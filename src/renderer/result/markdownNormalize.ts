@@ -234,12 +234,33 @@ function mapOutsideDollarMath(line: string, map: (text: string) => string): stri
   return result + map(line.slice(cursor))
 }
 
+const CURRENCY_PAIR = /\$(\d[^$\n]*?)\$/gu
+const CJK = /[\u3400-\u9fff\u3040-\u30ff\uac00-\ud7af]/u
+
+/**
+ * `$5 ... $10` is money, not inline math: remark-math would swallow both
+ * dollars and typeset the span between them. Escape the pair when the body
+ * reads like prose (CJK characters, or a trailing space before the closing
+ * dollar); real formulas such as `$x^2$` keep working.
+ */
+export function escapeCurrencyDollars(line: string): string {
+  if (!line.includes('$')) return line
+  return line.replace(CURRENCY_PAIR, (match, body: string) => {
+    const looksLikeMoney = CJK.test(body) || /\s$/u.test(body)
+    return looksLikeMoney ? match.replace(/\$/gu, '\\$') : match
+  })
+}
+
 export function normalizeMarkdownSource(source: string): string {
   if (!source) return source
 
   // The transport has already decoded JSON. Literal escapes are content,
   // especially inside code, regular expressions and Windows paths.
-  const text = normalizeLatexDelimiters(source).replace(/\r\n?/gu, '\n')
+  const text = normalizeLatexDelimiters(source)
+    .replace(/\r\n?/gu, '\n')
+    .split('\n')
+    .map(escapeCurrencyDollars)
+    .join('\n')
   const lines = text.split('\n')
   const out: string[] = []
   let fenceChar: string | null = null

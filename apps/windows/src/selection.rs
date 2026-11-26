@@ -2377,7 +2377,10 @@ impl SelectionWorker {
                         selection.bounds,
                         to_logical(drag_start),
                         to_logical(drag_end),
-                        POINTER_BOUNDS_TOLERANCE,
+                        // The tolerance lives in the bounds' space, so it has to
+                        // shrink with the scale: passing it unchanged doubled the
+                        // effective slack at 200% and let scrollbar drags through.
+                        POINTER_BOUNDS_TOLERANCE / gesture_scale,
                     )
                 };
                 if !matched_in_physical && !matched_in_logical {

@@ -15,7 +15,16 @@ import {
   type PublicSettings,
   type SelectionPayload
 } from '../../shared'
-import { detectSensitiveKinds, sensitiveWarning } from '../../shared/sensitive'
+import {
+  detectSensitiveKinds,
+  sensitiveLabels,
+  sensitiveWarning
+} from '../../shared/sensitive'
+
+// A confirming click inside the floor is the same gesture; past the ceiling the
+// confirmation expires so a stale "already warned" state cannot skip the gate.
+const SENSITIVE_CONFIRM_FLOOR_MS = 800
+const SENSITIVE_CONFIRM_CEILING_MS = 8_000
 import { ActionIcon } from '../components/ActionIcon'
 import { runDetached } from '../lib/asyncEffects'
 import { getErrorMessage } from '../lib/errors'
@@ -502,22 +511,30 @@ export function ToolbarApp(): JSX.Element {
     if (busyActionRef.current) return
     const action = visibleActions.find((candidate) => candidate.id === actionId)
     if (!action) return
-    // Copy and search never leave the machine; everything else talks to a
-    // provider, so credentials in the selection deserve one deliberate click.
-    if (action.kind !== 'copy' && action.kind !== 'search') {
+    // Only a local copy stays on the machine. Search puts the selection into a
+    // search-engine URL, so it leaks a credential just as surely as a model
+    // request does and has to pass the same gate.
+    if (action.kind !== 'copy') {
       const kinds = detectSensitiveKinds(selection?.text ?? '')
       const confirmationKey = `${selection?.selectionId ?? ''}:${actionId}`
       const gate = sensitiveGateRef.current
-      // The warning has to stay readable: a confirming click inside this window
-      // is still the same gesture (double click), not a decision.
+      const elapsed = gate?.key === confirmationKey ? Date.now() - gate.at : -1
+      // Below the floor it is still the same gesture (a double click); above the
+      // ceiling the confirmation has expired and the warning must come back.
       const confirmed =
-        gate?.key === confirmationKey && Date.now() - gate.at >= 800
+        elapsed >= SENSITIVE_CONFIRM_FLOOR_MS && elapsed <= SENSITIVE_CONFIRM_CEILING_MS
       if (kinds.length > 0 && !confirmed) {
+        if (elapsed >= 0 && elapsed < SENSITIVE_CONFIRM_FLOOR_MS) {
+          // Say why nothing happened instead of swallowing the click.
+          setMessage(`请稍候再点一次以确认发送（内容可能包含${sensitiveLabels(kinds).join('、')}）`)
+          return
+        }
         sensitiveGateRef.current = { key: confirmationKey, at: Date.now() }
         setMessage(sensitiveWarning(kinds))
         return
       }
     }
+    sensitiveGateRef.current = null
     resetCopySuccess()
     const pointerTriggered = event.detail > 0
     const actedSelectionId = selection?.selectionId

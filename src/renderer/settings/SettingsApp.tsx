@@ -620,7 +620,10 @@ export function SettingsApp(): JSX.Element {
     }
     return false
   }, [keyInputs, keyBaselines])
-  unsavedChangesRef.current = dirty || keysDirty
+  // An open action editor or model picker holds uncommitted work that neither
+  // `dirty` nor the key fields can see; the quit guard has to count it too.
+  unsavedChangesRef.current =
+    dirty || keysDirty || editor !== null || modelPicker !== null
 
   // The settings window hides to the tray by default, so the backend has to
   // know when closing would drop edits: a tray quit is refused while dirty.

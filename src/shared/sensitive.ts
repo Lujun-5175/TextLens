@@ -73,10 +73,14 @@ export function detectSensitiveKinds(text: string): SensitiveKind[] {
     if (found.includes(rule.kind)) continue
     if (!rule.pattern.test(text)) continue
     if (rule.kind === 'bankCard') {
-      // Require a real card number so order ids stop triggering the warning,
-      // and skip runs already reported as an identity number.
-      const match = /(?:^|[^0-9])([0-9]{16,19})(?![0-9])/u.exec(text)
-      if (!match || !passesLuhn(match[1]!) || found.includes('identityCard')) continue
+      // Cards are commonly written in groups (`4111 1111 1111 1111`), so the
+      // separators have to come out before matching, and every candidate run
+      // needs the Luhn check — testing only the first one missed a real card
+      // that followed an order number.
+      if (found.includes('identityCard')) continue
+      const digits = text.replace(/[ \-]/gu, '')
+      const candidates = digits.match(/[0-9]{16,19}/gu) ?? []
+      if (!candidates.some((candidate) => passesLuhn(candidate))) continue
     }
     found.push(rule.kind)
   }

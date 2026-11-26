@@ -196,3 +196,16 @@ describe('LaTeX inside existing math', () => {
     expect(normalizeMarkdownSource(input)).toBe(input)
   })
 })
+
+describe('currency dollars', () => {
+  it('escapes a money pair so remark-math cannot swallow it', () => {
+    const out = normalizeMarkdownSource('价格是 $5，折扣 $10 元')
+    expect(out).toContain(String.raw`\$5`)
+    expect(out).toContain(String.raw`\$10`)
+  })
+
+  it('leaves real inline math alone', () => {
+    const input = '公式 $x^2$ 成立'
+    expect(normalizeMarkdownSource(input)).toBe(input)
+  })
+})

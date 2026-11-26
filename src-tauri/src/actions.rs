@@ -2469,7 +2469,7 @@ fn runtime_failure_from_transport(failure: TransportFailure) -> RuntimeFailure {
         .as_ref()
         .and_then(|error| error.param.as_deref());
     let message = if failure.provider_error.is_some() && !status_classified {
-        provider_rejection_message(provider_code, provider_param)
+        provider_rejection_message(&failure.message, provider_code, provider_param)
     } else {
         failure.message
     };
@@ -2481,17 +2481,34 @@ fn runtime_failure_from_transport(failure: TransportFailure) -> RuntimeFailure {
     }
 }
 
-fn provider_rejection_message(code: Option<&str>, param: Option<&str>) -> String {
+/// Keeps the provider's own wording and appends the machine hint.
+///
+/// Replacing the message with a generic instruction sent users to "check the
+/// model and parameters" for quota exhaustion and retired models, where that
+/// advice is simply wrong.
+fn provider_rejection_message(
+    provider_message: &str,
+    code: Option<&str>,
+    param: Option<&str>,
+) -> String {
     const GENERIC: &str = "模型服务拒绝了请求，请检查模型与参数配置";
     fn detail(value: &str) -> Option<String> {
         let value = value.trim();
         (!value.is_empty()).then(|| value.chars().take(64).collect())
     }
+    let base = {
+        let trimmed = provider_message.trim();
+        if trimmed.is_empty() {
+            GENERIC.to_owned()
+        } else {
+            trimmed.chars().take(200).collect::<String>()
+        }
+    };
     match (code.and_then(detail), param.and_then(detail)) {
-        (Some(code), Some(param)) => format!("{GENERIC}（错误码：{code}；参数：{param}）"),
-        (Some(code), None) => format!("{GENERIC}（错误码：{code}）"),
-        (None, Some(param)) => format!("{GENERIC}（参数：{param}）"),
-        (None, None) => GENERIC.to_owned(),
+        (Some(code), Some(param)) => format!("{base}（错误码：{code}；参数：{param}）"),
+        (Some(code), None) => format!("{base}（错误码：{code}）"),
+        (None, Some(param)) => format!("{base}（参数：{param}）"),
+        (None, None) => base,
     }
 }
 
@@ -3441,9 +3458,13 @@ mod tests {
             })),
             content_seen: false,
         });
-        assert!(runtime.message.contains("请检查模型与参数配置"));
+        // The provider's own wording leads; it is the only text that explains
+        // quota exhaustion or a retired model, where "check the model and
+        // parameters" is actively misleading.
+        assert!(runtime.message.starts_with("model not found"));
         assert!(runtime.message.contains("错误码：model_not_found"));
         assert!(runtime.message.contains("参数：thinking"));
+        assert!(!runtime.message.contains("请检查模型与参数配置"));
 
         // A streamed provider error has no HTTP status at all; the provider code is the
         // only detail available, so it must survive in the message as well.
@@ -3457,7 +3478,7 @@ mod tests {
             })),
             content_seen: true,
         });
-        assert!(streamed.message.contains("请检查模型与参数配置"));
+        assert!(streamed.message.starts_with("Overloaded"));
         assert!(streamed.message.contains("错误码：overloaded_error"));
         assert!(streamed.retryable);
     }

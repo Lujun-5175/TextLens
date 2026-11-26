@@ -3631,11 +3631,15 @@ fn record_request_log(
     if matches!(begin.snapshot.status, ActionSnapshotStatus::Running) {
         return;
     }
-    let claimed = {
+    let (claimed, sent_characters) = {
         let mut sessions = state.result_sessions.lock();
-        sessions
-            .get_mut(session_id)
-            .is_some_and(|meta| meta.claim_request_log(&begin.snapshot.request_id))
+        match sessions.get_mut(session_id) {
+            Some(meta) => (
+                meta.claim_request_log(&begin.snapshot.request_id),
+                meta.selection.payload.text.chars().count() as u64,
+            ),
+            None => (false, 0),
+        }
     };
     if !claimed {
         return;
@@ -3672,12 +3676,9 @@ fn record_request_log(
     let Some(status) = request_log_status(begin.snapshot.status) else {
         return;
     };
-    let character_count = settings
-        .actions
-        .iter()
-        .find(|action| action.id == begin.snapshot.action_id)
-        .map(|_| begin.snapshot.content.chars().count() as u64)
-        .unwrap_or(0);
+    // The size of the text the user sent; the answer length is a different
+    // number and does not belong under this name.
+    let character_count = sent_characters;
     let entry = crate::request_log::RequestLogEntry {
         created_at: crate::request_log::now_iso8601(),
         action_name,

@@ -254,11 +254,22 @@ fn write_entries_atomically(path: &Path, entries: &[ResultHistoryEntry]) -> io::
     let mut temp_name = file_name.to_os_string();
     temp_name.push(HISTORY_TEMP_SUFFIX);
     let temp = path.with_file_name(temp_name);
-    if let Err(error) = fs::write(&temp, buffer.as_bytes()) {
-        let _ = fs::remove_file(&temp);
-        return Err(error);
-    }
-    if let Err(error) = crate::settings::atomic_file::replace_file(&temp, path) {
+    // Flush before the replace: ReplaceFileW is atomic, but it does not promise
+    // the new contents reached the disk. Without this a crash during the ring
+    // rewrite loses every entry instead of the newest one.
+    let write_result = (|| -> io::Result<()> {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&temp)?;
+        file.write_all(buffer.as_bytes())?;
+        file.sync_all()?;
+        // Windows refuses the replace while this handle is still open.
+        drop(file);
+        crate::settings::atomic_file::replace_file(&temp, path)
+    })();
+    if let Err(error) = write_result {
         let _ = fs::remove_file(&temp);
         return Err(error);
     }
