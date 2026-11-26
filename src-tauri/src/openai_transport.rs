@@ -11,8 +11,8 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     models::AI_OUTPUT_LIMIT,
     openai_protocol::{
-        decode_json_content, is_incomplete_finish_reason, json_response_is_incomplete,
-        provider_error_from_value, DecodedSseEvent, ProtocolError, ProtocolLimits,
+        decode_json_content, incomplete_finish_kind, json_incomplete_kind,
+        provider_error_from_value, DecodedSseEvent, IncompleteKind, ProtocolError, ProtocolLimits,
         ProviderErrorEnvelope, SseCodec, SseDecoder, SseTermination,
     },
 };
@@ -305,6 +305,7 @@ where
     let mut content = String::new();
     let mut output_scalars = 0usize;
     let mut thinking_scalars = 0usize;
+    let mut reasoning_seen = false;
     let mut content_seen = false;
     let mut first_body_seen = false;
     let mut first_event_deadline = Some(headers_at + config.first_event);
@@ -333,7 +334,7 @@ where
                 .finish()
                 .map_err(|error| protocol_failure(error, content_seen))?;
             if content.trim().is_empty() {
-                return Err(empty_response_failure(content_seen));
+                return Err(empty_or_reasoning_failure(reasoning_seen, content_seen));
             }
             return Ok(TransportSuccess {
                 content,
@@ -366,7 +367,7 @@ where
                 let Some(event) = event else {
                     if done_seen {
                         if content.trim().is_empty() {
-                            return Err(empty_response_failure(content_seen));
+                            return Err(empty_or_reasoning_failure(reasoning_seen, content_seen));
                         }
                         return Ok(TransportSuccess {
                             content,
@@ -384,7 +385,7 @@ where
                         let incomplete = data
                             .finish_reason
                             .as_deref()
-                            .is_some_and(is_incomplete_finish_reason);
+                            .and_then(incomplete_finish_kind);
                         let now = Instant::now();
                         if first_event_deadline.take().is_some() {
                             on_marker(TransportMarker::FirstValidEvent, now);
@@ -396,6 +397,10 @@ where
                         // and idle timers so long CoT does not look hung, but never
                         // merge into answer content or answer scalar limits.
                         if let Some(thinking) = data.reasoning.filter(|delta| !delta.is_empty()) {
+                            // Remember that the provider did produce reasoning even when
+                            // the delta is dropped by the scalar cap: an answer-less
+                            // stream must be reported as reasoning-only, not as empty.
+                            reasoning_seen = true;
                             let scalar_count = thinking.chars().count();
                             if thinking_scalars.saturating_add(scalar_count)
                                 <= config.output_scalars
@@ -428,8 +433,8 @@ where
                             }
                             idle_deadline = Some(marked_at + config.stream_idle);
                         }
-                        if incomplete {
-                            return Err(incomplete_response_failure(content_seen));
+                        if let Some(kind) = incomplete {
+                            return Err(incomplete_kind_failure(kind, content_seen));
                         }
                     }
                 }
@@ -541,14 +546,14 @@ where
     }
     on_marker(TransportMarker::FirstValidEvent, Instant::now());
     let content = decode_json_content(codec, &value).unwrap_or_default();
-    let incomplete = json_response_is_incomplete(codec, &value);
+    let incomplete = json_incomplete_kind(codec, &value);
     let scalar_count = content.chars().count();
     if scalar_count > config.output_scalars {
         return Err(output_limit_failure(false));
     }
     if content.trim().is_empty() {
-        if incomplete {
-            return Err(incomplete_response_failure(false));
+        if let Some(kind) = incomplete {
+            return Err(incomplete_kind_failure(kind, false));
         }
         return Err(empty_response_failure(false));
     }
@@ -559,8 +564,8 @@ where
         return Err(stale_ticket_failure(true));
     }
     on_marker(TransportMarker::FirstContent, Instant::now());
-    if incomplete {
-        return Err(incomplete_response_failure(true));
+    if let Some(kind) = incomplete {
+        return Err(incomplete_kind_failure(kind, true));
     }
     Ok(TransportSuccess {
         content,
@@ -687,10 +692,51 @@ fn provider_failure(envelope: ProviderErrorEnvelope, content_seen: bool) -> Tran
     TransportFailure {
         code: "PROVIDER_ERROR",
         message: envelope.message.clone(),
-        retryable: false,
+        retryable: provider_error_is_retryable(&envelope),
         status: None,
         provider_error: Some(envelope),
         content_seen,
+    }
+}
+
+/// Transient provider rejections that the same request can survive.
+///
+/// Overload, rate limiting and provider-side faults are retried by the user; model
+/// or parameter rejections and policy blocks are not, because repeating the request
+/// cannot change the outcome.
+fn provider_error_is_retryable(envelope: &ProviderErrorEnvelope) -> bool {
+    [envelope.code.as_deref(), envelope.kind.as_deref()]
+        .into_iter()
+        .flatten()
+        .any(is_transient_provider_code)
+}
+
+fn is_transient_provider_code(code: &str) -> bool {
+    let normalized = code.trim().to_ascii_lowercase();
+    if matches!(
+        normalized.as_str(),
+        "overloaded_error"
+            | "server_is_overloaded"
+            | "overloaded"
+            | "rate_limit_error"
+            | "rate_limit_exceeded"
+            | "rate_limited"
+            | "rate_limit"
+            | "server_error"
+            | "internal_server_error"
+            | "internal_error"
+            | "service_unavailable"
+            | "unavailable"
+            | "api_error"
+            | "timeout"
+    ) {
+        return true;
+    }
+    match normalized.parse::<u16>() {
+        // Some gateways put the bare HTTP status into `code` / `type`.
+        Ok(429) => true,
+        Ok(status) => (500..=599).contains(&status),
+        Err(_) => false,
     }
 }
 
@@ -744,6 +790,27 @@ fn empty_response_failure(content_seen: bool) -> TransportFailure {
     )
 }
 
+/// No answer text, but reasoning deltas were delivered.
+///
+/// The reasoning itself was already streamed to the thinking buffer, so this is not
+/// an empty response; it usually means the output budget was consumed by reasoning.
+fn reasoning_only_failure(content_seen: bool) -> TransportFailure {
+    failure(
+        "REASONING_ONLY",
+        "模型只返回了思考过程，未给出最终答案",
+        true,
+        content_seen,
+    )
+}
+
+fn empty_or_reasoning_failure(reasoning_seen: bool, content_seen: bool) -> TransportFailure {
+    if reasoning_seen {
+        reasoning_only_failure(content_seen)
+    } else {
+        empty_response_failure(content_seen)
+    }
+}
+
 fn incomplete_response_failure(content_seen: bool) -> TransportFailure {
     failure(
         "INCOMPLETE_RESPONSE",
@@ -755,6 +822,40 @@ fn incomplete_response_failure(content_seen: bool) -> TransportFailure {
         true,
         content_seen,
     )
+}
+
+/// Report an abnormal stop that the provider classified precisely.
+///
+/// The result window derives its retry affordance from the structured failure's
+/// `retryable` flag and shows the message for `status == "error"`, so truncation and
+/// policy stops stay inside that contract instead of inventing a new status: the
+/// already streamed content is preserved, the message names the cause, and
+/// `retryable: false` removes the retry suggestion (repeating an identical request
+/// cannot add tokens the provider already refused to emit).
+fn incomplete_kind_failure(kind: IncompleteKind, content_seen: bool) -> TransportFailure {
+    match kind {
+        IncompleteKind::OutputLimit => failure(
+            "OUTPUT_TRUNCATED",
+            if content_seen {
+                "模型已达输出长度上限，回复在此结束，已保留生成的内容"
+            } else {
+                "模型在输出正文前就达到了输出长度上限"
+            },
+            false,
+            content_seen,
+        ),
+        IncompleteKind::SafetyFilter => failure(
+            "CONTENT_FILTERED",
+            if content_seen {
+                "模型回复被服务商安全策略拦截，已保留生成的内容"
+            } else {
+                "模型回复被服务商安全策略拦截"
+            },
+            false,
+            content_seen,
+        ),
+        IncompleteKind::Abnormal => incomplete_response_failure(content_seen),
+    }
 }
 
 fn output_limit_failure(content_seen: bool) -> TransportFailure {
@@ -1048,30 +1149,106 @@ mod tests {
                 &CancellationToken::new(), &GenerationBudget::new(Instant::now(), Duration::from_secs(10)),
                 Instant::now(), TransportConfig::test(), |delta| { deltas.push(delta); ControlFlow::Continue(()) }, |_| ControlFlow::Continue(()), |_, _| {},
             ).await.unwrap_err();
-            assert_eq!(failure.code, "INCOMPLETE_RESPONSE");
+            let expected = if codec == SseCodec::OpenAiChat {
+                // `finish_reason: length` is an output-ceiling stop, not a broken stream.
+                "OUTPUT_TRUNCATED"
+            } else {
+                // `response.incomplete` without `incomplete_details` carries no cause,
+                // so it stays in the abnormal bucket.
+                "INCOMPLETE_RESPONSE"
+            };
+            assert_eq!(failure.code, expected, "{codec:?}");
             assert_eq!(deltas.concat(), "partial");
             assert!(failure.content_seen);
+            if expected == "OUTPUT_TRUNCATED" {
+                assert!(!failure.retryable);
+                assert!(!failure.message.contains("重试"));
+            } else {
+                assert!(failure.retryable);
+            }
         }
     }
 
     #[tokio::test]
+    async fn transport_sse_content_filter_and_precise_truncation_are_classified() {
+        let filtered = consume_sse_chunks_for(
+            SseCodec::OpenAiChat,
+            futures_util::stream::iter(vec![Ok(Bytes::from_static(
+                b"data: {\"choices\":[{\"delta\":{\"content\":\"partial\"},\"finish_reason\":\"content_filter\"}]}\n\n",
+            ))]),
+            &CancellationToken::new(),
+            &GenerationBudget::new(Instant::now(), Duration::from_secs(10)),
+            Instant::now(),
+            TransportConfig::test(),
+            |_| ControlFlow::Continue(()),
+            |_| ControlFlow::Continue(()),
+            |_, _| {},
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(filtered.code, "CONTENT_FILTERED");
+        assert!(!filtered.retryable);
+        assert!(filtered.content_seen);
+        assert!(!filtered.message.contains("重试"));
+
+        let precise = consume_sse_chunks_for(
+            SseCodec::OpenAiResponses,
+            futures_util::stream::iter(vec![Ok(Bytes::from_static(
+                br#"event: response.output_text.delta
+data: {"type":"response.output_text.delta","delta":"partial"}
+
+event: response.incomplete
+data: {"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"}}}
+
+"#,
+            ))]),
+            &CancellationToken::new(),
+            &GenerationBudget::new(Instant::now(), Duration::from_secs(10)),
+            Instant::now(),
+            TransportConfig::test(),
+            |_| ControlFlow::Continue(()),
+            |_| ControlFlow::Continue(()),
+            |_, _| {},
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(precise.code, "OUTPUT_TRUNCATED");
+        assert!(!precise.retryable);
+    }
+
+    #[tokio::test]
     async fn transport_json_incomplete_providers_preserve_content_and_successful_stop_completes() {
-        for (codec, body) in [
+        for (codec, body, expected) in [
             (
                 SseCodec::OpenAiChat,
                 serde_json::json!({"choices":[{"message":{"content":"partial"},"finish_reason":"length"}]}),
+                "OUTPUT_TRUNCATED",
             ),
             (
                 SseCodec::OpenAiResponses,
                 serde_json::json!({"output_text":"partial","status":"incomplete"}),
+                // No `incomplete_details`, so the cause is unknown: abnormal stop.
+                "INCOMPLETE_RESPONSE",
+            ),
+            (
+                SseCodec::OpenAiResponses,
+                serde_json::json!({"output_text":"partial","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"}}),
+                "OUTPUT_TRUNCATED",
+            ),
+            (
+                SseCodec::OpenAiResponses,
+                serde_json::json!({"output_text":"partial","status":"incomplete","incomplete_details":{"reason":"content_filter"}}),
+                "CONTENT_FILTERED",
             ),
             (
                 SseCodec::AnthropicMessages,
                 serde_json::json!({"content":[{"type":"text","text":"partial"}],"stop_reason":"max_tokens"}),
+                "OUTPUT_TRUNCATED",
             ),
             (
                 SseCodec::Gemini,
                 serde_json::json!({"candidates":[{"content":{"parts":[{"text":"partial"}]},"finishReason":"MAX_TOKENS"}]}),
+                "OUTPUT_TRUNCATED",
             ),
         ] {
             let mut deltas = Vec::new();
@@ -1092,9 +1269,17 @@ mod tests {
             )
             .await
             .unwrap_err();
-            assert_eq!(failure.code, "INCOMPLETE_RESPONSE", "{codec:?}");
+            assert_eq!(failure.code, expected, "{codec:?} {body}");
             assert!(failure.content_seen);
             assert_eq!(deltas.concat(), "partial");
+            if expected == "INCOMPLETE_RESPONSE" {
+                // A stop without a stated cause stays retryable.
+                assert!(failure.retryable, "{codec:?} {body}");
+            } else {
+                // Truncation and policy stops cannot be improved by repeating the request.
+                assert!(!failure.retryable, "{codec:?} {body}");
+                assert!(!failure.message.contains("重试"));
+            }
         }
         let success = consume_json_chunks(
             futures_util::stream::iter(vec![Ok(Bytes::from_static(
@@ -1196,6 +1381,23 @@ mod tests {
         tokio::task::yield_now().await;
         tokio::time::advance(Duration::from_millis(501)).await;
         assert_eq!(task.await.unwrap().unwrap_err().code, "ERROR_BODY_TIMEOUT");
+    }
+
+    #[tokio::test]
+    async fn transport_error_body_read_reports_cancellation_not_a_status_guess() {
+        // The HTTP layer keeps this code and turns the request into a cancelled
+        // outcome; it must not be reclassified as a status-derived failure.
+        let token = CancellationToken::new();
+        let cancel = token.clone();
+        let config = TransportConfig::test();
+        let task = tokio::spawn(async move {
+            let budget = GenerationBudget::new(tokio::time::Instant::now(), config.total);
+            read_limited_error_chunks(futures_util::stream::pending(), &token, &budget, config)
+                .await
+        });
+        tokio::task::yield_now().await;
+        cancel.cancel();
+        assert_eq!(task.await.unwrap().unwrap_err().code, "CANCELLED");
     }
 
     #[tokio::test]
@@ -1303,5 +1505,77 @@ mod tests {
         assert_eq!(&*thinking.lock().unwrap(), &["think"]);
         assert_eq!(&*answer.lock().unwrap(), &["ans"]);
         assert_eq!(success.content, "ans");
+    }
+
+    #[tokio::test]
+    async fn transport_reasoning_only_answer_is_not_an_empty_response() {
+        for wire in [
+            // [DONE] path.
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"plan\"}}]}\n\ndata: [DONE]\n\n",
+            // Clean EOF without a terminator.
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"plan\"}}]}\n\n",
+        ] {
+            let mut thinking = Vec::new();
+            let failure = consume_sse_chunks(
+                futures_util::stream::iter(vec![Ok(Bytes::from(wire.to_owned()))]),
+                &CancellationToken::new(),
+                &GenerationBudget::new(Instant::now(), Duration::from_secs(10)),
+                Instant::now(),
+                TransportConfig::test(),
+                |_| ControlFlow::Continue(()),
+                |delta| {
+                    thinking.push(delta);
+                    ControlFlow::Continue(())
+                },
+                |_, _| {},
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(failure.code, "REASONING_ONLY");
+            // The reasoning was already handed to the thinking buffer.
+            assert_eq!(thinking.concat(), "plan");
+            assert!(failure.message.contains("思考过程"));
+        }
+    }
+
+    #[test]
+    fn transport_provider_failure_retryability_follows_the_provider_code() {
+        let retryable = |code: Option<&str>, kind: Option<&str>| {
+            provider_failure(
+                ProviderErrorEnvelope {
+                    code: code.map(ToOwned::to_owned),
+                    kind: kind.map(ToOwned::to_owned),
+                    param: None,
+                    message: "provider rejected".to_owned(),
+                },
+                false,
+            )
+            .retryable
+        };
+        for transient in [
+            "overloaded_error",
+            "rate_limit_exceeded",
+            "server_error",
+            "internal_server_error",
+            "api_error",
+            "429",
+            "503",
+            "529",
+        ] {
+            assert!(retryable(Some(transient), None), "{transient}");
+        }
+        // Anthropic-style envelopes only set `type`.
+        assert!(retryable(None, Some("overloaded_error")));
+        for permanent in [
+            "model_not_found",
+            "unsupported_parameter",
+            "invalid_request_error",
+            "content_policy_violation",
+            "prompt_blocked",
+        ] {
+            assert!(!retryable(Some(permanent), None), "{permanent}");
+        }
+        // Unknown codes stay conservative.
+        assert!(!retryable(None, None));
     }
 }

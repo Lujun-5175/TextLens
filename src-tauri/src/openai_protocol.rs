@@ -348,7 +348,17 @@ fn decode_openai_responses_event(
             *state = SseState::Done;
             Ok(DecodedSseEvent::Done)
         }
-        "response.incomplete" => data_event(state, None, None, Some("incomplete".to_owned())),
+        "response.incomplete" => {
+            // The Responses API carries the real cause in `incomplete_details.reason`
+            // (`max_output_tokens` / `content_filter`); without it the caller can only
+            // treat the stop as an abnormal protocol termination.
+            let reason = value
+                .pointer("/response/incomplete_details/reason")
+                .and_then(Value::as_str)
+                .filter(|reason| !reason.is_empty())
+                .unwrap_or("incomplete");
+            data_event(state, None, None, Some(reason.to_owned()))
+        }
         "response.failed" => {
             let error = value.pointer("/response/error");
             Err(ProtocolError::Provider(ProviderErrorEnvelope {
@@ -511,32 +521,50 @@ fn string_or_number(value: &Value) -> Option<String> {
         .or_else(|| value.as_i64().map(|number| number.to_string()))
 }
 
-pub(crate) fn is_incomplete_finish_reason(reason: &str) -> bool {
-    matches!(
-        reason.to_ascii_lowercase().as_str(),
-        "length"
-            | "max_tokens"
-            | "max_output_tokens"
-            | "incomplete"
-            | "content_filter"
-            | "safety"
-            | "recitation"
-            | "blocklist"
-            | "prohibited_content"
-            | "spii"
-            | "malformed_function_call"
-            | "tool_calls"
-            | "function_call"
-            | "tool_use"
-            | "pause_turn"
-    )
+/// Why a response stopped without a normal completion.
+///
+/// Truncation at the output ceiling and a safety-policy stop are terminal for the
+/// request (the same request cannot produce more text), while other abnormal stop
+/// reasons usually come from a broken provider stream and can be retried.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IncompleteKind {
+    /// The provider hit the output/length ceiling; the text received is final.
+    OutputLimit,
+    /// The provider stopped for safety or content-policy reasons.
+    SafetyFilter,
+    /// Any other abnormal stop (truncated tool call, malformed call, pause_turn…).
+    Abnormal,
 }
 
-pub(crate) fn json_response_is_incomplete(codec: SseCodec, value: &Value) -> bool {
-    if codec == SseCodec::OpenAiResponses
-        && value.get("status").and_then(Value::as_str) == Some("incomplete")
-    {
-        return true;
+pub(crate) fn incomplete_finish_kind(reason: &str) -> Option<IncompleteKind> {
+    match reason.trim().to_ascii_lowercase().as_str() {
+        "length" | "max_tokens" | "max_output_tokens" => Some(IncompleteKind::OutputLimit),
+        "content_filter" | "safety" | "refusal" | "guardrail" | "recitation" | "blocklist"
+        | "prohibited_content" | "spii" => Some(IncompleteKind::SafetyFilter),
+        "incomplete"
+        | "malformed_function_call"
+        | "tool_calls"
+        | "function_call"
+        | "tool_use"
+        | "pause_turn" => Some(IncompleteKind::Abnormal),
+        _ => None,
+    }
+}
+
+pub(crate) fn json_incomplete_kind(codec: SseCodec, value: &Value) -> Option<IncompleteKind> {
+    if codec == SseCodec::OpenAiResponses {
+        if value.get("status").and_then(Value::as_str) != Some("incomplete") {
+            return None;
+        }
+        // `incomplete_details.reason` (max_output_tokens / content_filter) is more
+        // precise than the bare status; keep the abnormal bucket as the fallback.
+        return Some(
+            value
+                .pointer("/incomplete_details/reason")
+                .and_then(Value::as_str)
+                .and_then(incomplete_finish_kind)
+                .unwrap_or(IncompleteKind::Abnormal),
+        );
     }
     let reason = match codec {
         SseCodec::OpenAiChat => value.pointer("/choices/0/finish_reason"),
@@ -548,7 +576,7 @@ pub(crate) fn json_response_is_incomplete(codec: SseCodec, value: &Value) -> boo
     };
     reason
         .and_then(Value::as_str)
-        .is_some_and(is_incomplete_finish_reason)
+        .and_then(incomplete_finish_kind)
 }
 
 /// Extract answer text from a non-streaming response body for one protocol.
@@ -626,8 +654,8 @@ pub(crate) fn decode_json_content(codec: SseCodec, value: &Value) -> Option<Stri
 
 pub(crate) fn provider_error_from_value(value: &Value) -> Option<ProviderErrorEnvelope> {
     let object = value.as_object()?;
-    match object.get("error") {
-        Some(Value::Object(error)) => Some(ProviderErrorEnvelope {
+    let envelope = match object.get("error") {
+        Some(Value::Object(error)) => ProviderErrorEnvelope {
             code: field(error, "code").or_else(|| field(object, "code")),
             kind: field(error, "type")
                 .or_else(|| field(error, "kind"))
@@ -637,23 +665,59 @@ pub(crate) fn provider_error_from_value(value: &Value) -> Option<ProviderErrorEn
             message: field(error, "message")
                 .or_else(|| field(object, "message"))
                 .unwrap_or_else(|| "provider returned an error".to_owned()),
-        }),
-        Some(Value::String(message)) => Some(ProviderErrorEnvelope {
+        },
+        Some(Value::String(message)) => ProviderErrorEnvelope {
             code: field(object, "code"),
             kind: field(object, "type").or_else(|| field(object, "kind")),
             param: field(object, "param"),
             message: bounded(message),
-        }),
+        },
         Some(Value::Null) | None => {
             if object.contains_key("choices") {
                 return None;
             }
-            Some(ProviderErrorEnvelope {
+            ProviderErrorEnvelope {
                 code: Some(field(object, "code")?),
                 kind: field(object, "type").or_else(|| field(object, "kind")),
                 param: field(object, "param"),
                 message: field(object, "message")?,
-            })
+            }
+        }
+        _ => return None,
+    };
+    Some(normalize_provider_error(envelope))
+}
+
+/// Fold `type`/`param` semantics into `code`.
+///
+/// Many OpenAI-compatible gateways leave `error.code` null and only send
+/// `type: invalid_request_error` plus the offending `param`.  The thinking-control
+/// fallback matches on well-known parameter codes, so the semantics are recovered
+/// here once instead of special-casing every consumer.
+fn normalize_provider_error(mut envelope: ProviderErrorEnvelope) -> ProviderErrorEnvelope {
+    let explicit = envelope
+        .code
+        .as_deref()
+        .map(str::trim)
+        .filter(|code| !code.is_empty())
+        .map(ToOwned::to_owned);
+    envelope.code = explicit
+        .or_else(|| infer_provider_code(envelope.kind.as_deref(), envelope.param.as_deref()));
+    envelope
+}
+
+fn infer_provider_code(kind: Option<&str>, param: Option<&str>) -> Option<String> {
+    let param = param.map(str::trim).filter(|param| !param.is_empty());
+    let kind = kind.map(|kind| kind.trim().to_ascii_lowercase());
+    match kind.as_deref() {
+        Some("unsupported_parameter" | "unknown_parameter" | "unknown_field") => {
+            Some("unsupported_parameter".to_owned())
+        }
+        Some("unsupported_value" | "invalid_value") => Some("unsupported_value".to_owned()),
+        // A bare type describes the class of the rejection, not the cause.  When it
+        // also names a field, the gateway rejected that field.
+        Some("invalid_request_error" | "invalid_request" | "bad_request" | "unknown") | None => {
+            param.map(|_| "unsupported_parameter".to_owned())
         }
         _ => None,
     }
@@ -1010,5 +1074,192 @@ mod tests {
             events,
             termination,
         })
+    }
+
+    #[test]
+    fn protocol_recovers_provider_code_from_type_and_param() {
+        // Gateways often omit `code` and only describe the rejection through `type`
+        // plus `param`; the thinking fallback matches on parameter codes, so the
+        // semantics must be recovered here.
+        let typed = provider_error_from_value(&serde_json::json!({
+            "error": {
+                "type": "invalid_request_error",
+                "param": "reasoning_effort",
+                "message": "unsupported parameter"
+            }
+        }))
+        .expect("provider error");
+        assert_eq!(typed.code.as_deref(), Some("unsupported_parameter"));
+
+        let param_only = provider_error_from_value(&serde_json::json!({
+            "error": {"param": "enable_thinking", "message": "rejected"}
+        }))
+        .expect("provider error");
+        assert_eq!(param_only.code.as_deref(), Some("unsupported_parameter"));
+
+        let typed_value = provider_error_from_value(&serde_json::json!({
+            "error": {"type": "unsupported_value", "param": "thinking.type", "message": "bad"}
+        }))
+        .expect("provider error");
+        assert_eq!(typed_value.code.as_deref(), Some("unsupported_value"));
+
+        // An explicit code always wins over inference.
+        let explicit = provider_error_from_value(&serde_json::json!({
+            "error": {
+                "code": "rate_limit_exceeded",
+                "type": "invalid_request_error",
+                "param": "reasoning_effort",
+                "message": "slow down"
+            }
+        }))
+        .expect("provider error");
+        assert_eq!(explicit.code.as_deref(), Some("rate_limit_exceeded"));
+
+        // Non-parameter classes are left without a code.
+        let overloaded = provider_error_from_value(&serde_json::json!({
+            "error": {"type": "overloaded_error", "message": "overloaded"}
+        }))
+        .expect("provider error");
+        assert_eq!(overloaded.code, None);
+        assert_eq!(overloaded.kind.as_deref(), Some("overloaded_error"));
+    }
+
+    #[test]
+    fn normalized_gateway_error_unlocks_thinking_control_fallback() {
+        use crate::{
+            models::{ThinkingCapabilitySource, ThinkingMode},
+            thinking::{should_fallback_without_control, AppliedThinkingControl},
+        };
+
+        let applied = AppliedThinkingControl {
+            field_path: "reasoning_effort",
+            source: ThinkingCapabilitySource::Heuristic,
+        };
+        // Gateway shape that used to defeat the fallback: `code` is null and only
+        // `type` + `param` describe the rejection.
+        let envelope = provider_error_from_value(&serde_json::json!({
+            "error": {
+                "type": "invalid_request_error",
+                "param": "reasoning_effort",
+                "message": "Unsupported parameter"
+            }
+        }))
+        .expect("provider error");
+        assert!(should_fallback_without_control(
+            &applied,
+            ThinkingMode::Off,
+            1,
+            Some(400),
+            Some(&envelope),
+            false,
+            false,
+        ));
+
+        // A rejection of an unrelated field must not authorize the retry.
+        let unrelated = provider_error_from_value(&serde_json::json!({
+            "error": {
+                "type": "invalid_request_error",
+                "param": "temperature",
+                "message": "Unsupported value"
+            }
+        }))
+        .expect("provider error");
+        assert!(!should_fallback_without_control(
+            &applied,
+            ThinkingMode::Off,
+            1,
+            Some(400),
+            Some(&unrelated),
+            false,
+            false,
+        ));
+    }
+
+    #[test]
+    fn protocol_classifies_incomplete_stop_reasons() {
+        for reason in ["length", "max_tokens", "MAX_OUTPUT_TOKENS"] {
+            assert_eq!(
+                incomplete_finish_kind(reason),
+                Some(IncompleteKind::OutputLimit),
+                "{reason}"
+            );
+        }
+        for reason in [
+            "content_filter",
+            "safety",
+            "SAFETY",
+            "refusal",
+            "recitation",
+            "blocklist",
+        ] {
+            assert_eq!(
+                incomplete_finish_kind(reason),
+                Some(IncompleteKind::SafetyFilter),
+                "{reason}"
+            );
+        }
+        for reason in [
+            "incomplete",
+            "tool_calls",
+            "malformed_function_call",
+            "pause_turn",
+        ] {
+            assert_eq!(
+                incomplete_finish_kind(reason),
+                Some(IncompleteKind::Abnormal),
+                "{reason}"
+            );
+        }
+        assert_eq!(incomplete_finish_kind("stop"), None);
+        assert_eq!(incomplete_finish_kind("end_turn"), None);
+    }
+
+    #[test]
+    fn protocol_reads_responses_incomplete_details_and_falls_back_to_abnormal() {
+        let truncation = serde_json::json!({
+            "status": "incomplete",
+            "incomplete_details": {"reason": "max_output_tokens"}
+        });
+        assert_eq!(
+            json_incomplete_kind(SseCodec::OpenAiResponses, &truncation),
+            Some(IncompleteKind::OutputLimit)
+        );
+        let filtered = serde_json::json!({
+            "status": "incomplete",
+            "incomplete_details": {"reason": "content_filter"}
+        });
+        assert_eq!(
+            json_incomplete_kind(SseCodec::OpenAiResponses, &filtered),
+            Some(IncompleteKind::SafetyFilter)
+        );
+        assert_eq!(
+            json_incomplete_kind(
+                SseCodec::OpenAiResponses,
+                &serde_json::json!({"status": "incomplete"})
+            ),
+            Some(IncompleteKind::Abnormal)
+        );
+        assert_eq!(
+            json_incomplete_kind(
+                SseCodec::OpenAiResponses,
+                &serde_json::json!({"status": "completed"})
+            ),
+            None
+        );
+        // The Responses event carries the detailed reason instead of a bare status.
+        let events = decode_all_with_codec(
+            b"data: {\"type\":\"response.incomplete\",\"response\":{\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"}}}\n\n",
+            SseCodec::OpenAiResponses,
+        )
+        .unwrap();
+        assert_eq!(
+            events.events,
+            vec![DecodedSseEvent::Data(DecodedSseData {
+                content: None,
+                reasoning: None,
+                finish_reason: Some("max_output_tokens".to_owned()),
+                metadata_only: false,
+            })]
+        );
     }
 }

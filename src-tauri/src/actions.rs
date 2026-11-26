@@ -1596,37 +1596,21 @@ impl ActionService {
         config: TransportConfig,
     ) -> TransportFailure {
         let status = response.status();
-        let bytes = read_http_error(response, cancellation, &prepared.budget, config).await;
-        if let Err(failure) = bytes {
-            return failure;
-        }
-        let bytes = bytes.expect("checked above");
-        let provider_error = serde_json::from_slice::<Value>(&bytes)
-            .ok()
+        // The status line is already known here, so an unreadable error body must not
+        // turn a 401/429 into "error detail read timed out": the status-derived
+        // diagnosis is the authoritative one and the body only adds detail.
+        let body = match read_http_error(response, cancellation, &prepared.budget, config).await {
+            Ok(bytes) => Some(bytes),
+            Err(failure) if failure.code == "CANCELLED" => return failure,
+            Err(_) => None,
+        };
+        let provider_error = body
+            .as_deref()
+            .and_then(|bytes| serde_json::from_slice::<Value>(bytes).ok())
             .as_ref()
             .and_then(provider_error_from_value);
-        let message = match status {
-            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
-                "认证失败，请检查 API Key 和接口权限".to_owned()
-            }
-            StatusCode::TOO_MANY_REQUESTS => "请求过于频繁或额度不足，请稍后重试".to_owned(),
-            _ => safe_server_message(&bytes, &prepared.api_key)
-                .unwrap_or_else(|| format!("模型服务返回 HTTP {}", status.as_u16())),
-        };
-        let (code, retryable) = if status == StatusCode::TOO_MANY_REQUESTS {
-            ("RATE_LIMITED", true)
-        } else if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
-            ("AUTHENTICATION_FAILED", false)
-        } else if status.is_server_error()
-            || matches!(
-                status,
-                StatusCode::REQUEST_TIMEOUT | StatusCode::CONFLICT | StatusCode::TOO_EARLY
-            )
-        {
-            ("HTTP_ERROR", true)
-        } else {
-            ("HTTP_ERROR", false)
-        };
+        let (code, message, retryable) =
+            classify_http_failure(status, body.as_deref(), &prepared.api_key);
         TransportFailure {
             code,
             message,
@@ -2354,9 +2338,61 @@ fn shared_total_timeout_failure(content_seen: bool) -> TransportFailure {
     }
 }
 
+/// Map an HTTP error response onto the localized runtime failure.
+///
+/// `body` is `None` when the error body could not be read (timeout or network error
+/// while draining it).  The status code is always known at this point, so the
+/// status-derived message wins and a missing body only costs the provider detail.
+fn classify_http_failure(
+    status: StatusCode,
+    body: Option<&[u8]>,
+    api_key: &str,
+) -> (&'static str, String, bool) {
+    let (code, retryable) = if status == StatusCode::TOO_MANY_REQUESTS {
+        ("RATE_LIMITED", true)
+    } else if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
+        // Fixing the key is enough to retry; the user should not have to restart the
+        // request flow to use the corrected credential.
+        ("AUTHENTICATION_FAILED", true)
+    } else if status.is_server_error()
+        || matches!(
+            status,
+            StatusCode::REQUEST_TIMEOUT | StatusCode::CONFLICT | StatusCode::TOO_EARLY
+        )
+    {
+        ("HTTP_ERROR", true)
+    } else {
+        ("HTTP_ERROR", false)
+    };
+    let message = match status {
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
+            "认证失败，请检查 API Key 和接口权限".to_owned()
+        }
+        StatusCode::TOO_MANY_REQUESTS => "请求过于频繁或额度不足，请稍后重试".to_owned(),
+        _ => body
+            .and_then(|bytes| safe_server_message(bytes, api_key))
+            .unwrap_or_else(|| format!("模型服务返回 HTTP {}", status.as_u16())),
+    };
+    (code, message, retryable)
+}
+
 fn runtime_failure_from_transport(failure: TransportFailure) -> RuntimeFailure {
-    let message = if failure.provider_error.is_some() {
-        "模型服务拒绝了请求，请检查模型与参数配置".to_owned()
+    // 401/403/429 messages are already classified above; the generic provider hint
+    // must not replace them. Statuses without a classified message keep the hint,
+    // but the provider's own `code`/`param` are folded into the text because the
+    // result window renders `message` only (there is no structured field for them in
+    // the terminal payload, which lives outside this module).
+    let status_classified = matches!(failure.status, Some(401 | 403 | 429));
+    let provider_code = failure
+        .provider_error
+        .as_ref()
+        .and_then(|error| error.code.as_deref().or(error.kind.as_deref()));
+    let provider_param = failure
+        .provider_error
+        .as_ref()
+        .and_then(|error| error.param.as_deref());
+    let message = if failure.provider_error.is_some() && !status_classified {
+        provider_rejection_message(provider_code, provider_param)
     } else {
         failure.message
     };
@@ -2365,6 +2401,20 @@ fn runtime_failure_from_transport(failure: TransportFailure) -> RuntimeFailure {
         message,
         retryable: failure.retryable,
         status: failure.status,
+    }
+}
+
+fn provider_rejection_message(code: Option<&str>, param: Option<&str>) -> String {
+    const GENERIC: &str = "模型服务拒绝了请求，请检查模型与参数配置";
+    fn detail(value: &str) -> Option<String> {
+        let value = value.trim();
+        (!value.is_empty()).then(|| value.chars().take(64).collect())
+    }
+    match (code.and_then(detail), param.and_then(detail)) {
+        (Some(code), Some(param)) => format!("{GENERIC}（错误码：{code}；参数：{param}）"),
+        (Some(code), None) => format!("{GENERIC}（错误码：{code}）"),
+        (None, Some(param)) => format!("{GENERIC}（参数：{param}）"),
+        (None, None) => GENERIC.to_owned(),
     }
 }
 
@@ -2439,7 +2489,8 @@ async fn model_http_failure(
     let (code, retryable) = if status == StatusCode::TOO_MANY_REQUESTS {
         ("RATE_LIMITED", true)
     } else if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
-        ("AUTHENTICATION_FAILED", false)
+        // Same rationale as generation requests: a corrected key can be retried.
+        ("AUTHENTICATION_FAILED", true)
     } else if status.is_server_error()
         || matches!(
             status,
@@ -3121,6 +3172,116 @@ mod tests {
         let runtime = runtime_failure_from_transport(failure);
         assert_eq!(runtime.code, "INVALID_RESPONSE");
         assert!(runtime.retryable);
+    }
+
+    #[test]
+    fn provider_error_never_overwrites_the_classified_status_message() {
+        let provider_error = provider_error_from_value(&serde_json::json!({
+            "error": {"code": "invalid_api_key", "type": "invalid_request_error", "message": "bad key"}
+        }));
+        assert!(provider_error.is_some());
+        for (status, expected_code, expected_message) in [
+            (
+                StatusCode::UNAUTHORIZED,
+                "AUTHENTICATION_FAILED",
+                "认证失败，请检查 API Key 和接口权限",
+            ),
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                "RATE_LIMITED",
+                "请求过于频繁或额度不足，请稍后重试",
+            ),
+        ] {
+            let (code, message, retryable) = classify_http_failure(
+                status,
+                Some(b"{\"error\":{\"message\":\"bad\"}}"),
+                "sk-test",
+            );
+            assert_eq!(code, expected_code, "{status}");
+            assert_eq!(message, expected_message, "{status}");
+            // A corrected key or a cooled-down quota can be retried immediately.
+            assert!(retryable, "{status}");
+            let runtime = runtime_failure_from_transport(TransportFailure {
+                code,
+                message,
+                retryable,
+                status: Some(status.as_u16()),
+                provider_error: provider_error.clone(),
+                content_seen: false,
+            });
+            assert_eq!(runtime.message, expected_message, "{status}");
+            assert!(runtime.retryable, "{status}");
+        }
+    }
+
+    #[test]
+    fn unreadable_error_body_keeps_the_status_diagnosis() {
+        for (status, expected_code, expected_message, expected_retryable) in [
+            (
+                StatusCode::UNAUTHORIZED,
+                "AUTHENTICATION_FAILED",
+                "认证失败，请检查 API Key 和接口权限",
+                true,
+            ),
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                "RATE_LIMITED",
+                "请求过于频繁或额度不足，请稍后重试",
+                true,
+            ),
+            (
+                StatusCode::BAD_REQUEST,
+                "HTTP_ERROR",
+                "模型服务返回 HTTP 400",
+                false,
+            ),
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "HTTP_ERROR",
+                "模型服务返回 HTTP 503",
+                true,
+            ),
+        ] {
+            // `None` stands for an error body that timed out or broke mid-read; the
+            // status line was already received, so it must still drive the message.
+            let (code, message, retryable) = classify_http_failure(status, None, "sk-test");
+            assert_eq!(code, expected_code, "{status}");
+            assert_eq!(message, expected_message, "{status}");
+            assert_eq!(retryable, expected_retryable, "{status}");
+        }
+    }
+
+    #[test]
+    fn unclassified_provider_error_keeps_the_hint_and_provider_detail() {
+        let runtime = runtime_failure_from_transport(TransportFailure {
+            code: "PROVIDER_ERROR",
+            message: "model not found".to_owned(),
+            retryable: false,
+            status: Some(400),
+            provider_error: provider_error_from_value(&serde_json::json!({
+                "error": {"code": "model_not_found", "param": "thinking", "message": "model not found"}
+            })),
+            content_seen: false,
+        });
+        assert!(runtime.message.contains("请检查模型与参数配置"));
+        assert!(runtime.message.contains("错误码：model_not_found"));
+        assert!(runtime.message.contains("参数：thinking"));
+
+        // A streamed provider error has no HTTP status at all; the provider code is the
+        // only detail available, so it must survive in the message as well.
+        let streamed = runtime_failure_from_transport(TransportFailure {
+            code: "PROVIDER_ERROR",
+            message: "Overloaded".to_owned(),
+            retryable: true,
+            status: None,
+            provider_error: provider_error_from_value(&serde_json::json!({
+                "error": {"type": "overloaded_error", "message": "Overloaded"}
+            })),
+            content_seen: true,
+        });
+        assert!(streamed.message.contains("请检查模型与参数配置"));
+        assert!(streamed.message.contains("错误码：overloaded_error"));
+        assert!(streamed.retryable);
     }
 
     #[test]
