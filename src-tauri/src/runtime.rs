@@ -3581,6 +3581,42 @@ fn record_completed_history(
     );
 }
 
+#[cfg(test)]
+mod request_log_status_tests {
+    use super::*;
+
+    #[test]
+    fn a_running_snapshot_never_earns_an_audit_line() {
+        // Regression: claiming the slot while running consumed it, so the
+        // terminal handshake for the same request id was dropped and no line
+        // was ever written for ordinary requests.
+        assert_eq!(request_log_status(ActionSnapshotStatus::Running), None);
+        assert_eq!(
+            request_log_status(ActionSnapshotStatus::Completed),
+            Some("completed")
+        );
+        assert_eq!(
+            request_log_status(ActionSnapshotStatus::Error),
+            Some("failed")
+        );
+        assert_eq!(
+            request_log_status(ActionSnapshotStatus::Cancelled),
+            Some("cancelled")
+        );
+    }
+}
+
+/// Only a terminal request earns an audit line. `Running` also carries a
+/// request id, so the guard has to live here rather than in the caller.
+fn request_log_status(status: ActionSnapshotStatus) -> Option<&'static str> {
+    match status {
+        ActionSnapshotStatus::Completed => Some("completed"),
+        ActionSnapshotStatus::Error => Some("failed"),
+        ActionSnapshotStatus::Cancelled => Some("cancelled"),
+        ActionSnapshotStatus::Running => None,
+    }
+}
+
 /// Writes one audit line per finished request: who was asked, how much text and
 /// what came back. Metadata only — never the prompt or the answer.
 fn record_request_log(
@@ -3589,6 +3625,12 @@ fn record_request_log(
     session_id: &str,
     begin: &ActionBeginReady,
 ) {
+    // The first ready handshake happens while the request is still running; the
+    // terminal one reuses the same request id. Claiming before this check would
+    // consume the slot and drop the only line worth writing.
+    if matches!(begin.snapshot.status, ActionSnapshotStatus::Running) {
+        return;
+    }
     let claimed = {
         let mut sessions = state.result_sessions.lock();
         sessions
@@ -3627,15 +3669,9 @@ fn record_request_log(
         }
         None => (String::new(), String::new(), String::new()),
     };
-    let status = match begin.snapshot.status {
-        ActionSnapshotStatus::Completed => "completed",
-        ActionSnapshotStatus::Error => "failed",
-        ActionSnapshotStatus::Cancelled => "cancelled",
-        _ => "running",
-    };
-    if status == "running" {
+    let Some(status) = request_log_status(begin.snapshot.status) else {
         return;
-    }
+    };
     let character_count = settings
         .actions
         .iter()
@@ -4072,20 +4108,34 @@ pub fn reinsert_result(
     if text.chars().count() > 1_000_000 {
         return Err("结果过长".to_owned());
     }
-    let source_window = state
+    let (source_window, source_app) = state
         .result_sessions
         .lock()
         .get(&session_id)
-        .and_then(|meta| meta.selection.payload.source_window);
+        .map(|meta| {
+            (
+                meta.selection.payload.source_window,
+                meta.selection.payload.source_app.name.clone(),
+            )
+        })
+        .unwrap_or((None, String::new()));
     clipboard::write_text(&text)?;
     // Hide first: the OS restores the previous foreground window, so the
     // verification inside `reinsert` has a chance to pass.
     let _ = window.hide();
     std::thread::sleep(Duration::from_millis(40));
-    Ok(match crate::reinsert::reinsert(source_window) {
-        crate::reinsert::ReinsertOutcome::Pasted => "pasted".to_owned(),
-        crate::reinsert::ReinsertOutcome::CopiedOnly => "copied".to_owned(),
-    })
+    let outcome = crate::reinsert::reinsert(
+        source_window,
+        (!source_app.is_empty()).then_some(source_app.as_str()),
+    );
+    if outcome == crate::reinsert::ReinsertOutcome::CopiedOnly {
+        // Bring the window back: the "press Ctrl+V yourself" hint lives there,
+        // and a window that vanished with no explanation reads as a failure.
+        let _ = window.show();
+        let _ = window.set_focus();
+        return Ok("copied".to_owned());
+    }
+    Ok("pasted".to_owned())
 }
 
 #[tauri::command]

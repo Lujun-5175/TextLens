@@ -117,8 +117,10 @@ export function ToolbarApp(): JSX.Element {
   const measuredSizeRef = useRef<{ selectionId?: string; width: number; height: number } | null>(null)
   const busyActionRef = useRef<string | null>(null)
   const [busyActionId, setBusyActionId] = useState<string | null>(null)
-  // Selection+action that the user already confirmed despite sensitive content.
-  const [sensitiveConfirmed, setSensitiveConfirmed] = useState<string | null>(null)
+  // Selection+action the user confirmed despite sensitive content, and when.
+  // A ref is required: state has not re-rendered yet on the second click of a
+  // double click, so a state check would let it through instantly.
+  const sensitiveGateRef = useRef<{ key: string; at: number } | null>(null)
   const [copySuccessActionId, setCopySuccessActionId] = useState<string | null>(null)
   const [hoveredControlId, setHoveredControlId] = useState<string | null>(null)
   const [message, setMessage] = useState('')
@@ -505,8 +507,13 @@ export function ToolbarApp(): JSX.Element {
     if (action.kind !== 'copy' && action.kind !== 'search') {
       const kinds = detectSensitiveKinds(selection?.text ?? '')
       const confirmationKey = `${selection?.selectionId ?? ''}:${actionId}`
-      if (kinds.length > 0 && sensitiveConfirmed !== confirmationKey) {
-        setSensitiveConfirmed(confirmationKey)
+      const gate = sensitiveGateRef.current
+      // The warning has to stay readable: a confirming click inside this window
+      // is still the same gesture (double click), not a decision.
+      const confirmed =
+        gate?.key === confirmationKey && Date.now() - gate.at >= 800
+      if (kinds.length > 0 && !confirmed) {
+        sensitiveGateRef.current = { key: confirmationKey, at: Date.now() }
         setMessage(sensitiveWarning(kinds))
         return
       }

@@ -75,15 +75,26 @@ describe('ToolbarApp', () => {
 
     const translate = await screen.findByRole('button', { name: '翻译' })
     await waitFor(() => expect(api.getCurrentSelection).toHaveBeenCalled())
+    // A confirming click inside the guard window is the same gesture (a double
+    // click), so drive the clock instead of relying on real elapsed time.
+    const clock = vi.spyOn(Date, 'now')
+    clock.mockReturnValue(1_000_000)
     fireEvent.click(translate)
-    // First click only warns: nothing is sent to a provider yet.
     expect(runAction).not.toHaveBeenCalled()
     expect(await screen.findByText(/可能包含API Key/u)).toBeInTheDocument()
 
+    // Still inside the window: ignored, so a double click cannot bypass it.
+    clock.mockReturnValue(1_000_200)
+    fireEvent.click(translate)
+    expect(runAction).not.toHaveBeenCalled()
+
+    // A deliberate second click after reading the warning goes through.
+    clock.mockReturnValue(1_002_000)
     fireEvent.click(translate)
     await waitFor(() =>
       expect(runAction).toHaveBeenCalledWith('translate', undefined, 'selection-1')
     )
+    clock.mockRestore()
     view.unmount()
   })
 

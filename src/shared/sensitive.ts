@@ -33,20 +33,52 @@ interface Rule {
 const RULES: readonly Rule[] = [
   { kind: 'privateKey', pattern: /-----BEGIN [A-Z ]*PRIVATE KEY-----/u },
   { kind: 'apiKey', pattern: /(?:^|[^A-Za-z0-9_-])sk-[A-Za-z0-9_-]{16,}/u },
-  { kind: 'cloudKey', pattern: /(?:^|[^A-Za-z0-9])(?:AKIA[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9]{20,}|AIza[0-9A-Za-z_-]{20,})/u },
+  {
+    kind: 'cloudKey',
+    pattern: /(?:^|[^A-Za-z0-9])(?:AKIA[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|AIza[0-9A-Za-z_-]{20,})/u
+  },
+  // JWT: three base64url segments, the first two always start with eyJ.
+  { kind: 'cloudKey', pattern: /eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/u },
+  { kind: 'cloudKey', pattern: /(?:^|[^A-Za-z])(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{20,}/iu },
+  {
+    kind: 'apiKey',
+    pattern: /(?:password|passwd|secret|token|api[_-]?key)\s*[:=]\s*\S{6,}/iu
+  },
   { kind: 'identityCard', pattern: /(?:^|[^0-9])[1-9][0-9]{5}(?:19|20)[0-9]{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12][0-9]|3[01])[0-9]{3}[0-9Xx](?![0-9])/u },
   { kind: 'bankCard', pattern: /(?:^|[^0-9])[0-9]{16,19}(?![0-9])/u },
   { kind: 'phone', pattern: /(?:^|[^0-9])1[3-9][0-9]{9}(?![0-9])/u }
 ]
+
+/** Luhn check: 16-19 digit runs are usually order numbers, not cards. */
+function passesLuhn(digits: string): boolean {
+  let sum = 0
+  let double = false
+  for (let index = digits.length - 1; index >= 0; index -= 1) {
+    let value = digits.charCodeAt(index) - 48
+    if (double) {
+      value *= 2
+      if (value > 9) value -= 9
+    }
+    sum += value
+    double = !double
+  }
+  return sum % 10 === 0
+}
 
 /** Kinds present in `text`, in a stable order, without duplicates. */
 export function detectSensitiveKinds(text: string): SensitiveKind[] {
   if (!text) return []
   const found: SensitiveKind[] = []
   for (const rule of RULES) {
-    if (rule.pattern.test(text) && !found.includes(rule.kind)) {
-      found.push(rule.kind)
+    if (found.includes(rule.kind)) continue
+    if (!rule.pattern.test(text)) continue
+    if (rule.kind === 'bankCard') {
+      // Require a real card number so order ids stop triggering the warning,
+      // and skip runs already reported as an identity number.
+      const match = /(?:^|[^0-9])([0-9]{16,19})(?![0-9])/u.exec(text)
+      if (!match || !passesLuhn(match[1]!) || found.includes('identityCard')) continue
     }
+    found.push(rule.kind)
   }
   return found
 }
