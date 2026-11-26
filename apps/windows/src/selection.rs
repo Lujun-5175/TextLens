@@ -5723,11 +5723,23 @@ impl CaptureEngine {
                 .ok()
                 .map(|values| rectangles_from_values(&values))
                 .unwrap_or_default();
-            let at_point = windows_double_click_matches_text_range(
-                &text,
-                &rectangles,
-                raw_selection_point(request.current),
-            );
+            // Same unit split as the drag guard: the hook reports physical
+            // pixels while UIA rectangles arrive in the helper's logical space,
+            // so a high-DPI display rejects every double-click word selection.
+            let pointer = raw_selection_point(request.current);
+            let at_point = windows_double_click_matches_text_range(&text, &rectangles, pointer)
+                || {
+                    let scale = dpi_scale_for_window(source_window);
+                    scale > 1.0
+                        && windows_double_click_matches_text_range(
+                            &text,
+                            &rectangles,
+                            SelectionPoint {
+                                x: pointer.x / scale,
+                                y: pointer.y / scale,
+                            },
+                        )
+                };
             // A no-geometry provider is accepted only after the same provider
             // changed its explicit selection since this gesture's first click.
             // RangeFromPoint alone is deliberately insufficient: it snaps to
@@ -6440,8 +6452,24 @@ fn document_range_selection_is_plausible(
     let release = request.end.unwrap_or(request.current);
     let release = raw_selection_point(release);
     let start = request.start.map(raw_selection_point);
-    selection_point_near_bounds(release, bounds)
-        && start.is_none_or(|point| selection_point_near_bounds(point, bounds))
+    let near = |release: SelectionPoint, start: Option<SelectionPoint>| {
+        selection_point_near_bounds(release, bounds)
+            && start.is_none_or(|point| selection_point_near_bounds(point, bounds))
+    };
+    // Hook points are physical, MSAA/UIA rectangles are logical on a scaled
+    // display; accept either interpretation instead of rejecting the drag.
+    if near(release, start) {
+        return true;
+    }
+    let scale = dpi_scale_for_window(source_window);
+    if scale <= 1.0 {
+        return false;
+    }
+    let to_logical = |point: SelectionPoint| SelectionPoint {
+        x: point.x / scale,
+        y: point.y / scale,
+    };
+    near(to_logical(release), start.map(to_logical))
 }
 
 /// MSAA does not distinguish a selected text range from a window/document
