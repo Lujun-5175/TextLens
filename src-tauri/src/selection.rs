@@ -925,7 +925,19 @@ fn drag_selection_matches_gesture(
     let contains = |point: SelectionPoint| {
         point.x >= left && point.x <= right && point.y >= top && point.y <= bottom
     };
-    contains(start) || contains(end)
+    if contains(start) || contains(end) {
+        return true;
+    }
+    // Dragging from the margin before the first glyph to past the last one puts
+    // both endpoints outside the reported rectangle, which is the most common
+    // way people select a whole line. A horizontal gesture that runs through the
+    // selection's vertical band is still this gesture; a scrollbar drag lives
+    // outside that band vertically and stays rejected.
+    let dx = (end.x - start.x).abs();
+    let dy = (end.y - start.y).abs();
+    let horizontal = dx >= dy * 2.0;
+    let band_overlap = start.y.min(end.y) <= bottom && start.y.max(end.y) >= top;
+    horizontal && band_overlap
 }
 
 #[cfg(any(target_os = "windows", test))]
@@ -1389,6 +1401,22 @@ mod tests {
             bounds,
             elsewhere,
             SelectionPoint { x: 705.0, y: 700.0 },
+            24.0
+        ));
+        // Selecting a whole line starts in the margin and ends past the last
+        // glyph, so both endpoints sit outside the rectangle. That is still this
+        // gesture and must open the toolbar, or line selection stops working.
+        assert!(drag_selection_matches_gesture(
+            bounds,
+            SelectionPoint { x: 60.0, y: 110.0 },
+            SelectionPoint { x: 340.0, y: 110.0 },
+            24.0
+        ));
+        // A vertical drag outside the band is a scrollbar, not a selection.
+        assert!(!drag_selection_matches_gesture(
+            bounds,
+            SelectionPoint { x: 320.0, y: 300.0 },
+            SelectionPoint { x: 322.0, y: 600.0 },
             24.0
         ));
         // Geometry the provider cannot report is unknown, not a rejection.
