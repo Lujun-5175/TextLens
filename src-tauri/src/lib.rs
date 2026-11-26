@@ -118,6 +118,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             runtime::get_settings,
             runtime::settings_ready,
+            runtime::set_settings_dirty,
             runtime::update_settings,
             runtime::reset_result_size,
             runtime::create_provider,

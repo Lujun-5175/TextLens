@@ -27,9 +27,25 @@ use std::ptr::NonNull;
 #[cfg(target_os = "windows")]
 use selection_windows::WindowsSelectionMonitor;
 
+/// Dismiss reasons the Windows helper emits when a gesture produced no
+/// selection because the source application cannot be inspected from TextLens's
+/// integrity level (UIPI) or from a remote session. The runtime converts them
+/// into a throttled notice instead of leaving the gesture silent.
+#[cfg(target_os = "windows")]
+pub(crate) const CAPTURE_UNAVAILABLE_ELEVATED_REASON: &str = "captureUnavailableElevated";
+#[cfg(target_os = "windows")]
+pub(crate) const CAPTURE_UNAVAILABLE_REMOTE_REASON: &str = "captureUnavailableRemote";
+
 #[cfg(target_os = "windows")]
 pub fn run_windows_selection_helper_if_requested() -> bool {
     selection_windows::run_selection_helper_if_requested()
+}
+
+/// Best-effort detection for a manual capture that returned nothing: the
+/// foreground process is elevated or belongs to a remote-desktop session.
+#[cfg(target_os = "windows")]
+pub(crate) fn foreground_capture_unavailable_reason() -> Option<(u32, &'static str)> {
+    selection_windows::foreground_capture_unavailable_reason()
 }
 
 #[cfg(target_os = "windows")]
@@ -745,8 +761,24 @@ fn direction_from_points(
 #[cfg(any(target_os = "windows", test))]
 const WINDOWS_CLICK_DRIFT_DISTANCE_SQUARED: f64 = 64.0;
 
+/// Minimum pointer travel, in device-independent pixels, before a press/release
+/// pair counts as a text drag. Hook coordinates are physical pixels, so the
+/// squared threshold must follow the source window's DPI: a fixed 4 physical
+/// pixels is 4 DIP at 100% but only ~2.7 DIP at 150%, which turns small
+/// click-jitter into a toolbar re-run.
 #[cfg(any(target_os = "windows", test))]
-const WINDOWS_DRAG_DISTANCE_SQUARED: f64 = 16.0;
+const WINDOWS_DRAG_DISTANCE_DIP: f64 = 4.0;
+
+#[cfg(any(target_os = "windows", test))]
+fn windows_drag_distance_squared(scale_factor: f64) -> f64 {
+    let scale = if scale_factor.is_finite() && scale_factor > 0.0 {
+        scale_factor
+    } else {
+        1.0
+    };
+    let distance = WINDOWS_DRAG_DISTANCE_DIP * scale;
+    distance * distance
+}
 
 /// Double-click detection uses the original hook timestamps (which wrap at
 /// 2^32 ms), the system's rectangle and the same native control for both
@@ -774,6 +806,7 @@ fn classify_windows_mouse_selection(
     shift_held: bool,
     is_double_click: bool,
     drag_duration_valid: bool,
+    drag_threshold_squared: f64,
 ) -> Option<SelectionTrigger> {
     let dx = end.x - start.x;
     let dy = end.y - start.y;
@@ -782,7 +815,7 @@ fn classify_windows_mouse_selection(
     if is_double_click && dx * dx + dy * dy <= WINDOWS_CLICK_DRIFT_DISTANCE_SQUARED {
         return Some(SelectionTrigger::DoubleClick);
     }
-    if drag_duration_valid && dx * dx + dy * dy >= WINDOWS_DRAG_DISTANCE_SQUARED {
+    if drag_duration_valid && dx * dx + dy * dy >= drag_threshold_squared {
         return Some(SelectionTrigger::Drag);
     }
     if is_double_click {
@@ -832,6 +865,62 @@ pub(crate) fn windows_double_click_matches_text_range(
             && point.y >= bounds.y
             && point.y <= bounds.y + bounds.height
     })
+}
+
+/// Anchor for a keyboard-triggered toolbar. Shift+Arrow/Home/End/Select-All
+/// selections have no meaningful pointer position, so wherever the mouse
+/// happens to rest would put the toolbar far away from the selected text.
+/// Use the bottom-center of the reported UIA range instead (the configured
+/// placement gap then keeps the toolbar just below the text); providers that
+/// expose no geometry keep the physical cursor position.
+#[cfg(any(target_os = "windows", test))]
+fn keyboard_selection_anchor(
+    bounds: Option<SelectionBounds>,
+    cursor: SelectionPoint,
+) -> SelectionPoint {
+    let Some(bounds) = bounds.filter(|bounds| selection_bounds_are_reasonable(*bounds)) else {
+        return cursor;
+    };
+    SelectionPoint {
+        x: bounds.x + bounds.width / 2.0,
+        y: bounds.y + bounds.height,
+    }
+}
+
+/// A drag release may only present a range that belongs to this gesture.
+///
+/// Providers that report geometry must place the selection rectangle under at
+/// least one end of the drag; a stale range left by an earlier selection
+/// (or a provider that never updated) usually sits somewhere else entirely.
+/// `None` bounds mean the provider does not expose geometry (for example the
+/// clipboard fallback), which is unknown rather than disproven, so the
+/// selection is kept.
+#[cfg(any(target_os = "windows", test))]
+fn drag_selection_matches_gesture(
+    bounds: Option<SelectionBounds>,
+    start: SelectionPoint,
+    end: SelectionPoint,
+    tolerance: f64,
+) -> bool {
+    let Some(bounds) = bounds else {
+        return true;
+    };
+    if !selection_bounds_are_reasonable(bounds) {
+        return false;
+    }
+    let tolerance = if tolerance.is_finite() && tolerance > 0.0 {
+        tolerance
+    } else {
+        0.0
+    };
+    let left = bounds.x - tolerance;
+    let top = bounds.y - tolerance;
+    let right = bounds.x + bounds.width + tolerance;
+    let bottom = bounds.y + bounds.height + tolerance;
+    let contains = |point: SelectionPoint| {
+        point.x >= left && point.x <= right && point.y >= top && point.y <= bottom
+    };
+    contains(start) || contains(end)
 }
 
 #[cfg(any(target_os = "windows", test))]
@@ -1147,12 +1236,13 @@ mod tests {
         let start = SelectionPoint { x: 10.0, y: 10.0 };
         let near = SelectionPoint { x: 11.0, y: 11.0 };
         let far = SelectionPoint { x: 20.0, y: 10.0 };
+        let threshold = windows_drag_distance_squared(1.0);
         assert_eq!(
-            classify_windows_mouse_selection(start, near, true, false, true),
+            classify_windows_mouse_selection(start, near, true, false, true, threshold),
             Some(SelectionTrigger::ShiftClick)
         );
         assert_eq!(
-            classify_windows_mouse_selection(start, near, false, true, true),
+            classify_windows_mouse_selection(start, near, false, true, true, threshold),
             Some(SelectionTrigger::DoubleClick)
         );
         assert_eq!(
@@ -1162,15 +1252,16 @@ mod tests {
                 false,
                 true,
                 true,
+                threshold,
             ),
             Some(SelectionTrigger::DoubleClick)
         );
         assert_eq!(
-            classify_windows_mouse_selection(start, far, true, true, true),
+            classify_windows_mouse_selection(start, far, true, true, true, threshold),
             Some(SelectionTrigger::Drag)
         );
         assert_eq!(
-            classify_windows_mouse_selection(start, near, false, false, true),
+            classify_windows_mouse_selection(start, near, false, false, true, threshold),
             None
         );
         assert_eq!(
@@ -1180,13 +1271,137 @@ mod tests {
                 false,
                 false,
                 true,
+                threshold,
             ),
             Some(SelectionTrigger::Drag)
         );
         assert_eq!(
-            classify_windows_mouse_selection(start, far, true, false, false),
+            classify_windows_mouse_selection(start, far, true, false, false, threshold),
             Some(SelectionTrigger::ShiftClick)
         );
+    }
+
+    #[test]
+    fn windows_drag_threshold_follows_the_source_display_scale() {
+        assert_eq!(windows_drag_distance_squared(1.0), 16.0);
+        assert_eq!(windows_drag_distance_squared(1.25), 25.0);
+        assert_eq!(windows_drag_distance_squared(1.5), 36.0);
+        assert_eq!(windows_drag_distance_squared(2.0), 64.0);
+        // Unknown/zero scales fall back to 100% instead of disabling drags.
+        assert_eq!(windows_drag_distance_squared(0.0), 16.0);
+        assert_eq!(windows_drag_distance_squared(f64::NAN), 16.0);
+
+        // 5 physical pixels is a drag at 100% but only click-sized jitter at
+        // 150%, where the same gesture spans ~3.3 DIP.
+        let start = SelectionPoint { x: 0.0, y: 0.0 };
+        let end = SelectionPoint { x: 5.0, y: 0.0 };
+        assert_eq!(
+            classify_windows_mouse_selection(
+                start,
+                end,
+                false,
+                false,
+                true,
+                windows_drag_distance_squared(1.0),
+            ),
+            Some(SelectionTrigger::Drag)
+        );
+        assert_eq!(
+            classify_windows_mouse_selection(
+                start,
+                end,
+                false,
+                false,
+                true,
+                windows_drag_distance_squared(1.5),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn keyboard_selection_anchors_on_the_reported_range_not_the_cursor() {
+        let cursor = SelectionPoint {
+            x: 1_500.0,
+            y: 40.0,
+        };
+        let bounds = Some(SelectionBounds {
+            x: 200.0,
+            y: 300.0,
+            width: 400.0,
+            height: 18.0,
+        });
+
+        // Bottom-center of the range: below the last selected line.
+        assert_eq!(
+            keyboard_selection_anchor(bounds, cursor),
+            SelectionPoint { x: 400.0, y: 318.0 }
+        );
+        // No geometry or a broken rectangle falls back to the cursor.
+        assert_eq!(keyboard_selection_anchor(None, cursor), cursor);
+        assert_eq!(
+            keyboard_selection_anchor(
+                Some(SelectionBounds {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 0.0,
+                    height: 0.0,
+                }),
+                cursor
+            ),
+            cursor
+        );
+    }
+
+    #[test]
+    fn drag_selection_must_touch_the_current_gesture() {
+        let bounds = Some(SelectionBounds {
+            x: 100.0,
+            y: 100.0,
+            width: 200.0,
+            height: 20.0,
+        });
+        let inside_start = SelectionPoint { x: 120.0, y: 105.0 };
+        let inside_end = SelectionPoint { x: 280.0, y: 110.0 };
+        let elsewhere = SelectionPoint { x: 700.0, y: 700.0 };
+
+        assert!(drag_selection_matches_gesture(
+            bounds,
+            inside_start,
+            inside_end,
+            24.0
+        ));
+        // A release that lands just past the last glyph still belongs to the
+        // gesture; the tolerance covers provider rounding and DPI drift.
+        assert!(drag_selection_matches_gesture(
+            bounds,
+            inside_start,
+            SelectionPoint { x: 330.0, y: 115.0 },
+            24.0
+        ));
+        // A stale range from somewhere else cannot be presented as this drag.
+        assert!(!drag_selection_matches_gesture(
+            bounds,
+            elsewhere,
+            SelectionPoint { x: 705.0, y: 700.0 },
+            24.0
+        ));
+        // Geometry the provider cannot report is unknown, not a rejection.
+        assert!(drag_selection_matches_gesture(
+            None, elsewhere, elsewhere, 24.0
+        ));
+        // Broken rectangles never authorize a drag selection.
+        assert!(!drag_selection_matches_gesture(
+            Some(SelectionBounds {
+                x: 0.0,
+                y: 0.0,
+                width: 0.0,
+                height: 10.0,
+            }),
+            inside_start,
+            inside_end,
+            24.0
+        ));
     }
 
     #[test]

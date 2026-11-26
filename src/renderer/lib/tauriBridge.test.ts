@@ -396,6 +396,11 @@ describe('Tauri renderer bridge', () => {
     await window.textLens.settingsReady?.()
     expect(invokeMock).toHaveBeenCalledWith('settings_ready')
 
+    await window.textLens.setSettingsDirty?.(true)
+    expect(invokeMock).toHaveBeenCalledWith('set_settings_dirty', { dirty: true })
+    await window.textLens.setSettingsDirty?.(false)
+    expect(invokeMock).toHaveBeenCalledWith('set_settings_dirty', { dirty: false })
+
     await window.textLens.openSettings?.()
     expect(invokeMock).toHaveBeenCalledWith('open_settings', { options: null })
 

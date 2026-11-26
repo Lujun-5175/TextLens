@@ -277,6 +277,9 @@ export function installTauriBridge(): void {
       await settingsCloseRequestEvents.ready()
       await invoke(TAURI_COMMANDS.settingsReady)
     },
+    async setSettingsDirty(dirty: boolean) {
+      await invoke(TAURI_COMMANDS.setSettingsDirty, { dirty })
+    },
     async updateSettings(update: SettingsUpdate) {
       return publicSettingsSchema.parse(await invoke(TAURI_COMMANDS.updateSettings, { update }))
     },

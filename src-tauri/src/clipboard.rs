@@ -10,6 +10,25 @@ const WINDOWS_CLIPBOARD_TEXT_LIMIT: usize = 1_000_000;
 #[cfg(target_os = "windows")]
 const WINDOWS_CLIPBOARD_SNAPSHOT_LIMIT: usize = 64 * 1024 * 1024;
 
+/// Registered (named) clipboard formats that tell Windows and clipboard
+/// monitors not to keep a copy of this write. Both are documented as a 4-byte
+/// `DWORD`; a value of 0 means "do not include" / "do not process".
+///
+/// TextLens performs one transient clipboard write per clipboard-based
+/// capture: restoring the user's original clipboard after the synthetic copy.
+/// Without these markers that restore lands in Win+V history and in clipboard
+/// sync/monitor tools as a second, unexpected entry. The names stay as string
+/// constants so the pair is testable off Windows; the ids come from
+/// `RegisterClipboardFormatW`.
+#[cfg(any(target_os = "windows", test))]
+const WINDOWS_CLIPBOARD_HISTORY_EXCLUSION_FORMATS: [&str; 2] = [
+    "CanIncludeInClipboardHistory",
+    "ExcludeClipboardContentFromMonitorProcessing",
+];
+/// The `DWORD` payload that opts a format out of history/monitor processing.
+#[cfg(any(target_os = "windows", test))]
+const WINDOWS_CLIPBOARD_EXCLUSION_DWORD: u32 = 0;
+
 #[cfg(target_os = "windows")]
 pub(crate) struct WindowsClipboardSnapshot {
     formats: Vec<WindowsClipboardFormatSnapshot>,
@@ -41,11 +60,70 @@ impl WindowsClipboardSnapshot {
     /// still the newest clipboard write. The snapshot owns materialized bytes
     /// rather than a third-party IDataObject proxy, so repeatedly restoring a
     /// PDF renderer's delayed formats cannot build a recursive OLE proxy chain.
-    pub(crate) fn restore_if_unchanged(&self, expected_sequence: u32) -> bool {
-        if !windows_clipboard_sequence_matches(expected_sequence) {
-            return false;
+    ///
+    /// Returns the reason when the restore is refused so the caller can
+    /// distinguish "a newer clipboard write won" from "the restore itself
+    /// failed" instead of silently discarding the snapshot.
+    pub(crate) fn restore_if_unchanged_detailed(
+        &self,
+        expected_sequence: u32,
+    ) -> WindowsClipboardRestoreOutcome {
+        let current_sequence = windows_clipboard_sequence();
+        if !windows_clipboard_sequence_is_stable(expected_sequence, current_sequence) {
+            return classify_windows_clipboard_restore(expected_sequence, current_sequence, None);
         }
-        restore_windows_clipboard_snapshot(self, expected_sequence)
+        let failure = restore_windows_clipboard_snapshot(self, expected_sequence).err();
+        classify_windows_clipboard_restore(expected_sequence, current_sequence, failure)
+    }
+}
+
+/// Why a snapshot restore did or did not happen. `SequenceChanged` means a
+/// newer clipboard write won (the correct, expected outcome of the guard);
+/// `Failed` means our own restore could not be completed and the clipboard may
+/// still hold the synthetic copy.
+#[cfg(target_os = "windows")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WindowsClipboardRestoreOutcome {
+    Restored,
+    SequenceChanged { expected: u32, actual: u32 },
+    Failed(&'static str),
+}
+
+#[cfg(target_os = "windows")]
+impl WindowsClipboardRestoreOutcome {
+    pub(crate) fn is_restored(self) -> bool {
+        matches!(self, Self::Restored)
+    }
+
+    /// Compact, non-sensitive status for the selection trace log.
+    pub(crate) fn trace_status(self) -> String {
+        match self {
+            Self::Restored => "restored".to_owned(),
+            Self::SequenceChanged { expected, actual } => {
+                format!("sequence-changed(expected={expected},actual={actual})")
+            }
+            Self::Failed(stage) => format!("failed({stage})"),
+        }
+    }
+}
+
+/// Pure classification of a restore attempt. `stage` is `None` when the native
+/// restore succeeded and `Some(step)` when it failed at that step.
+#[cfg(any(target_os = "windows", test))]
+fn classify_windows_clipboard_restore(
+    expected: u32,
+    current: u32,
+    stage: Option<&'static str>,
+) -> WindowsClipboardRestoreOutcome {
+    if !windows_clipboard_sequence_is_stable(expected, current) {
+        return WindowsClipboardRestoreOutcome::SequenceChanged {
+            expected,
+            actual: current,
+        };
+    }
+    match stage {
+        Some(stage) => WindowsClipboardRestoreOutcome::Failed(stage),
+        None => WindowsClipboardRestoreOutcome::Restored,
     }
 }
 
@@ -367,7 +445,7 @@ fn prepare_windows_clipboard_format(
 fn restore_windows_clipboard_snapshot(
     snapshot: &WindowsClipboardSnapshot,
     expected_sequence: u32,
-) -> bool {
+) -> Result<(), &'static str> {
     use std::{thread, time::Duration};
 
     use windows::{
@@ -406,7 +484,7 @@ fn restore_windows_clipboard_snapshot(
             .map(|format| prepare_windows_clipboard_format(format).map(|handle| (format, handle)))
             .collect::<Option<Vec<_>>>()
         else {
-            return false;
+            return Err("prepare-formats");
         };
         prepared
     };
@@ -429,7 +507,7 @@ fn restore_windows_clipboard_snapshot(
     }
     .map(ClipboardOwnerWindow);
     let Ok(owner) = owner else {
-        return false;
+        return Err("owner-window");
     };
     if retry_operation(
         WINDOWS_CLIPBOARD_ATTEMPTS,
@@ -441,22 +519,97 @@ fn restore_windows_clipboard_snapshot(
     )
     .is_err()
     {
-        return false;
+        return Err("open-clipboard");
     }
     let _clipboard = ClipboardGuard;
-    if !windows_clipboard_sequence_matches(expected_sequence)
-        || unsafe { EmptyClipboard() }.is_err()
-    {
-        return false;
+    if !windows_clipboard_sequence_matches(expected_sequence) {
+        return Err("sequence-changed-on-open");
+    }
+    if unsafe { EmptyClipboard() }.is_err() {
+        return Err("empty-clipboard");
     }
 
     for (format, handle) in &mut prepared {
         if unsafe { SetClipboardData(format.format, Some(handle.raw())) }.is_err() {
-            return false;
+            return Err("set-snapshot-format");
         }
         handle.relinquish();
     }
-    true
+    // Best effort: the restored data is already published, so a marker failure
+    // must not turn a successful restore into a failed one. Markers only spare
+    // Win+V history and clipboard monitor tools a copy of this transient write.
+    // A snapshot that captured an empty clipboard stays empty: publishing only
+    // the marker formats would make Windows report content that is not there.
+    if !snapshot.was_empty {
+        let _ = write_windows_clipboard_history_exclusions();
+    }
+    Ok(())
+}
+
+/// Publishes the two history/monitor exclusion formats on the clipboard this
+/// process currently owns. Must be called with the clipboard open and after
+/// `EmptyClipboard` (Windows requires ownership for `SetClipboardData`).
+#[cfg(target_os = "windows")]
+fn write_windows_clipboard_history_exclusions() -> Result<(), &'static str> {
+    use windows::Win32::System::DataExchange::SetClipboardData;
+
+    let formats =
+        register_windows_clipboard_history_exclusion_formats().ok_or("register-format")?;
+    for format in formats {
+        let Some(mut handle) = prepare_windows_clipboard_exclusion_handle() else {
+            return Err("exclusion-memory");
+        };
+        if unsafe { SetClipboardData(format, Some(handle.raw())) }.is_err() {
+            return Err("set-exclusion-format");
+        }
+        handle.relinquish();
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn register_windows_clipboard_history_exclusion_formats() -> Option<[u32; 2]> {
+    use windows::{core::PCWSTR, Win32::System::DataExchange::RegisterClipboardFormatW};
+
+    let mut formats = [0u32; 2];
+    for (slot, name) in formats
+        .iter_mut()
+        .zip(WINDOWS_CLIPBOARD_HISTORY_EXCLUSION_FORMATS)
+    {
+        let wide = name
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let format = unsafe { RegisterClipboardFormatW(PCWSTR(wide.as_ptr())) };
+        if format == 0 {
+            return None;
+        }
+        *slot = format;
+    }
+    Some(formats)
+}
+
+#[cfg(target_os = "windows")]
+fn prepare_windows_clipboard_exclusion_handle() -> Option<PreparedWindowsClipboardHandle> {
+    use std::ptr;
+
+    use windows::{
+        core::Free,
+        Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE},
+    };
+
+    // The marker payload is a single 4-byte DWORD (documented value 0).
+    let value = WINDOWS_CLIPBOARD_EXCLUSION_DWORD.to_le_bytes();
+    let global = unsafe { GlobalAlloc(GMEM_MOVEABLE, value.len()) }.ok()?;
+    let pointer = unsafe { GlobalLock(global) }.cast::<u8>();
+    if pointer.is_null() {
+        let mut global = global;
+        unsafe { global.free() };
+        return None;
+    }
+    unsafe { ptr::copy_nonoverlapping(value.as_ptr(), pointer, value.len()) };
+    let _ = unsafe { GlobalUnlock(global) };
+    Some(PreparedWindowsClipboardHandle::Global(Some(global)))
 }
 
 #[cfg(target_os = "windows")]
@@ -1197,6 +1350,62 @@ mod tests {
         assert!(!windows_clipboard_sequence_is_stable(42, 43));
         assert!(windows_clipboard_sequence_is_stable(0, 0));
         assert!(!windows_clipboard_sequence_is_stable(0, 1));
+    }
+
+    #[test]
+    fn clipboard_exclusion_formats_use_the_documented_names_and_a_zero_dword() {
+        assert_eq!(
+            WINDOWS_CLIPBOARD_HISTORY_EXCLUSION_FORMATS,
+            [
+                "CanIncludeInClipboardHistory",
+                "ExcludeClipboardContentFromMonitorProcessing",
+            ]
+        );
+        assert_eq!(WINDOWS_CLIPBOARD_EXCLUSION_DWORD, 0);
+        assert_eq!(WINDOWS_CLIPBOARD_EXCLUSION_DWORD.to_le_bytes().len(), 4);
+        assert_eq!(
+            WINDOWS_CLIPBOARD_EXCLUSION_DWORD.to_le_bytes(),
+            [0, 0, 0, 0]
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn restore_outcome_distinguishes_a_lost_race_from_a_failed_restore() {
+        assert_eq!(
+            classify_windows_clipboard_restore(7, 9, None),
+            WindowsClipboardRestoreOutcome::SequenceChanged {
+                expected: 7,
+                actual: 9
+            }
+        );
+        // The guard wins even when the native stage is reported: a newer
+        // clipboard write is not an error, it is the expected veto.
+        assert_eq!(
+            classify_windows_clipboard_restore(7, 9, Some("empty-clipboard")),
+            WindowsClipboardRestoreOutcome::SequenceChanged {
+                expected: 7,
+                actual: 9
+            }
+        );
+        assert_eq!(
+            classify_windows_clipboard_restore(7, 7, Some("owner-window")),
+            WindowsClipboardRestoreOutcome::Failed("owner-window")
+        );
+        assert_eq!(
+            classify_windows_clipboard_restore(7, 7, None),
+            WindowsClipboardRestoreOutcome::Restored
+        );
+        assert!(WindowsClipboardRestoreOutcome::Restored.is_restored());
+        assert!(!WindowsClipboardRestoreOutcome::Failed("open-clipboard").is_restored());
+        assert_eq!(
+            WindowsClipboardRestoreOutcome::SequenceChanged {
+                expected: 7,
+                actual: 9
+            }
+            .trace_status(),
+            "sequence-changed(expected=7,actual=9)"
+        );
     }
 
     #[test]

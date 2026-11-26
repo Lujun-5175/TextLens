@@ -2,6 +2,7 @@
 export const TAURI_COMMANDS = {
   getSettings: 'get_settings',
   settingsReady: 'settings_ready',
+  setSettingsDirty: 'set_settings_dirty',
   updateSettings: 'update_settings',
   resetResultSize: 'reset_result_size',
   createProvider: 'create_provider',

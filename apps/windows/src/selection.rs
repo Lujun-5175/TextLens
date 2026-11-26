@@ -9,12 +9,15 @@
 
 use super::{
     automatic_selection_fingerprint, automatic_selection_pointer_matches_bounds,
-    classify_windows_mouse_selection, direction_from_points, selection_bounds_are_reasonable,
-    union_selection_bounds, windows_click_pair_matches, windows_double_click_matches_text_range,
-    windows_text_budget, DismissEvent, SelectionBounds, SelectionDirection, SelectionError,
-    SelectionEvent, SelectionMethod, SelectionMouse, SelectionPayload, SelectionPoint,
-    SelectionTrigger, SourceApplication, WindowsSelectionEvidence,
-    WindowsSelectionObservationContext, WINDOWS_CLICK_DRIFT_DISTANCE_SQUARED,
+    classify_windows_mouse_selection, direction_from_points, drag_selection_matches_gesture,
+    keyboard_selection_anchor, selection_bounds_are_reasonable, union_selection_bounds,
+    windows_click_pair_matches, windows_double_click_matches_text_range,
+    windows_drag_distance_squared, windows_text_budget, DismissEvent, SelectionBounds,
+    SelectionDirection, SelectionError, SelectionEvent, SelectionMethod, SelectionMouse,
+    SelectionPayload, SelectionPoint, SelectionTrigger, SourceApplication,
+    WindowsSelectionEvidence, WindowsSelectionObservationContext,
+    CAPTURE_UNAVAILABLE_ELEVATED_REASON, CAPTURE_UNAVAILABLE_REMOTE_REASON,
+    WINDOWS_CLICK_DRIFT_DISTANCE_SQUARED,
 };
 use crate::{
     clipboard,
@@ -1766,12 +1769,20 @@ impl SelectionWorker {
                     );
                 let start_point = raw_selection_point(start);
                 let end_point = raw_selection_point(point);
+                // The hook reports physical pixels, so the drag threshold must
+                // be scaled by the display the gesture started on.
+                let gesture_dpi_scale = dpi_scale_for_window(if gesture_window != 0 {
+                    HWND(gesture_window as *mut c_void)
+                } else {
+                    target_window
+                });
                 let trigger = classify_windows_mouse_selection(
                     start_point,
                     end_point,
                     self.mouse_down_shift,
                     is_double_click,
                     drag_duration_valid,
+                    windows_drag_distance_squared(gesture_dpi_scale),
                 );
                 self.last_mouse_up = Some(point);
                 if unmodified
@@ -2219,6 +2230,26 @@ impl SelectionWorker {
                 }
                 Ok(None) => {
                     trace_selection_capture("empty", &request, trace_root, trace_process_id);
+                    // A plain click is observation-only and must stay silent;
+                    // a real gesture that yielded nothing may be blocked by
+                    // UIPI or a remote session, which the user cannot guess.
+                    if !request.observation_only {
+                        if let Some(reason) =
+                            capture_unavailable_reason(completion.source_process_id)
+                        {
+                            trace_selection_capture(
+                                "empty-capture-unavailable",
+                                &request,
+                                trace_root,
+                                trace_process_id,
+                            );
+                            self.emit_capture_unavailable(
+                                reason,
+                                request.current,
+                                completion.source_process_id,
+                            );
+                        }
+                    }
                 }
                 Err(_) => {
                     trace_selection_capture("error", &request, trace_root, trace_process_id);
@@ -2263,7 +2294,42 @@ impl SelectionWorker {
             );
             return false;
         }
+        if request.trigger == SelectionTrigger::Keyboard {
+            // Shift+Arrow / Select-All captures have no usable pointer
+            // position; prefer the selected range's geometry so the toolbar
+            // opens next to the text instead of at a resting mouse cursor.
+            selection.mouse.current =
+                keyboard_selection_anchor(selection.bounds, selection.mouse.current);
+        }
         if request.trigger != SelectionTrigger::Manual {
+            if request.trigger == SelectionTrigger::Drag {
+                // A drag may only present a range produced by this gesture.
+                // Without this check a provider that did not update its
+                // selection hands us the previous range again, and the toolbar
+                // reopens over text the user did not select.
+                let drag_start = request
+                    .start
+                    .map(raw_selection_point)
+                    .unwrap_or(raw_selection_point(request.current));
+                let drag_end = request
+                    .end
+                    .map(raw_selection_point)
+                    .unwrap_or(raw_selection_point(request.current));
+                if !drag_selection_matches_gesture(
+                    selection.bounds,
+                    drag_start,
+                    drag_end,
+                    POINTER_BOUNDS_TOLERANCE,
+                ) {
+                    trace_selection_capture(
+                        "rejected-drag-outside-gesture",
+                        &request,
+                        source_root_window,
+                        source_process_id,
+                    );
+                    return false;
+                }
+            }
             if request.trigger != SelectionTrigger::Keyboard
                 && !automatic_selection_pointer_matches_bounds(&selection, POINTER_BOUNDS_TOLERANCE)
             {
@@ -2322,6 +2388,21 @@ impl SelectionWorker {
                 mouse: raw_selection_point(point),
                 target_pid: i64::from(window_process_id(target_window)),
                 timestamp_ms,
+                sequence: 0,
+            }))
+        });
+    }
+
+    /// Reports an empty capture that is explained by UIPI/remote-desktop
+    /// isolation. Unlike `emit_dismiss` the process id is the capture source,
+    /// not a window lookup, so the runtime can throttle per source app.
+    fn emit_capture_unavailable(&self, reason: &'static str, point: RawPoint, process_id: u32) {
+        let _ = self.event_sender.lock().ok().map(|sender| {
+            sender.send(SelectionEvent::Dismiss(DismissEvent {
+                reason: reason.to_owned(),
+                mouse: raw_selection_point(point),
+                target_pid: i64::from(process_id),
+                timestamp_ms: timestamp_ms(),
                 sequence: 0,
             }))
         });
@@ -4045,7 +4126,10 @@ impl CaptureEngine {
             trace_selection_route("clipboard-recovery-cancelled", source_window, process_id);
             return false;
         }
-        if recovery.snapshot.restore_if_unchanged(current_sequence) {
+        let restore = recovery
+            .snapshot
+            .restore_if_unchanged_detailed(current_sequence);
+        if restore.is_restored() {
             control.report_phase(HelperPhase::ClipboardRestored { process_id });
             // The renderer can publish another delayed format after this
             // repair. Keep the same original snapshot under a fresh sequence
@@ -4059,7 +4143,7 @@ impl CaptureEngine {
             true
         } else {
             trace_selection_route(
-                "clipboard-recovery-restore-raced",
+                &format!("clipboard-recovery-restore-{}", restore.trace_status()),
                 source_window,
                 process_id,
             );
@@ -4452,8 +4536,17 @@ impl CaptureEngine {
                 process_parents,
             )
         {
-            if snapshot.restore_if_unchanged(copied_sequence) {
+            // The capture is discarded either way; still keep the restore
+            // failure reason in the trace instead of silently dropping it.
+            let restore = snapshot.restore_if_unchanged_detailed(copied_sequence);
+            if restore.is_restored() {
                 control.report_phase(HelperPhase::ClipboardRestored { process_id });
+            } else {
+                trace_selection_route(
+                    &format!("clipboard-finalize-restore-{}", restore.trace_status()),
+                    source_window,
+                    process_id,
+                );
             }
             trace_selection_route("clipboard-finalize-invalid", source_window, process_id);
             return Ok(None);
@@ -4464,16 +4557,13 @@ impl CaptureEngine {
         // moved away: a real user copy changes the sequence and wins. Keeping
         // the restore independent of foreground state prevents an aborted PDF
         // capture from leaving stale text that later selections can consume.
-        let restored = snapshot.restore_if_unchanged(copied_sequence);
+        let restore = snapshot.restore_if_unchanged_detailed(copied_sequence);
+        let restored = restore.is_restored();
         if restored {
             control.report_phase(HelperPhase::ClipboardRestored { process_id });
         }
         trace_selection_route(
-            if restored {
-                "clipboard-restore-success"
-            } else {
-                "clipboard-restore-raced"
-            },
+            &format!("clipboard-restore-{}", restore.trace_status()),
             source_window,
             process_id,
         );
@@ -8115,16 +8205,13 @@ fn restore_interrupted_clipboard_if_safe(
     {
         return false;
     }
-    let restored = snapshot.restore_if_unchanged(current_sequence);
+    let restore = snapshot.restore_if_unchanged_detailed(current_sequence);
+    let restored = restore.is_restored();
     if restored {
         control.report_phase(HelperPhase::ClipboardRestored { process_id });
     }
     trace_selection_route(
-        if restored {
-            "clipboard-interrupted-restore-success"
-        } else {
-            "clipboard-interrupted-restore-raced"
-        },
+        &format!("clipboard-interrupted-restore-{}", restore.trace_status()),
         source_window,
         process_id,
     );
@@ -8967,6 +9054,107 @@ fn window_process_id(window: HWND) -> u32 {
     let mut process_id = 0;
     unsafe { GetWindowThreadProcessId(window, Some(&mut process_id)) };
     process_id
+}
+
+/// Display scale of the window the gesture started on. Hook coordinates are
+/// physical pixels, so thresholds expressed in DIPs multiply by this value.
+fn dpi_scale_for_window(window: HWND) -> f64 {
+    use windows::Win32::UI::HiDpi::GetDpiForWindow;
+
+    if window.0 == ptr::null_mut() {
+        return 1.0;
+    }
+    let dpi = unsafe { GetDpiForWindow(window) };
+    if dpi == 0 {
+        1.0
+    } else {
+        f64::from(dpi) / 96.0
+    }
+}
+
+/// Why an empty capture is expected for this source process, if it is.
+///
+/// UIPI blocks a medium-integrity process from reading an elevated
+/// application's UI Automation tree, and remote-desktop clients do not publish
+/// the remote selection at all. Both look like "no selection" from here;
+/// reporting the reason lets the runtime explain it once instead of showing
+/// nothing at all.
+pub(super) fn capture_unavailable_reason(process_id: u32) -> Option<&'static str> {
+    if process_id == 0 {
+        return None;
+    }
+    // `query_full_process_image_path` is the cheap handle-based probe; the
+    // ToolHelp fallback used by `process_image_path` walks every process and
+    // must not run after each empty gesture.
+    let image_path = query_full_process_image_path(process_id).unwrap_or_default();
+    if remote_desktop_host_executable(&executable_name(&image_path)) {
+        return Some(CAPTURE_UNAVAILABLE_REMOTE_REASON);
+    }
+    // Only an unelevated TextLens is blocked by UIPI. When TextLens itself runs
+    // elevated it can read elevated applications, so "run TextLens as admin"
+    // would be wrong advice for a genuinely empty capture.
+    if !process_is_elevated(unsafe { GetCurrentProcessId() }) && process_is_elevated(process_id) {
+        return Some(CAPTURE_UNAVAILABLE_ELEVATED_REASON);
+    }
+    None
+}
+
+pub(super) fn foreground_capture_unavailable_reason() -> Option<(u32, &'static str)> {
+    let foreground = unsafe { GetForegroundWindow() };
+    let process_id = window_process_id(foreground);
+    capture_unavailable_reason(process_id).map(|reason| (process_id, reason))
+}
+
+fn remote_desktop_host_executable(executable: &str) -> bool {
+    matches!(
+        executable,
+        "mstsc.exe"
+            | "msrdc.exe"
+            | "teamviewer.exe"
+            | "anydesk.exe"
+            | "rustdesk.exe"
+            | "todesk.exe"
+            | "sunloginclient.exe"
+            | "parsecd.exe"
+    )
+}
+
+/// Token elevation is the authoritative check for UIPI isolation. Protected
+/// processes refuse `PROCESS_QUERY_LIMITED_INFORMATION`; those are reported as
+/// not elevated because no notice text would be actionable for them.
+fn process_is_elevated(process_id: u32) -> bool {
+    use windows::Win32::{
+        Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY},
+        System::Threading::OpenProcessToken,
+    };
+
+    let Ok(process) =
+        (unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, process_id) })
+    else {
+        return false;
+    };
+    let process = OwnedHandle(process);
+    let mut token = HANDLE::default();
+    if unsafe { OpenProcessToken(process.0, TOKEN_QUERY, &mut token) }.is_err() {
+        return false;
+    }
+    let token = OwnedHandle(token);
+    let mut elevation = TOKEN_ELEVATION::default();
+    let mut returned = 0u32;
+    if unsafe {
+        GetTokenInformation(
+            token.0,
+            TokenElevation,
+            Some(&mut elevation as *mut TOKEN_ELEVATION as *mut c_void),
+            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+            &mut returned,
+        )
+    }
+    .is_err()
+    {
+        return false;
+    }
+    elevation.TokenIsElevated != 0
 }
 
 fn window_is_fullscreen(window: HWND) -> bool {
@@ -10008,7 +10196,7 @@ mod tests {
         let request = CaptureRequest {
             observation_generation: None,
             observation_only: false,
-            trigger: SelectionTrigger::Drag,
+            trigger: SelectionTrigger::ShiftClick,
             start: Some(RawPoint { x: 10, y: 10 }),
             end: Some(RawPoint { x: 80, y: 10 }),
             current: RawPoint { x: 80, y: 10 },
@@ -10017,7 +10205,7 @@ mod tests {
             press_duration_ms: 0,
             capture_strategy: SelectionCaptureStrategy::SelectionHook,
         };
-        let mut selection = test_selection(SelectionTrigger::Drag);
+        let mut selection = test_selection(SelectionTrigger::ShiftClick);
         selection.bounds = Some(SelectionBounds {
             x: 5_000.0,
             y: 5_000.0,
@@ -10034,6 +10222,88 @@ mod tests {
         };
         assert_eq!(selection.text, "selected text");
         assert_eq!(selection.bounds, None);
+    }
+
+    #[test]
+    fn remote_desktop_hosts_are_recognized_by_executable_name() {
+        assert!(remote_desktop_host_executable("mstsc.exe"));
+        assert!(remote_desktop_host_executable("msrdc.exe"));
+        assert!(remote_desktop_host_executable("anydesk.exe"));
+        assert!(!remote_desktop_host_executable("notepad.exe"));
+        assert!(!remote_desktop_host_executable(""));
+    }
+
+    #[test]
+    fn keyboard_delivery_anchors_the_toolbar_on_the_selected_range() {
+        let (event_sender, event_receiver) = mpsc::channel();
+        let mut worker = test_worker(event_sender);
+        let request = CaptureRequest {
+            observation_generation: None,
+            observation_only: false,
+            trigger: SelectionTrigger::Keyboard,
+            start: None,
+            end: None,
+            // The mouse is parked far away from the text.
+            current: RawPoint { x: 10, y: 10 },
+            generation: Some(hook_generation().load(Ordering::Acquire)),
+            clipboard_sequence_at_start: None,
+            press_duration_ms: 0,
+            capture_strategy: SelectionCaptureStrategy::SelectionHook,
+        };
+        let mut selection = test_selection(SelectionTrigger::Keyboard);
+        selection.bounds = Some(SelectionBounds {
+            x: 200.0,
+            y: 300.0,
+            width: 400.0,
+            height: 18.0,
+        });
+
+        assert!(worker.deliver_captured_selection(request, selection, 42, 200));
+        let SelectionEvent::Selection(selection) = event_receiver
+            .recv_timeout(Duration::from_millis(50))
+            .expect("selection event")
+        else {
+            panic!("expected selection event");
+        };
+        // Bottom-center of the UIA range, not the parked cursor.
+        assert_eq!(
+            selection.mouse.current,
+            SelectionPoint { x: 400.0, y: 318.0 }
+        );
+    }
+
+    #[test]
+    fn drag_bounds_outside_the_current_gesture_do_not_open_the_toolbar() {
+        let (event_sender, event_receiver) = mpsc::channel();
+        let mut worker = test_worker(event_sender);
+        let generation = hook_generation().load(Ordering::Acquire);
+        let request = CaptureRequest {
+            observation_generation: None,
+            observation_only: false,
+            trigger: SelectionTrigger::Drag,
+            start: Some(RawPoint { x: 10, y: 10 }),
+            end: Some(RawPoint { x: 80, y: 10 }),
+            current: RawPoint { x: 80, y: 10 },
+            generation: Some(generation),
+            clipboard_sequence_at_start: None,
+            press_duration_ms: 0,
+            capture_strategy: SelectionCaptureStrategy::SelectionHook,
+        };
+        // A provider that never updated its range hands back the previous
+        // selection. This drag must not present it again.
+        let mut selection = test_selection(SelectionTrigger::Drag);
+        selection.bounds = Some(SelectionBounds {
+            x: 5_000.0,
+            y: 5_000.0,
+            width: 100.0,
+            height: 20.0,
+        });
+
+        assert!(!worker.deliver_captured_selection(request, selection, 42, 200));
+        assert!(matches!(
+            event_receiver.try_recv(),
+            Err(TryRecvError::Empty)
+        ));
     }
 
     #[test]

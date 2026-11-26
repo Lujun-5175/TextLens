@@ -66,6 +66,7 @@ export interface SettingsGuidance {
 export interface WindowTextLensApi {
   getSettings(): Promise<PublicSettings>
   settingsReady?(): Promise<void>
+  setSettingsDirty?(dirty: boolean): Promise<void>
   updateSettings(update: SettingsUpdate): Promise<PublicSettings>
   resetResultSize?(): Promise<PublicSettings>
   createProvider?(input: ProviderCreateInput): Promise<PublicSettings>

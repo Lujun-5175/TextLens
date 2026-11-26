@@ -567,6 +567,13 @@ export function SettingsApp(): JSX.Element {
   }, [keyInputs, keyBaselines])
   unsavedChangesRef.current = dirty || keysDirty
 
+  // The settings window hides to the tray by default, so the backend has to
+  // know when closing would drop edits: a tray quit is refused while dirty.
+  const settingsDirtyForTray = dirty || keysDirty
+  useEffect(() => {
+    void window.textLens.setSettingsDirty?.(settingsDirtyForTray).catch(() => undefined)
+  }, [settingsDirtyForTray])
+
   const refreshRuntimeStatus = useCallback(async (): Promise<void> => {
     const status = await window.textLens.getAccessibilityStatus()
     setAccessibility(status)

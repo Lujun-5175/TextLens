@@ -50,6 +50,12 @@ use crate::{
     },
 };
 
+#[cfg(target_os = "windows")]
+use crate::{
+    selection::{CAPTURE_UNAVAILABLE_ELEVATED_REASON, CAPTURE_UNAVAILABLE_REMOTE_REASON},
+    windows::StartupNoticeKind,
+};
+
 pub const SELECTION_EVENT: &str = "textlens:selection";
 pub const SETTINGS_CHANGED_EVENT: &str = "textlens:settings-changed";
 pub const SHORTCUT_ERROR_EVENT: &str = "textlens:shortcut-error";
@@ -771,8 +777,15 @@ pub struct RuntimeState {
     latest_result_size: Mutex<Option<PendingResultSize>>,
     last_permission: Mutex<bool>,
     settings_renderer_ready: AtomicBool,
+    /// Whether the hidden settings window holds unsaved edits. The renderer
+    /// reports this so a tray quit cannot silently discard them.
+    settings_dirty: AtomicBool,
     shutting_down: AtomicBool,
     pending_settings_guidance: Mutex<Option<SettingsGuidance>>,
+    /// Last UIPI/remote-desktop capture notice: `(source process, kind, shown
+    /// at)`. Used to throttle the notice to one per source app per window.
+    #[cfg(target_os = "windows")]
+    capture_unavailable_notice: Mutex<Option<(u32, StartupNoticeKind, Instant)>>,
 }
 
 impl RuntimeState {
@@ -806,8 +819,11 @@ impl RuntimeState {
             latest_result_size: Mutex::new(None),
             last_permission: Mutex::new(SelectionMonitor::is_accessibility_trusted()),
             settings_renderer_ready: AtomicBool::new(false),
+            settings_dirty: AtomicBool::new(false),
             shutting_down: AtomicBool::new(false),
             pending_settings_guidance: Mutex::new(None),
+            #[cfg(target_os = "windows")]
+            capture_unavailable_notice: Mutex::new(None),
         }
     }
 
@@ -821,6 +837,49 @@ impl RuntimeState {
             bounds: selection.bounds,
             mouse: selection.mouse,
         });
+    }
+
+    /// Explains an empty capture caused by UIPI or remote-desktop isolation.
+    /// Throttled per source process and reason so repeated attempts stay quiet.
+    #[cfg(target_os = "windows")]
+    fn maybe_show_capture_unavailable_notice(
+        &self,
+        app: &AppHandle,
+        process_id: u32,
+        kind: StartupNoticeKind,
+    ) {
+        if self.shutting_down.load(Ordering::Acquire) {
+            return;
+        }
+        let now = Instant::now();
+        {
+            let mut last = self.capture_unavailable_notice.lock();
+            if !capture_unavailable_notice_is_due(*last, process_id, kind, now) {
+                return;
+            }
+            *last = Some((process_id, kind, now));
+        }
+        let app_handle = app.clone();
+        // Notice windows are Tauri webviews; build them on the event-loop
+        // thread like the startup notice does.
+        let _ = app.run_on_main_thread(move || {
+            if let Err(error) = crate::windows::show_startup_notice(&app_handle, kind) {
+                eprintln!("[selection] stage=capture-unavailable-notice error={error}");
+            }
+        });
+    }
+
+    /// Manual/shortcut captures get no helper event when they are empty, so the
+    /// foreground process is inspected here instead.
+    #[cfg(target_os = "windows")]
+    fn maybe_show_foreground_capture_unavailable_notice(&self, app: &AppHandle) {
+        let Some((process_id, reason)) = crate::selection::foreground_capture_unavailable_reason()
+        else {
+            return;
+        };
+        if let Some(kind) = capture_unavailable_notice_kind(reason) {
+            self.maybe_show_capture_unavailable_notice(app, process_id, kind);
+        }
     }
 
     /// Revoke older clear leases and return the generation for a new selection.
@@ -941,6 +1000,18 @@ impl RuntimeState {
         match event {
             SelectionEvent::Selection(selection) => self.handle_selection(app, selection, false),
             SelectionEvent::Dismiss(dismiss) => {
+                // An empty capture blocked by UIPI or a remote session is not
+                // a dismissal: explain it once and leave the current toolbar
+                // untouched.
+                #[cfg(target_os = "windows")]
+                if let Some(kind) = capture_unavailable_notice_kind(&dismiss.reason) {
+                    self.maybe_show_capture_unavailable_notice(
+                        app,
+                        u32::try_from(dismiss.target_pid).unwrap_or_default(),
+                        kind,
+                    );
+                    return;
+                }
                 let result_selection_origin = self
                     .current_selection
                     .lock()
@@ -1282,6 +1353,8 @@ impl RuntimeState {
                 match captured {
                     Ok(Some(selection)) => state.handle_selection(&app, selection, true),
                     Ok(None) | Err(_) => {
+                        #[cfg(target_os = "windows")]
+                        state.maybe_show_foreground_capture_unavailable_notice(&app);
                         state.windows.hide_toolbar(&app);
                         *state.current_selection.lock() = None;
                     }
@@ -1715,6 +1788,9 @@ impl RuntimeState {
             dismiss_delay_ms: u64::from(result.dismiss_delay_ms),
             opacity: result.opacity,
             remember_size: result.remember_size,
+            // Captured above this call: a fullscreen source window must not
+            // lose fullscreen just because the result took focus.
+            source_fullscreen: selection.payload.is_fullscreen,
         };
         // Publish immutable session metadata before creating the webview. A
         // fast renderer can invoke its ready handshake during `build()`, and
@@ -1955,7 +2031,14 @@ impl RuntimeState {
             WindowEvent::CloseRequested { api, .. } => {
                 // Tauri queues close() even on the UI thread. Revalidate an
                 // automatic close after any intervening focus/pointer/pin IPC.
-                if !self.windows.accept_result_close_request(app, label) {
+                // A blur dismissal must also yield while the session still has
+                // an in-flight request, otherwise the stream is cancelled and
+                // its answer is lost.
+                if !self.windows.accept_result_close_request(
+                    app,
+                    label,
+                    result_session_is_streaming(&self.actions, &session_id),
+                ) {
                     api.prevent_close();
                     return;
                 }
@@ -2413,7 +2496,7 @@ fn handle_tray_menu_event(app: &AppHandle, event: tauri::menu::MenuEvent) {
         // settings renderer is unhealthy. The settings-page button and the
         // close-behavior confirmation eventually enter this same controller
         // through `quit_app`.
-        TRAY_QUIT_ID => quit_application(app),
+        TRAY_QUIT_ID => request_quit_from_tray(app),
         _ => {}
     }
 }
@@ -2482,6 +2565,38 @@ pub fn take_settings_guidance(
 }
 
 #[cfg(target_os = "windows")]
+const CAPTURE_UNAVAILABLE_NOTICE_INTERVAL: Duration = Duration::from_secs(60);
+
+/// The same source process and the same reason may only produce one notice per
+/// throttle window; otherwise every failed selection in an elevated app would
+/// flash a notice.
+#[cfg(target_os = "windows")]
+fn capture_unavailable_notice_is_due(
+    last: Option<(u32, StartupNoticeKind, Instant)>,
+    process_id: u32,
+    kind: StartupNoticeKind,
+    now: Instant,
+) -> bool {
+    match last {
+        Some((last_process, last_kind, shown_at)) => {
+            last_process != process_id
+                || last_kind != kind
+                || now.saturating_duration_since(shown_at) >= CAPTURE_UNAVAILABLE_NOTICE_INTERVAL
+        }
+        None => true,
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn capture_unavailable_notice_kind(reason: &str) -> Option<StartupNoticeKind> {
+    match reason {
+        CAPTURE_UNAVAILABLE_ELEVATED_REASON => Some(StartupNoticeKind::CaptureBlockedElevated),
+        CAPTURE_UNAVAILABLE_REMOTE_REASON => Some(StartupNoticeKind::CaptureBlockedRemoteDesktop),
+        _ => None,
+    }
+}
+
+#[cfg(target_os = "windows")]
 fn request_settings_close_confirmation(app: &AppHandle) -> bool {
     app.emit_to(SETTINGS_LABEL, SETTINGS_CLOSE_REQUEST_EVENT, ())
         .is_ok()
@@ -2490,6 +2605,25 @@ fn request_settings_close_confirmation(app: &AppHandle) -> bool {
 fn quit_application(app: &AppHandle) {
     app.state::<RuntimeState>().shutdown(app);
     app.exit(0);
+}
+
+/// Tray quit must not silently discard edits held by the hidden settings window.
+///
+/// The renderer reports its dirty state, so quitting with unsaved edits opens
+/// the settings window and explains instead of exiting. Once the user saves or
+/// discards, the flag clears and the next quit proceeds normally.
+fn request_quit_from_tray(app: &AppHandle) {
+    let dirty = app
+        .state::<RuntimeState>()
+        .settings_dirty
+        .load(Ordering::Acquire);
+    if !dirty {
+        quit_application(app);
+        return;
+    }
+    open_settings_window(app);
+    #[cfg(target_os = "windows")]
+    let _ = crate::windows::show_startup_notice(app, StartupNoticeKind::SettingsUnsaved);
 }
 
 fn request_accessibility_internal(app: &AppHandle) -> AccessibilityStatus {
@@ -2604,6 +2738,14 @@ pub async fn get_settings(
 pub fn settings_ready(window: WebviewWindow, state: State<'_, RuntimeState>) -> Result<(), String> {
     ensure_settings_caller(&window)?;
     state.settings_renderer_ready.store(true, Ordering::Release);
+    Ok(())
+}
+
+/// Lets the settings renderer tell the tray whether closing would lose edits.
+#[tauri::command]
+pub fn set_settings_dirty(window: WebviewWindow, state: State<'_, RuntimeState>, dirty: bool) -> Result<(), String> {
+    ensure_settings_caller(&window)?;
+    state.settings_dirty.store(dirty, Ordering::Release);
     Ok(())
 }
 
@@ -3776,15 +3918,27 @@ fn dismiss_mode(mode: ResultDismissMode) -> DismissMode {
 fn selection_toolbar_anchor(selection: &SelectionPayload) -> (WindowPoint, ToolbarPlacement) {
     let cursor = selection.mouse.end.unwrap_or(selection.mouse.current);
     // The release point is the only coordinate shared reliably by UIA, MSAA,
-    // COM and clipboard fallback paths. Treat it as the toolbar's top edge;
-    // the window coordinator performs screen-edge clamping afterward.
+    // COM and clipboard fallback paths. Treat it as the toolbar's near edge;
+    // the window coordinator performs screen-edge clamping and inserts the
+    // gap between the range and the toolbar.
     (
         WindowPoint {
             x: cursor.x,
             y: cursor.y,
         },
-        ToolbarPlacement::BottomMiddle,
+        toolbar_placement_for_direction(selection.direction),
     )
+}
+
+/// A backward (bottom-to-top) drag releases at the top edge of the range, so a
+/// toolbar below that point would sit on top of the selected text. Place it
+/// above instead; every other direction keeps the familiar below-the-selection
+/// position.
+fn toolbar_placement_for_direction(direction: SelectionDirection) -> ToolbarPlacement {
+    match direction {
+        SelectionDirection::Backward => ToolbarPlacement::TopMiddle,
+        SelectionDirection::Forward | SelectionDirection::Unknown => ToolbarPlacement::BottomMiddle,
+    }
 }
 
 fn should_hide_toolbar_for_selection(
@@ -3904,6 +4058,17 @@ fn cursor_near_toolbar(app: &AppHandle, selection: &SelectionPayload) -> WindowP
 fn session_from_result_label(label: &str) -> Option<String> {
     let session = label.strip_prefix(RESULT_LABEL_PREFIX)?;
     Uuid::parse_str(session).ok().map(|value| value.to_string())
+}
+
+/// True while the session has an in-flight request (preparing or streaming).
+/// The result window is the only copy of that answer, so automatic blur
+/// dismissal must not destroy it. `Running` covers both the preparation phase
+/// and an active stream because the session status only leaves `Running` at a
+/// terminal commit.
+fn result_session_is_streaming(actions: &ActionService, session_id: &str) -> bool {
+    actions
+        .get_snapshot(session_id)
+        .is_some_and(|snapshot| snapshot.status == ActionSnapshotStatus::Running)
 }
 
 fn application_is_allowed(
@@ -4225,6 +4390,54 @@ mod tests {
         assert!(pending.lock().is_empty());
     }
 
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn capture_unavailable_notice_is_throttled_per_process_and_reason() {
+        let now = Instant::now();
+        let kind = StartupNoticeKind::CaptureBlockedElevated;
+        assert!(capture_unavailable_notice_is_due(None, 42, kind, now));
+
+        let shown = Some((42, kind, now));
+        // The same app hitting the same wall stays quiet inside the window.
+        assert!(!capture_unavailable_notice_is_due(
+            shown,
+            42,
+            kind,
+            now + Duration::from_secs(59)
+        ));
+        // A different source app or a different reason is independent.
+        assert!(capture_unavailable_notice_is_due(shown, 43, kind, now));
+        assert!(capture_unavailable_notice_is_due(
+            shown,
+            42,
+            StartupNoticeKind::CaptureBlockedRemoteDesktop,
+            now
+        ));
+        // Once the window elapses the same app may be told again.
+        assert!(capture_unavailable_notice_is_due(
+            shown,
+            42,
+            kind,
+            now + Duration::from_secs(60)
+        ));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn capture_unavailable_reasons_map_to_their_notice_kinds() {
+        assert_eq!(
+            capture_unavailable_notice_kind(CAPTURE_UNAVAILABLE_ELEVATED_REASON),
+            Some(StartupNoticeKind::CaptureBlockedElevated)
+        );
+        assert_eq!(
+            capture_unavailable_notice_kind(CAPTURE_UNAVAILABLE_REMOTE_REASON),
+            Some(StartupNoticeKind::CaptureBlockedRemoteDesktop)
+        );
+        // Ordinary dismissals must not produce a notice.
+        assert_eq!(capture_unavailable_notice_kind("mouseDown"), None);
+        assert_eq!(capture_unavailable_notice_kind("scroll"), None);
+    }
+
     fn result_meta() -> ResultSessionMeta {
         ResultSessionMeta {
             selection: CurrentSelection {
@@ -4284,6 +4497,38 @@ mod tests {
         let (anchor, placement) = selection_toolbar_anchor(&selection);
         assert_eq!(anchor, WindowPoint { x: 72.0, y: 88.0 });
         assert_eq!(placement, ToolbarPlacement::BottomMiddle);
+    }
+
+    #[test]
+    fn selection_toolbar_sits_above_a_backward_range_and_below_a_forward_one() {
+        let mut forward = result_meta().selection.payload;
+        forward.mouse.end = Some(SelectionPoint { x: 240.0, y: 360.0 });
+        forward.direction = SelectionDirection::Forward;
+        assert_eq!(
+            selection_toolbar_anchor(&forward),
+            (
+                WindowPoint { x: 240.0, y: 360.0 },
+                ToolbarPlacement::BottomMiddle
+            )
+        );
+
+        let mut backward = forward.clone();
+        backward.direction = SelectionDirection::Backward;
+        assert_eq!(
+            selection_toolbar_anchor(&backward),
+            (
+                WindowPoint { x: 240.0, y: 360.0 },
+                ToolbarPlacement::TopMiddle
+            )
+        );
+
+        // Unknown direction keeps the previous below-the-point behavior.
+        let mut unknown = forward.clone();
+        unknown.direction = SelectionDirection::Unknown;
+        assert_eq!(
+            toolbar_placement_for_direction(unknown.direction),
+            ToolbarPlacement::BottomMiddle
+        );
     }
 
     fn initial_preparing_begin() -> ActionBeginReady {

@@ -27,6 +27,12 @@ static STARTUP_NOTICE_GENERATION: AtomicU64 = AtomicU64::new(0);
 static WINDOWS_UI_THREAD_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 const SCREEN_MARGIN: f64 = 8.0;
 const TOOLBAR_SCREEN_MARGIN: f64 = 20.0;
+/// Visible gap between the selected range and the toolbar, in logical pixels.
+/// Below the range the anchor is the mouse-up point (the selection's bottom
+/// edge); above it the anchor is the same point (the selection's top edge for
+/// a backward range). Keeping a small gap prevents the toolbar from covering
+/// the first/last selected line.
+const TOOLBAR_SELECTION_GAP: f64 = 7.0;
 // WebView2's client extent can land a few physical pixels short of a
 // borderless SetWindowPos request on some DPI/driver combinations. Keep a
 // small, scale-aware transparent trailing area outside the measured toolbar
@@ -68,6 +74,16 @@ enum ResultForegroundScope {
 pub enum StartupNoticeKind {
     Started,
     AlreadyRunning,
+    /// The source application runs at a higher integrity level (UIPI blocks
+    /// TextLens from reading its UI Automation tree).
+    CaptureBlockedElevated,
+    /// The source application is a remote-desktop client (mstsc/Windows App or
+    /// a third-party remote-control tool); the remote selection is rendered as
+    /// pixels and is not exposed locally.
+    CaptureBlockedRemoteDesktop,
+    /// The tray quit was deferred because the settings window holds unsaved
+    /// edits; the notice explains why the app stayed open.
+    SettingsUnsaved,
 }
 
 #[cfg(target_os = "windows")]
@@ -76,6 +92,9 @@ impl StartupNoticeKind {
         match self {
             Self::Started => "started",
             Self::AlreadyRunning => "running",
+            Self::CaptureBlockedElevated => "captureBlockedElevated",
+            Self::CaptureBlockedRemoteDesktop => "captureBlockedRemote",
+            Self::SettingsUnsaved => "settingsUnsaved",
         }
     }
 }
@@ -192,6 +211,9 @@ pub enum ToolbarPlacement {
     BottomMiddle,
     BottomLeft,
     BottomRight,
+    /// Mirrors `BottomMiddle` above the anchor; used for a backward selection
+    /// so the toolbar never covers the range the user just selected upward.
+    TopMiddle,
     TopRight,
 }
 
@@ -250,6 +272,10 @@ pub struct ResultWindowOptions {
     pub dismiss_delay_ms: u64,
     pub opacity: f64,
     pub remember_size: bool,
+    /// The selection was captured over a fullscreen source window. The result
+    /// must then be ordered topmost without taking focus, otherwise activating
+    /// it makes the source application leave fullscreen.
+    pub source_fullscreen: bool,
 }
 
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
@@ -266,6 +292,7 @@ struct ResultRuntime {
     pinned: bool,
     opacity: f64,
     placement: ResultPlacement,
+    source_fullscreen: bool,
     reveal_phase: ResultRevealPhase,
     reveal_operation: Arc<Mutex<()>>,
     focus_seen: bool,
@@ -1281,6 +1308,7 @@ impl WindowCoordinator {
                     cursor: options.cursor,
                     follow_cursor: options.follow_cursor,
                 },
+                source_fullscreen: options.source_fullscreen,
                 reveal_phase: initial_result_reveal_phase(),
                 reveal_operation: Arc::new(Mutex::new(())),
                 focus_seen: false,
@@ -1346,14 +1374,14 @@ impl WindowCoordinator {
     pub fn prepare_result_reveal(&self, app: &AppHandle, label: &str) -> tauri::Result<()> {
         let operation = self.result_reveal_operation(label)?;
         let _operation_guard = operation.lock();
-        let (phase, pinned, placement) = self.result_reveal_context(label)?;
+        let (phase, pinned, placement, source_fullscreen) = self.result_reveal_context(label)?;
         if phase != ResultRevealPhase::Hidden {
             return Ok(());
         }
         let window = app
             .get_webview_window(label)
             .ok_or_else(|| result_reveal_error("result window no longer exists"))?;
-        prepare_result_window(&window, pinned, placement)?;
+        prepare_result_window(&window, pinned, source_fullscreen, placement)?;
         self.set_result_reveal_phase(
             label,
             ResultRevealPhase::Hidden,
@@ -1366,7 +1394,7 @@ impl WindowCoordinator {
     pub fn commit_result_reveal(&self, app: &AppHandle, label: &str) -> tauri::Result<bool> {
         let operation = self.result_reveal_operation(label)?;
         let _operation_guard = operation.lock();
-        let (phase, pinned, _) = self.result_reveal_context(label)?;
+        let (phase, pinned, _, source_fullscreen) = self.result_reveal_context(label)?;
         match phase {
             ResultRevealPhase::Committed => return Ok(false),
             ResultRevealPhase::Hidden => {
@@ -1384,7 +1412,7 @@ impl WindowCoordinator {
         let window = app
             .get_webview_window(label)
             .ok_or_else(|| result_reveal_error("result window no longer exists"))?;
-        show_result_window(&window, pinned, opacity)?;
+        show_result_window(&window, pinned, source_fullscreen, opacity)?;
         self.set_result_reveal_phase(
             label,
             ResultRevealPhase::Prepared,
@@ -1410,12 +1438,19 @@ impl WindowCoordinator {
     fn result_reveal_context(
         &self,
         label: &str,
-    ) -> tauri::Result<(ResultRevealPhase, bool, ResultPlacement)> {
+    ) -> tauri::Result<(ResultRevealPhase, bool, ResultPlacement, bool)> {
         self.state
             .lock()
             .results
             .get(label)
-            .map(|runtime| (runtime.reveal_phase, runtime.pinned, runtime.placement))
+            .map(|runtime| {
+                (
+                    runtime.reveal_phase,
+                    runtime.pinned,
+                    runtime.placement,
+                    runtime.source_fullscreen,
+                )
+            })
             .ok_or_else(|| result_reveal_error("result session no longer exists"))
     }
 
@@ -1652,7 +1687,36 @@ impl WindowCoordinator {
 
     /// Revalidates a queued automatic dismissal at Tauri's final CloseRequested
     /// boundary. Requests with no automatic token are ordinary/manual closes.
-    pub fn accept_result_close_request(&self, app: &AppHandle, label: &str) -> bool {
+    ///
+    /// `session_in_flight` reports whether the result's action session still
+    /// has a request running. A queued blur dismissal is dropped in that case:
+    /// destroying the window would cancel the stream and discard the only copy
+    /// of the answer. The token is cleared so a later blur or manual close can
+    /// still close the window.
+    pub fn accept_result_close_request(
+        &self,
+        app: &AppHandle,
+        label: &str,
+        session_in_flight: bool,
+    ) -> bool {
+        let streaming_blur_is_queued = {
+            let mut state = self.state.lock();
+            let pending = state
+                .results
+                .get(label)
+                .and_then(|runtime| runtime.pending_auto_close);
+            if auto_close_blocked_by_streaming(pending, session_in_flight) {
+                if let Some(runtime) = state.results.get_mut(label) {
+                    runtime.cancel_auto_close_request();
+                }
+                true
+            } else {
+                false
+            }
+        };
+        if streaming_blur_is_queued {
+            return false;
+        }
         let decision = verified_result_close_request_decision(
             &self.state,
             label,
@@ -1819,7 +1883,14 @@ fn toolbar_layout_with_placement(
         coordinate_scale,
     );
     let position = geometry.map_or_else(
-        || toolbar_position_without_area(point, coordinate_size, placement),
+        || {
+            toolbar_position_without_area(
+                point,
+                coordinate_size,
+                placement,
+                TOOLBAR_SELECTION_GAP * coordinate_scale,
+            )
+        },
         |geometry| {
             toolbar_position_in_area_with_placement(
                 point,
@@ -1882,17 +1953,18 @@ fn toolbar_position_without_area(
     point: Point,
     size: WindowSize,
     placement: ToolbarPlacement,
+    gap: f64,
 ) -> Point {
     let x = match placement {
         ToolbarPlacement::BottomLeft => point.x - size.width,
-        ToolbarPlacement::BottomMiddle => point.x - size.width / 2.0,
+        ToolbarPlacement::BottomMiddle | ToolbarPlacement::TopMiddle => point.x - size.width / 2.0,
         ToolbarPlacement::BottomRight | ToolbarPlacement::TopRight => point.x,
     };
     let y = match placement {
-        ToolbarPlacement::TopRight => point.y - size.height,
+        ToolbarPlacement::TopMiddle | ToolbarPlacement::TopRight => point.y - size.height - gap,
         ToolbarPlacement::BottomLeft
         | ToolbarPlacement::BottomMiddle
-        | ToolbarPlacement::BottomRight => point.y,
+        | ToolbarPlacement::BottomRight => point.y + gap,
     };
     Point { x, y }
 }
@@ -1913,7 +1985,12 @@ fn toolbar_position_in_area_with_placement(
     // `point` is Cherry's reference point: the toolbar grows left/right from
     // the selected endpoint and above it for a backward multi-line range.
     // Work-area clamping takes precedence near taskbars and display edges.
-    let preferred = toolbar_position_without_area(point, size, placement);
+    let preferred = toolbar_position_without_area(
+        point,
+        size,
+        placement,
+        TOOLBAR_SELECTION_GAP * coordinate_scale,
+    );
     let x = preferred.x.clamp(left, (right - size.width).max(left));
     let y = preferred.y.clamp(top, (bottom - size.height).max(top));
     Point { x, y }
@@ -2639,6 +2716,17 @@ fn verified_pointer_leave_timeout_decision(
     }
 }
 
+/// A queued blur dismissal must not destroy a result whose action session still
+/// has an in-flight request: closing the window cancels the request and, with
+/// no persisted history, silently discards the streamed answer. Manual closes
+/// and pointer-leave dismissals keep their existing semantics.
+fn auto_close_blocked_by_streaming(
+    origin: Option<AutoCloseOrigin>,
+    session_in_flight: bool,
+) -> bool {
+    session_in_flight && matches!(origin, Some(AutoCloseOrigin::Blur(_)))
+}
+
 fn verified_result_close_request_decision(
     state: &Mutex<WindowState>,
     label: &str,
@@ -3042,16 +3130,37 @@ fn set_native_alpha_raw(window: &WebviewWindow, alpha: u8) -> tauri::Result<()> 
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+struct ResultShowActivation {
+    topmost: bool,
+    focus: bool,
+}
+
+/// A result opened over a fullscreen source window must stay above it without
+/// taking focus: activating another window makes the source application
+/// (browser fullscreen view, video player, game) leave fullscreen. Pinned
+/// results are topmost as before, and ordinary results keep their usual
+/// topmost-unpinned + focused reveal.
+fn result_show_activation(pinned: bool, source_fullscreen: bool) -> ResultShowActivation {
+    ResultShowActivation {
+        topmost: pinned || source_fullscreen,
+        focus: !source_fullscreen,
+    }
+}
+
 #[cfg(target_os = "windows")]
 fn prepare_result_window(
     window: &WebviewWindow,
     pinned: bool,
+    source_fullscreen: bool,
     placement: ResultPlacement,
 ) -> tauri::Result<()> {
     use windows::Win32::UI::WindowsAndMessaging::{
         SetWindowPos, HWND_NOTOPMOST, HWND_TOPMOST, SWP_NOACTIVATE, SWP_SHOWWINDOW,
     };
 
+    let topmost = result_show_activation(pinned, source_fullscreen).topmost;
     let size = fit_size_to_monitor(window, placement.cursor, placement.size)
         .map_err(|error| result_window_step_error("monitor sizing", error))?;
     let layout = if placement.follow_cursor {
@@ -3063,10 +3172,14 @@ fn prepare_result_window(
     };
 
     run_windows_window_operation(window, move |window| {
-        configure_result_native_raw(window, pinned)?;
+        configure_result_native_raw(window, topmost)?;
         set_native_alpha_raw(window, 0)?;
         let hwnd = window.hwnd()?;
-        let insert_after = if pinned { HWND_TOPMOST } else { HWND_NOTOPMOST };
+        let insert_after = if topmost {
+            HWND_TOPMOST
+        } else {
+            HWND_NOTOPMOST
+        };
         unsafe {
             SetWindowPos(
                 hwnd,
@@ -3087,11 +3200,13 @@ fn prepare_result_window(
 fn prepare_result_window(
     window: &WebviewWindow,
     pinned: bool,
+    source_fullscreen: bool,
     placement: ResultPlacement,
 ) -> tauri::Result<()> {
+    let topmost = result_show_activation(pinned, source_fullscreen).topmost;
     run_macos_window_operation(window, move |window| {
         use objc2_app_kit::NSWindow;
-        configure_result_native_raw(window, pinned)?;
+        configure_result_native_raw(window, topmost)?;
         let size = fit_size_to_monitor(window, placement.cursor, placement.size)?;
         let layout = if placement.follow_cursor {
             result_layout(window, placement.cursor, size)?
@@ -3112,6 +3227,7 @@ fn prepare_result_window(
 fn prepare_result_window(
     window: &WebviewWindow,
     _pinned: bool,
+    _source_fullscreen: bool,
     placement: ResultPlacement,
 ) -> tauri::Result<()> {
     let layout = result_layout(window, placement.cursor, placement.size)?;
@@ -3119,28 +3235,82 @@ fn prepare_result_window(
 }
 
 #[cfg(target_os = "windows")]
-fn show_result_window(window: &WebviewWindow, pinned: bool, opacity: f64) -> tauri::Result<()> {
+fn show_result_window(
+    window: &WebviewWindow,
+    pinned: bool,
+    source_fullscreen: bool,
+    opacity: f64,
+) -> tauri::Result<()> {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        SetWindowPos, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW,
+    };
+
+    let activation = result_show_activation(pinned, source_fullscreen);
     run_windows_window_operation(window, move |window| {
-        window.show()?;
-        configure_result_native_raw(window, pinned)?;
+        if activation.focus {
+            window.show()?;
+            configure_result_native_raw(window, activation.topmost)?;
+            set_native_opacity_raw(window, opacity)?;
+            return window.set_focus();
+        }
+        // Fullscreen source windows must keep the foreground. The prepare step
+        // already made the (fully transparent) window visible with
+        // SWP_NOACTIVATE, so commit only restores the alpha and topmost band.
+        // Calling Tauri's `show()` here would activate the window and make the
+        // source application leave fullscreen.
+        configure_result_native_raw(window, activation.topmost)?;
         set_native_opacity_raw(window, opacity)?;
-        window.set_focus()
+        let hwnd = window.hwnd()?;
+        unsafe {
+            SetWindowPos(
+                hwnd,
+                Some(HWND_TOPMOST),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            )
+            .map_err(windows_error)?;
+        }
+        Ok(())
     })
 }
 
 #[cfg(target_os = "macos")]
-fn show_result_window(window: &WebviewWindow, _pinned: bool, opacity: f64) -> tauri::Result<()> {
+fn show_result_window(
+    window: &WebviewWindow,
+    pinned: bool,
+    source_fullscreen: bool,
+    opacity: f64,
+) -> tauri::Result<()> {
+    let activation = result_show_activation(pinned, source_fullscreen);
     run_macos_window_operation(window, move |window| {
+        configure_result_native_raw(window, activation.topmost)?;
         set_native_opacity(window, opacity)?;
         window.show()?;
-        window.set_focus()
+        if activation.focus {
+            window.set_focus()
+        } else {
+            Ok(())
+        }
     })
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-fn show_result_window(window: &WebviewWindow, _pinned: bool, _opacity: f64) -> tauri::Result<()> {
+fn show_result_window(
+    window: &WebviewWindow,
+    pinned: bool,
+    source_fullscreen: bool,
+    _opacity: f64,
+) -> tauri::Result<()> {
+    let activation = result_show_activation(pinned, source_fullscreen);
     window.show()?;
-    window.set_focus()
+    if activation.focus {
+        window.set_focus()
+    } else {
+        Ok(())
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -3365,6 +3535,7 @@ mod tests {
                 cursor: Point { x: 640.0, y: 360.0 },
                 follow_cursor: true,
             },
+            source_fullscreen: false,
             reveal_phase,
             reveal_operation: Arc::new(Mutex::new(())),
             focus_seen: false,
@@ -3793,6 +3964,26 @@ mod tests {
     }
 
     #[test]
+    fn blur_auto_close_yields_while_the_session_is_streaming() {
+        // A running request keeps the result window alive on blur.
+        assert!(auto_close_blocked_by_streaming(
+            Some(AutoCloseOrigin::Blur(3)),
+            true
+        ));
+        // An idle session still closes on blur exactly as before.
+        assert!(!auto_close_blocked_by_streaming(
+            Some(AutoCloseOrigin::Blur(3)),
+            false
+        ));
+        // Pointer-leave dismissal and manual closes keep their semantics.
+        assert!(!auto_close_blocked_by_streaming(
+            Some(AutoCloseOrigin::PointerLeave(3)),
+            true
+        ));
+        assert!(!auto_close_blocked_by_streaming(None, true));
+    }
+
+    #[test]
     fn result_pointer_timeout_ignores_reentry_during_cursor_reads() {
         let coordinator = WindowCoordinator::default();
         let label = "selection-result-pointer-reentry";
@@ -3948,6 +4139,7 @@ mod tests {
                     cursor: Point { x: 640.0, y: 360.0 },
                     follow_cursor: true,
                 },
+                source_fullscreen: false,
                 reveal_phase: ResultRevealPhase::Prepared,
                 reveal_operation: Arc::new(Mutex::new(())),
                 focus_seen: false,
@@ -3997,6 +4189,7 @@ mod tests {
                     cursor: expected_cursor,
                     follow_cursor: false,
                 },
+                source_fullscreen: false,
                 reveal_phase: ResultRevealPhase::Hidden,
                 reveal_operation: Arc::new(Mutex::new(())),
                 focus_seen: false,
@@ -4016,11 +4209,12 @@ mod tests {
             (ResultRevealPhase::Hidden, ResultRevealPhase::Prepared),
             (ResultRevealPhase::Prepared, ResultRevealPhase::Committed),
         ] {
-            let (phase, pinned, placement) = coordinator
+            let (phase, pinned, placement, source_fullscreen) = coordinator
                 .result_reveal_context(label)
                 .expect("the reveal session should remain available");
             assert_eq!(phase, expected_phase);
             assert!(pinned);
+            assert!(!source_fullscreen);
             assert_eq!(placement.size, expected_size);
             assert_eq!(placement.cursor, expected_cursor);
             assert!(!placement.follow_cursor);
@@ -4029,7 +4223,7 @@ mod tests {
                 .expect("the reveal phase should advance exactly once");
         }
 
-        let (phase, _, placement) = coordinator.result_reveal_context(label).unwrap();
+        let (phase, _, placement, _) = coordinator.result_reveal_context(label).unwrap();
         assert_eq!(phase, ResultRevealPhase::Committed);
         assert_eq!(placement.size, expected_size);
         assert_eq!(placement.cursor, expected_cursor);
@@ -4066,6 +4260,55 @@ mod tests {
     #[test]
     fn result_labels_are_namespaced() {
         assert_eq!(result_label("abc"), "selection-result-abc");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn capture_unavailable_notice_kinds_have_distinct_renderer_keys() {
+        assert_eq!(StartupNoticeKind::Started.query_value(), "started");
+        assert_eq!(StartupNoticeKind::AlreadyRunning.query_value(), "running");
+        assert_eq!(
+            StartupNoticeKind::CaptureBlockedElevated.query_value(),
+            "captureBlockedElevated"
+        );
+        assert_eq!(
+            StartupNoticeKind::CaptureBlockedRemoteDesktop.query_value(),
+            "captureBlockedRemote"
+        );
+    }
+
+    #[test]
+    fn result_over_a_fullscreen_source_is_topmost_without_stealing_focus() {
+        // Fullscreen source: always above it, never activated.
+        assert_eq!(
+            result_show_activation(false, true),
+            ResultShowActivation {
+                topmost: true,
+                focus: false,
+            }
+        );
+        assert_eq!(
+            result_show_activation(true, true),
+            ResultShowActivation {
+                topmost: true,
+                focus: false,
+            }
+        );
+        // Ordinary source keeps the existing reveal behavior.
+        assert_eq!(
+            result_show_activation(false, false),
+            ResultShowActivation {
+                topmost: false,
+                focus: true,
+            }
+        );
+        assert_eq!(
+            result_show_activation(true, false),
+            ResultShowActivation {
+                topmost: true,
+                focus: true,
+            }
+        );
     }
 
     #[test]
@@ -4185,7 +4428,8 @@ mod tests {
         );
         assert_eq!(position.x, -1_220.0);
         assert_eq!(position.x + size.width / 2.0, -960.0);
-        assert_eq!(position.y, 360.0);
+        // The toolbar keeps a 7 DIP gap below the release point.
+        assert_eq!(position.y, 367.0);
 
         let clamped = toolbar_position_in_area(
             Point {
@@ -4198,6 +4442,62 @@ mod tests {
         );
         assert_eq!(clamped.x, -1_900.0);
         assert_eq!(clamped.y, 1_016.0);
+    }
+
+    #[test]
+    fn toolbar_placement_keeps_a_scaled_gap_above_and_below_the_range() {
+        let area = WorkArea {
+            x: 0.0,
+            y: 0.0,
+            width: 1_920.0,
+            height: 1_080.0,
+        };
+        let size = WindowSize {
+            width: 520.0,
+            height: 44.0,
+        };
+        let point = Point { x: 900.0, y: 500.0 };
+
+        let below = toolbar_position_in_area_with_placement(
+            point,
+            size,
+            area,
+            1.0,
+            ToolbarPlacement::BottomMiddle,
+        );
+        assert_eq!(below.y, 507.0);
+        assert_eq!(below.x + size.width / 2.0, point.x);
+
+        // A backward (upward) selection anchors the toolbar above the release
+        // point instead of covering the lines the user just selected.
+        let above = toolbar_position_in_area_with_placement(
+            point,
+            size,
+            area,
+            1.0,
+            ToolbarPlacement::TopMiddle,
+        );
+        assert_eq!(above.y + size.height, 493.0);
+        assert_eq!(above.x + size.width / 2.0, point.x);
+
+        // The gap is expressed in DIPs, so a 150% display grows it with the
+        // physical anchor point.
+        let scaled_below = toolbar_position_in_area_with_placement(
+            Point { x: 900.0, y: 750.0 },
+            size,
+            area,
+            1.5,
+            ToolbarPlacement::BottomMiddle,
+        );
+        assert_eq!(scaled_below.y, 760.5);
+        let scaled_above = toolbar_position_in_area_with_placement(
+            Point { x: 900.0, y: 750.0 },
+            size,
+            area,
+            1.5,
+            ToolbarPlacement::TopMiddle,
+        );
+        assert_eq!(scaled_above.y + size.height, 739.5);
     }
 
     #[test]
@@ -4498,6 +4798,7 @@ mod tests {
                 cursor: Point { x: 640.0, y: 360.0 },
                 follow_cursor: true,
             },
+            source_fullscreen: false,
             reveal_phase: ResultRevealPhase::Committed,
             reveal_operation: Arc::new(Mutex::new(())),
             focus_seen: false,
