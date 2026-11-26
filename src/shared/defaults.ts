@@ -721,6 +721,7 @@ export function migrateAppSettings(input: unknown): AppSettings {
   rejectNewerSettingsVersion(candidate.version)
   if (
     candidate.version === SETTINGS_VERSION ||
+    candidate.version === 13 ||
     candidate.version === 12 ||
     candidate.version === 11 ||
     candidate.version === 10 ||
@@ -763,6 +764,7 @@ export function migratePublicSettings(input: unknown): PublicSettings {
   rejectNewerSettingsVersion(candidate.version)
   if (
     candidate.version === SETTINGS_VERSION ||
+    candidate.version === 13 ||
     candidate.version === 12 ||
     candidate.version === 11 ||
     candidate.version === 10 ||

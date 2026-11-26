@@ -827,7 +827,9 @@ fn load_settings(path: &Path) -> Result<LoadedSettings, SettingsError> {
             must_persist,
         });
     }
-    if matches!(version, Some(11 | 12)) {
+    // v13 predates the launch-at-login field; serde's field default keeps the
+    // startup entry off for those files while the schema version advances.
+    if matches!(version, Some(11 | 12 | 13)) {
         migrate_v10_search_actions_value(&mut value);
         migrate_quote_to_ask_value(&mut value);
         let mut settings: AppSettings = serde_json::from_value(value)?;
@@ -1729,6 +1731,33 @@ mod tests {
             .map(|action| action.id.as_str())
             .collect::<Vec<_>>();
         assert_eq!(search_actions, vec!["search"]);
+    }
+
+    /// A file written by the previous release must still load. Bumping the
+    /// schema version without accepting the previous one made the app refuse to
+    /// start, so this guards the dispatch rather than the field itself.
+    #[test]
+    fn loads_a_v13_file_and_turns_the_startup_preference_off() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("settings.json");
+        let mut settings = AppSettings::default();
+        settings.version = 13;
+        let mut value = serde_json::to_value(&settings).unwrap();
+        // A v13 file predates the field entirely.
+        value
+            .get_mut("application")
+            .and_then(|application| application.as_object_mut())
+            .unwrap()
+            .remove("launchAtLogin");
+        fs::write(&path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+
+        let repository = SettingsRepository::new(&path).expect("a v13 file must still load");
+        let migrated = repository.get_settings();
+        assert_eq!(migrated.version, SETTINGS_VERSION);
+        assert!(
+            !migrated.application.launch_at_login,
+            "an upgrade must not silently add a startup entry"
+        );
     }
 
     #[test]
