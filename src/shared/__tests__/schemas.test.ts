@@ -967,6 +967,46 @@ describe('action stream event schemas', () => {
       content: '你好',
       contentScalarCount: 2
     })
+    // Streaming snapshots carry no usage; the field stays absent from the wire.
+    expect(parsed.usage).toBeUndefined()
+  })
+
+  it('accepts optional token usage and keeps the usage shape strict', () => {
+    expect(resultSessionSnapshotSchema.safeParse(snapshot()).success).toBe(true)
+    const full = resultSessionSnapshotSchema.safeParse(snapshot({
+      usage: { inputTokens: 900, outputTokens: 334, totalTokens: 1234 }
+    }))
+    expect(full.success).toBe(true)
+    expect(full.success && full.data.usage).toEqual({
+      inputTokens: 900,
+      outputTokens: 334,
+      totalTokens: 1234
+    })
+    // A total-only usage line is valid: not every protocol exposes both sides.
+    expect(
+      resultSessionSnapshotSchema.safeParse(snapshot({ usage: { totalTokens: 9876543 } })).success
+    ).toBe(true)
+    // Usage is a token counter, never a cost conversion.
+    expect(
+      resultSessionSnapshotSchema.safeParse(snapshot({
+        usage: { totalTokens: 10, costUsd: 0.002 }
+      })).success
+    ).toBe(false)
+    expect(
+      resultSessionSnapshotSchema.safeParse(snapshot({ usage: { totalTokens: -1 } })).success
+    ).toBe(false)
+    expect(
+      resultSessionSnapshotSchema.safeParse(snapshot({ usage: { totalTokens: 1.5 } })).success
+    ).toBe(false)
+    expect(
+      resultSessionSnapshotSchema.safeParse(snapshot({ usage: { inputTokens: 5 } })).success
+    ).toBe(false)
+    // A display-only counter must never fail the whole snapshot handshake.
+    expect(
+      resultSessionSnapshotSchema.safeParse(snapshot({
+        usage: { totalTokens: Number.MAX_SAFE_INTEGER + 2 }
+      })).success
+    ).toBe(true)
   })
 
   it('validates paired optional routes and exact snapshot scalar counts', () => {

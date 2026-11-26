@@ -37,6 +37,7 @@ use crate::{
         SessionGeneration, SettingsUpdate, SyncModelsResult, TranscriptTurn, TriggerMode,
         UpdateProviderInput, WindowSize as SettingsWindowSize,
     },
+    openai_protocol::TokenUsage,
     selection::{
         DismissEvent, SelectionBounds, SelectionDirection, SelectionEvent, SelectionEventReceiver,
         SelectionMethod, SelectionMonitor, SelectionMouse, SelectionPayload, SelectionPoint,
@@ -543,6 +544,11 @@ pub struct ResultSessionSnapshot {
     last_sequence: EventSequence,
     last_content_sequence: EventSequence,
     content_scalar_count: u64,
+    /// Provider-reported token usage of the request this snapshot describes.
+    /// Absent while streaming, for providers that report nothing, and for
+    /// failed/cancelled requests.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    usage: Option<TokenUsage>,
     handshake_generation: HandshakeGeneration,
     #[serde(skip_serializing_if = "Option::is_none")]
     generation_notice: Option<ActionNotice>,
@@ -581,6 +587,7 @@ fn compose_result_ready_snapshot(
         snapshot,
         ack,
         route,
+        usage,
     } = begin;
     let status = match snapshot.status {
         ActionSnapshotStatus::Running => "streaming",
@@ -612,6 +619,7 @@ fn compose_result_ready_snapshot(
         last_sequence: snapshot.last_sequence,
         last_content_sequence: snapshot.last_content_sequence,
         content_scalar_count: snapshot.content_scalar_count,
+        usage,
         handshake_generation: ack.handshake_generation,
         generation_notice: snapshot.generation_notice,
         preparation_failure: snapshot.preparation_failure,
@@ -4577,6 +4585,7 @@ mod tests {
                 handshake_generation: HandshakeGeneration(1),
             },
             route: None,
+            usage: None,
         }
     }
 
@@ -4617,11 +4626,21 @@ mod tests {
                 model_id: "m".into(),
                 thinking_mode: crate::models::ThinkingMode::Off,
             }),
+            usage: Some(TokenUsage {
+                input_tokens: Some(900),
+                output_tokens: Some(334),
+                total_tokens: 1234,
+            }),
         };
         let result = compose_result_ready_snapshot(result_meta(), begin, 900.0);
         assert_eq!(result.last_sequence, EventSequence(12));
         assert_eq!(result.last_content_sequence, EventSequence(11));
         assert_eq!(result.handshake_generation, HandshakeGeneration(4));
+        assert_eq!(
+            result.usage.map(|usage| usage.total_tokens),
+            Some(1234),
+            "usage must be forwarded to the result window snapshot"
+        );
         assert_eq!(
             result
                 .generation_notice
@@ -4685,6 +4704,9 @@ mod tests {
                 handshake_generation: HandshakeGeneration(1),
             },
             route: None,
+            // The shared fixture describes a streaming snapshot: the optional
+            // usage field must stay absent from the wire shape.
+            usage: None,
         };
         let actual =
             serde_json::to_value(compose_result_ready_snapshot(meta, begin, 900.0)).unwrap();
@@ -4693,6 +4715,38 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn result_snapshot_serializes_usage_as_camel_case_and_omits_it_when_absent() {
+        let with_usage = compose_result_ready_snapshot(
+            result_meta(),
+            ActionBeginReady {
+                usage: Some(crate::openai_protocol::TokenUsage {
+                    input_tokens: Some(900),
+                    output_tokens: Some(334),
+                    total_tokens: 1234,
+                }),
+                ..initial_preparing_begin()
+            },
+            900.0,
+        );
+        let value = serde_json::to_value(&with_usage).unwrap();
+        assert_eq!(
+            value.get("usage"),
+            Some(&serde_json::json!({
+                "inputTokens": 900,
+                "outputTokens": 334,
+                "totalTokens": 1234
+            }))
+        );
+
+        let without_usage =
+            compose_result_ready_snapshot(result_meta(), initial_preparing_begin(), 900.0);
+        assert!(serde_json::to_value(&without_usage)
+            .unwrap()
+            .get("usage")
+            .is_none());
     }
 
     #[test]

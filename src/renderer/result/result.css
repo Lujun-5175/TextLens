@@ -1490,3 +1490,10 @@ body,
 @media (prefers-reduced-motion: reduce) {
   .markdown-streaming .stream-text-enter { animation: none; }
 }
+
+/* Token usage sits beside the model name: the footer chrome only appears on
+   hover, and a cost line the user has to hunt for is not worth showing. */
+.result-usage {
+  margin-left: 8px;
+  white-space: nowrap;
+}

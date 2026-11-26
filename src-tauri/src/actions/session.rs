@@ -10,6 +10,7 @@ use crate::models::{
     EventSequence, HandshakeGeneration, PreparationFailure, RequestGeneration, ResultReadyAck,
     SessionGeneration, MAX_WIRE_COUNTER,
 };
+use crate::openai_protocol::TokenUsage;
 
 // Content deltas are emitted immediately (no coalesce window / byte batching)
 // so translate/explain/summary TTFB and tail fluency stay as low-latency as possible.
@@ -52,9 +53,27 @@ pub(super) struct SessionState {
     pub snapshot_absorbed_through: EventSequence,
     /// Ask sessions open as Completed with empty content; allow the first continue.
     pub allow_continue_without_content: bool,
+    /// Provider-reported token usage of the request that owns the snapshot.
+    ///
+    /// Kept outside `ActionSnapshot` on purpose: usage is metadata about the
+    /// request, not part of the integrity-checked answer state, and it must not
+    /// take part in the sequence / scalar-count protocol.
+    pub usage: Option<RequestUsage>,
     active_flusher_epoch: Option<DeliveryEpoch>,
     active_flusher_token: Option<Arc<()>>,
     in_flight: Option<InFlightEmit>,
+}
+
+/// Usage tagged with the request it belongs to.
+///
+/// The tag makes stale usage self-invalidating: a replacement request never
+/// inherits the previous request's numbers, no matter when the terminal for the
+/// old request was committed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestUsage {
+    pub request_id: String,
+    pub request_generation: RequestGeneration,
+    pub usage: TokenUsage,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -228,6 +247,9 @@ pub(super) struct CloseTransition {
 pub(super) struct BeginReadySnapshot {
     pub snapshot: ActionSnapshot,
     pub ack: ResultReadyAck,
+    /// Usage of the request the snapshot describes; `None` while streaming or
+    /// when the provider reported nothing.
+    pub usage: Option<TokenUsage>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -354,6 +376,7 @@ impl SessionTable {
             delivery_epoch: DeliveryEpoch::NONE,
             snapshot_absorbed_through: EventSequence::NONE,
             allow_continue_without_content: false,
+            usage: None,
             active_flusher_epoch: None,
             active_flusher_token: None,
             in_flight: None,
@@ -452,6 +475,7 @@ impl SessionTable {
             delivery_epoch: DeliveryEpoch::NONE,
             snapshot_absorbed_through: EventSequence::NONE,
             allow_continue_without_content: true,
+            usage: None,
             active_flusher_epoch: None,
             active_flusher_token: None,
             in_flight: None,
@@ -838,6 +862,27 @@ impl SessionTable {
         })
     }
 
+    /// Remember the provider-reported usage of the running request.
+    ///
+    /// Called right before the terminal is committed, so only a request that
+    /// actually produced a successful answer can own usage; a stale ticket or a
+    /// request that already moved on is ignored.
+    pub(super) fn record_usage(&mut self, ticket: &RequestTicket, usage: TokenUsage) {
+        let Some(SessionEntry::Open(state)) = self.entries.get_mut(&ticket.session_id) else {
+            return;
+        };
+        if state.snapshot.request_id != ticket.request_id
+            || state.snapshot.request_generation != ticket.request_generation
+        {
+            return;
+        }
+        state.usage = Some(RequestUsage {
+            request_id: ticket.request_id.clone(),
+            request_generation: ticket.request_generation,
+            usage,
+        });
+    }
+
     pub(super) fn commit_terminal(
         &mut self,
         ticket: &RequestTicket,
@@ -1014,9 +1059,23 @@ impl SessionTable {
         state.pending_events.retain(|event| {
             Some(event.sequence) == preserved_front || event.sequence > snapshot.last_sequence
         });
+        // Only the usage of the snapshot's own request is meaningful; a newer
+        // request in flight must not inherit the previous one's numbers.
+        let usage = state
+            .usage
+            .as_ref()
+            .filter(|usage| {
+                usage.request_id == snapshot.request_id
+                    && usage.request_generation == snapshot.request_generation
+            })
+            .map(|usage| usage.usage);
         debug_assert_flusher_identity(state);
 
-        Ok(BeginReadySnapshot { snapshot, ack })
+        Ok(BeginReadySnapshot {
+            snapshot,
+            ack,
+            usage,
+        })
     }
 
     pub(super) fn ack_ready(&mut self, ack: ResultReadyAck) -> AckTransition {
@@ -3454,5 +3513,44 @@ mod tests {
         assert_eq!(state.snapshot, before_snapshot);
         assert_eq!(state.pending_events, before_events);
         assert_eq!(state.next_sequence, before_next_sequence);
+    }
+
+    #[test]
+    fn recorded_usage_belongs_to_the_snapshot_request_only() {
+        let usage = TokenUsage {
+            input_tokens: Some(900),
+            output_tokens: Some(334),
+            total_tokens: 1234,
+        };
+        let (mut table, ticket) = running_table("s");
+        table.record_usage(&ticket, usage);
+
+        let first = table.begin_ready("s", "result/s").unwrap();
+        assert_eq!(first.usage, Some(usage));
+        assert_eq!(table.ack_ready(first.ack).result, TransitionResult::Applied);
+
+        assert_eq!(
+            table
+                .commit_terminal(&ticket, TerminalKind::Completed)
+                .unwrap()
+                .result,
+            TransitionResult::Applied
+        );
+        let retry = table.reserve_retry("s", "request-2".to_owned()).unwrap();
+        assert_eq!(
+            table.commit_prepare_success(&retry.ticket),
+            TransitionResult::Applied
+        );
+
+        // The replacement request starts without usage, even though the
+        // previous request's numbers are still stored.
+        let next = table.begin_ready("s", "result/s").unwrap();
+        assert_eq!(next.snapshot.request_id, "request-2");
+        assert_eq!(next.usage, None);
+
+        // A late recording for the finished request must not leak into it.
+        table.record_usage(&ticket, usage);
+        let after_late_write = table.begin_ready("s", "result/s").unwrap();
+        assert_eq!(after_late_write.usage, None);
     }
 }

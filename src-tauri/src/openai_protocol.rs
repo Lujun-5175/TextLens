@@ -1,4 +1,73 @@
+use serde::Serialize;
 use serde_json::Value;
+
+/// Token accounting reported by a provider for one request.
+///
+/// All four protocols report the same three quantities under different names;
+/// they are normalized once here so the transport, the result snapshot and the
+/// renderer never have to deal with protocol-specific spellings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct TokenUsage {
+    /// Prompt / input tokens, when the provider reports them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_tokens: Option<u64>,
+    /// Generated / output tokens, when the provider reports them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<u64>,
+    /// Total tokens; derived from input + output only when both are reported.
+    pub total_tokens: u64,
+}
+
+/// SSE usage arrives spread over several events per protocol.
+///
+/// Input is constant for a request while output is cumulative (Anthropic
+/// re-sends it in `message_delta`), so the last non-null value wins per field.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct UsageAccumulator {
+    input: Option<u64>,
+    output: Option<u64>,
+    total: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct RawUsage {
+    input: Option<u64>,
+    output: Option<u64>,
+    total: Option<u64>,
+}
+
+impl UsageAccumulator {
+    fn observe(&mut self, usage: RawUsage) {
+        if usage.input.is_some() {
+            self.input = usage.input;
+        }
+        if usage.output.is_some() {
+            self.output = usage.output;
+        }
+        if usage.total.is_some() {
+            self.total = usage.total;
+        }
+    }
+
+    /// `None` when the provider reported nothing usable.
+    ///
+    /// Anthropic has no `total_tokens`, so it is derived from input + output.
+    /// A lone side is not treated as the total: showing only the completion
+    /// count as "this request" would understate what the user paid for.
+    fn finish(self) -> Option<TokenUsage> {
+        let total = match (self.total, self.input, self.output) {
+            (Some(total), _, _) => total,
+            (None, Some(input), Some(output)) => input.saturating_add(output),
+            _ => return None,
+        };
+        Some(TokenUsage {
+            input_tokens: self.input,
+            output_tokens: self.output,
+            total_tokens: total,
+        })
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ProtocolLimits {
@@ -90,6 +159,7 @@ pub(crate) struct SseDecoder {
     scan_from: usize,
     raw_bytes: usize,
     state: SseState,
+    usage: UsageAccumulator,
 }
 
 impl SseDecoder {
@@ -107,7 +177,16 @@ impl SseDecoder {
             scan_from: 0,
             raw_bytes: 0,
             state: SseState::Open,
+            usage: UsageAccumulator::default(),
         }
+    }
+
+    /// Token usage seen so far; callers read it once the stream terminated.
+    ///
+    /// Every protocol that reports usage keeps it in the event stream as
+    /// metadata, so it never influences `state` / content admission.
+    pub(crate) fn usage(&self) -> Option<TokenUsage> {
+        self.usage.finish()
     }
 
     pub(crate) fn push(&mut self, chunk: &[u8]) -> Result<(), ProtocolError> {
@@ -200,6 +279,7 @@ impl SseDecoder {
         if let Some(error) = provider_error_from_value(&value) {
             return Err(ProtocolError::Provider(error));
         }
+        absorb_protocol_usage(self.codec, &value, &mut self.usage);
         decode_protocol_event(self.codec, &value, &mut self.state)
     }
 
@@ -492,6 +572,74 @@ fn decode_gemini_event(
     )
 }
 
+/// Fold the usage object carried by one event into the running total.
+///
+/// Shapes (verified against the provider docs):
+/// - Chat Completions: `usage.{prompt,completion,total}_tokens`, sent on the
+///   last chunk when `stream_options.include_usage` is set (DeepSeek always
+///   sends it). `usage: null` is ignored.
+/// - Responses: `response.usage.{input,output,total}_tokens` on the terminal
+///   `response.completed` event.
+/// - Anthropic: `message.usage.input_tokens` in `message_start` and a
+///   cumulative `usage.output_tokens` in `message_delta`.
+/// - Gemini: `usageMetadata.{promptTokenCount,candidatesTokenCount,totalTokenCount}`
+///   on any chunk (the last non-null value wins).
+fn absorb_protocol_usage(codec: SseCodec, value: &Value, usage: &mut UsageAccumulator) {
+    let raw = match codec {
+        SseCodec::OpenAiChat => value
+            .get("usage")
+            .map(|usage| usage_counts(usage, "prompt_tokens", "completion_tokens", "total_tokens")),
+        SseCodec::OpenAiResponses => value
+            .pointer("/response/usage")
+            .or_else(|| value.get("usage"))
+            .map(|usage| usage_counts(usage, "input_tokens", "output_tokens", "total_tokens")),
+        SseCodec::AnthropicMessages => value
+            .pointer("/message/usage")
+            .or_else(|| value.get("usage"))
+            .map(|usage| usage_counts(usage, "input_tokens", "output_tokens", "total_tokens")),
+        SseCodec::Gemini => value.get("usageMetadata").map(|usage| {
+            usage_counts(
+                usage,
+                "promptTokenCount",
+                "candidatesTokenCount",
+                "totalTokenCount",
+            )
+        }),
+    };
+    if let Some(raw) = raw {
+        usage.observe(raw);
+    }
+}
+
+fn usage_counts(usage: &Value, input: &str, output: &str, total: &str) -> RawUsage {
+    if !usage.is_object() {
+        return RawUsage::default();
+    }
+    RawUsage {
+        input: count_field(usage.get(input)),
+        output: count_field(usage.get(output)),
+        total: count_field(usage.get(total)),
+    }
+}
+
+/// Token counts are integers; a few gateways serialize them as `1234.0`.
+fn count_field(value: Option<&Value>) -> Option<u64> {
+    let value = value?;
+    value.as_u64().or_else(|| {
+        value
+            .as_f64()
+            .filter(|number| number.is_finite() && *number >= 0.0)
+            .map(|number| number as u64)
+    })
+}
+
+/// Usage from a non-streaming JSON response body.
+pub(crate) fn decode_json_usage(codec: SseCodec, value: &Value) -> Option<TokenUsage> {
+    let mut usage = UsageAccumulator::default();
+    absorb_protocol_usage(codec, value, &mut usage);
+    usage.finish()
+}
+
 fn data_event(
     state: &mut SseState,
     content: Option<String>,
@@ -725,6 +873,53 @@ fn infer_provider_code(kind: Option<&str>, param: Option<&str>) -> Option<String
 
 fn field(object: &serde_json::Map<String, Value>, name: &str) -> Option<String> {
     object.get(name).and_then(Value::as_str).map(bounded)
+}
+
+/// True when a provider rejection names `field` as the offending parameter.
+///
+/// Some OpenAI-compatible gateways reject any unknown request field with a
+/// generic `unsupported_parameter` / `unknown_field` code, so the parameter name
+/// in `param` or in the human message is the only signal that ties the failure
+/// to one optional field. Same idea as `thinking::should_fallback_without_control`,
+/// kept local to avoid coupling request compatibility to thinking control.
+pub(crate) fn provider_error_names_field(error: &ProviderErrorEnvelope, field: &str) -> bool {
+    let param_matches = error
+        .param
+        .as_deref()
+        .is_some_and(|param| normalize_field_path(param) == field);
+    param_matches || message_contains_field(&error.message, field)
+}
+
+fn normalize_field_path(value: &str) -> &str {
+    let trimmed = value.trim();
+    trimmed.strip_prefix("$.").unwrap_or(trimmed)
+}
+
+fn message_contains_field(message: &str, field: &str) -> bool {
+    let bytes = message.as_bytes();
+    let needle = field.as_bytes();
+    if needle.is_empty() || needle.len() > bytes.len() {
+        return false;
+    }
+    bytes
+        .windows(needle.len())
+        .enumerate()
+        .any(|(index, window)| {
+            if window != needle {
+                return false;
+            }
+            let before = index.checked_sub(1).and_then(|i| bytes.get(i)).copied();
+            let after = bytes.get(index + needle.len()).copied();
+            // `.` is a path separator here (not an identifier char), so
+            // "stream_options.include_usage" still names `stream_options`
+            // and "unknown field `stream_options`" still names it too.
+            !before.is_some_and(is_field_identifier_char)
+                && !after.is_some_and(is_field_identifier_char)
+        })
+}
+
+fn is_field_identifier_char(value: u8) -> bool {
+    value.is_ascii_alphanumeric() || matches!(value, b'_')
 }
 
 fn bounded(value: &str) -> String {
@@ -1035,6 +1230,280 @@ mod tests {
             .as_deref(),
             Some("answer")
         );
+    }
+
+    #[test]
+    fn protocol_reads_chat_completions_usage_from_the_final_chunk() {
+        // Trimmed real shape: content chunks, the finish chunk, then the
+        // usage-only chunk requested by `stream_options.include_usage`.
+        let decoded = decode_usage_with_codec(
+            concat!(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":900,\"completion_tokens\":334,\"total_tokens\":1234}}\n\n",
+                "data: [DONE]\n\n",
+            )
+            .as_bytes(),
+            SseCodec::OpenAiChat,
+        );
+        assert_eq!(
+            decoded,
+            Some(TokenUsage {
+                input_tokens: Some(900),
+                output_tokens: Some(334),
+                total_tokens: 1234,
+            })
+        );
+    }
+
+    #[test]
+    fn protocol_reads_responses_usage_from_the_completed_event() {
+        let decoded = decode_usage_with_codec(
+            concat!(
+                "event: response.output_text.delta\n",
+                "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hi\"}\n\n",
+                "event: response.completed\n",
+                "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp\",\"usage\":{\"input_tokens\":900,\"output_tokens\":334,\"total_tokens\":1234}}}\n\n",
+            )
+            .as_bytes(),
+            SseCodec::OpenAiResponses,
+        );
+        assert_eq!(
+            decoded,
+            Some(TokenUsage {
+                input_tokens: Some(900),
+                output_tokens: Some(334),
+                total_tokens: 1234,
+            })
+        );
+    }
+
+    #[test]
+    fn protocol_merges_anthropic_message_start_input_with_delta_output() {
+        // `message_start` carries the prompt count and a seed output count;
+        // `message_delta` re-sends the cumulative output. Input must come from
+        // the start event and output from the last delta.
+        let decoded = decode_usage_with_codec(
+            concat!(
+                "event: message_start\n",
+                "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg\",\"usage\":{\"input_tokens\":900,\"output_tokens\":1}}}\n\n",
+                "event: content_block_delta\n",
+                "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"Hi\"}}\n\n",
+                "event: message_delta\n",
+                "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":200}}\n\n",
+                "event: message_delta\n",
+                "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":334}}\n\n",
+                "event: message_stop\n",
+                "data: {\"type\":\"message_stop\"}\n\n",
+            )
+            .as_bytes(),
+            SseCodec::AnthropicMessages,
+        );
+        assert_eq!(
+            decoded,
+            Some(TokenUsage {
+                input_tokens: Some(900),
+                output_tokens: Some(334),
+                total_tokens: 1234,
+            })
+        );
+    }
+
+    #[test]
+    fn protocol_reads_the_last_gemini_usage_metadata() {
+        let decoded = decode_usage_with_codec(
+            concat!(
+                "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Hi\"}]}}],\"usageMetadata\":{\"promptTokenCount\":900,\"candidatesTokenCount\":100,\"totalTokenCount\":1000}}\n\n",
+                "data: {\"candidates\":[{\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":900,\"candidatesTokenCount\":334,\"totalTokenCount\":1234}}\n\n",
+            )
+            .as_bytes(),
+            SseCodec::Gemini,
+        );
+        assert_eq!(
+            decoded,
+            Some(TokenUsage {
+                input_tokens: Some(900),
+                output_tokens: Some(334),
+                total_tokens: 1234,
+            })
+        );
+    }
+
+    #[test]
+    fn protocol_ignores_null_usage_and_reports_nothing_when_absent() {
+        let null_usage = decode_usage_with_codec(
+            concat!(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}],\"usage\":null}\n\n",
+                "data: {\"choices\":[],\"usage\":null}\n\n",
+                "data: [DONE]\n\n",
+            )
+            .as_bytes(),
+            SseCodec::OpenAiChat,
+        );
+        assert_eq!(null_usage, None);
+
+        let no_usage = decode_usage_with_codec(
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\ndata: [DONE]\n\n",
+            SseCodec::OpenAiChat,
+        );
+        assert_eq!(no_usage, None);
+
+        // A lone side is not promoted to the total: showing only the
+        // completion count would understate the request cost.
+        let partial = decode_usage_with_codec(
+            b"data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":900}}}\n\n",
+            SseCodec::AnthropicMessages,
+        );
+        assert_eq!(partial, None);
+    }
+
+    #[test]
+    fn protocol_reads_non_stream_json_usage_for_every_protocol() {
+        assert_eq!(
+            decode_json_usage(
+                SseCodec::OpenAiChat,
+                &serde_json::json!({
+                    "choices": [{"message": {"content": "ok"}}],
+                    "usage": {"prompt_tokens": 12, "completion_tokens": 3, "total_tokens": 15}
+                })
+            ),
+            Some(TokenUsage {
+                input_tokens: Some(12),
+                output_tokens: Some(3),
+                total_tokens: 15,
+            })
+        );
+        assert_eq!(
+            decode_json_usage(
+                SseCodec::OpenAiResponses,
+                &serde_json::json!({
+                    "output_text": "ok",
+                    "usage": {"input_tokens": 12, "output_tokens": 3, "total_tokens": 15}
+                })
+            ),
+            Some(TokenUsage {
+                input_tokens: Some(12),
+                output_tokens: Some(3),
+                total_tokens: 15,
+            })
+        );
+        assert_eq!(
+            decode_json_usage(
+                SseCodec::AnthropicMessages,
+                &serde_json::json!({
+                    "content": [{"type": "text", "text": "ok"}],
+                    "usage": {"input_tokens": 12, "output_tokens": 3}
+                })
+            ),
+            Some(TokenUsage {
+                input_tokens: Some(12),
+                output_tokens: Some(3),
+                total_tokens: 15,
+            })
+        );
+        assert_eq!(
+            decode_json_usage(
+                SseCodec::Gemini,
+                &serde_json::json!({
+                    "candidates": [{"content": {"parts": [{"text": "ok"}]}}],
+                    "usageMetadata": {
+                        "promptTokenCount": 12,
+                        "candidatesTokenCount": 3,
+                        "totalTokenCount": 15
+                    }
+                })
+            ),
+            Some(TokenUsage {
+                input_tokens: Some(12),
+                output_tokens: Some(3),
+                total_tokens: 15,
+            })
+        );
+        // A gateway that only reports the total still yields a usable line.
+        assert_eq!(
+            decode_json_usage(
+                SseCodec::Gemini,
+                &serde_json::json!({"usageMetadata": {"totalTokenCount": 15}})
+            ),
+            Some(TokenUsage {
+                input_tokens: None,
+                output_tokens: None,
+                total_tokens: 15,
+            })
+        );
+    }
+
+    #[test]
+    fn protocol_usage_serializes_as_camel_case_without_absent_sides() {
+        let full = serde_json::to_value(TokenUsage {
+            input_tokens: Some(900),
+            output_tokens: Some(334),
+            total_tokens: 1234,
+        })
+        .unwrap();
+        assert_eq!(
+            full,
+            serde_json::json!({"inputTokens": 900, "outputTokens": 334, "totalTokens": 1234})
+        );
+        let total_only = serde_json::to_value(TokenUsage {
+            input_tokens: None,
+            output_tokens: None,
+            total_tokens: 15,
+        })
+        .unwrap();
+        assert_eq!(total_only, serde_json::json!({"totalTokens": 15}));
+    }
+
+    #[test]
+    fn protocol_matches_the_optional_field_named_by_a_rejection() {
+        let param_named = ProviderErrorEnvelope {
+            code: Some("unsupported_parameter".to_owned()),
+            kind: Some("invalid_request_error".to_owned()),
+            param: Some("stream_options".to_owned()),
+            message: "Unsupported parameter".to_owned(),
+        };
+        assert!(provider_error_names_field(&param_named, "stream_options"));
+
+        let message_named = ProviderErrorEnvelope {
+            code: Some("unknown_field".to_owned()),
+            kind: None,
+            param: None,
+            message: "Unrecognized request argument supplied: stream_options".to_owned(),
+        };
+        assert!(provider_error_names_field(&message_named, "stream_options"));
+
+        let unrelated = ProviderErrorEnvelope {
+            code: Some("unsupported_parameter".to_owned()),
+            kind: None,
+            param: Some("temperature".to_owned()),
+            message: "Unsupported value for temperature".to_owned(),
+        };
+        assert!(!provider_error_names_field(&unrelated, "stream_options"));
+
+        // A longer identifier that merely contains the field name must not match.
+        let longer_identifier = ProviderErrorEnvelope {
+            code: Some("unknown_field".to_owned()),
+            kind: None,
+            param: None,
+            message: "unknown field stream_options_v2".to_owned(),
+        };
+        assert!(!provider_error_names_field(
+            &longer_identifier,
+            "stream_options"
+        ));
+    }
+
+    fn decode_usage_with_codec(bytes: &[u8], codec: SseCodec) -> Option<TokenUsage> {
+        let mut decoder = SseDecoder::with_codec(ProtocolLimits::test(), codec);
+        decoder.push(bytes).unwrap();
+        loop {
+            match decoder.next_event() {
+                Ok(Some(_)) => {}
+                Ok(None) => break,
+                Err(error) => panic!("unexpected protocol error: {error:?}"),
+            }
+        }
+        decoder.usage()
     }
 
     fn decode_all_with_codec(

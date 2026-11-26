@@ -1330,3 +1330,60 @@ describe('ResultApp window interactions', () => {
     expect(screen.queryByRole('button', { name: '关闭' })).not.toBeInTheDocument()
   })
 })
+
+describe('ResultApp token usage', () => {
+  it('formats token counts with stable thousands separators', async () => {
+    const { formatTokenCount } = await import('./ResultApp')
+    expect(formatTokenCount(0)).toBe('0')
+    expect(formatTokenCount(999)).toBe('999')
+    expect(formatTokenCount(1234)).toBe('1,234')
+    expect(formatTokenCount(9876543)).toBe('9,876,543')
+    expect(formatTokenCount(-5)).toBe('0')
+  })
+
+  it('refreshes the completed snapshot and shows the request token usage', async () => {
+    const session = resultSnapshot({ requestId: 'request-usage' })
+    const withUsage = {
+      ...session,
+      usage: { inputTokens: 900, outputTokens: 334, totalTokens: 1234 }
+    }
+    const { bootstrap } = await renderResult(session, settingsWithFontSize(), {}, {
+      bootstrap: { recover: vi.fn().mockResolvedValue(withUsage) }
+    })
+
+    expect(await screen.findByTestId('result-usage')).toHaveTextContent(
+      '本次 1,234 tokens（输入 900 · 输出 334）'
+    )
+    expect(bootstrap.recover).toHaveBeenCalled()
+  })
+
+  it('shows a bare total when the provider reports no input/output split', async () => {
+    const session = resultSnapshot({ requestId: 'request-total-only' })
+    await renderResult(session, settingsWithFontSize(), {}, {
+      bootstrap: {
+        recover: vi.fn().mockResolvedValue({ ...session, usage: { totalTokens: 9876543 } })
+      }
+    })
+
+    const usage = await screen.findByTestId('result-usage')
+    expect(usage).toHaveTextContent('本次 9,876,543 tokens')
+    expect(usage).not.toHaveTextContent('输入')
+  })
+
+  it('keeps usage hidden while streaming and when the provider reported none', async () => {
+    const streaming = resultSnapshot({ requestId: 'request-streaming', status: 'streaming' })
+    const first = await renderResult(streaming, settingsWithFontSize(), {}, {
+      bootstrap: {
+        recover: vi.fn().mockResolvedValue({ ...streaming, usage: { totalTokens: 10 } })
+      }
+    })
+    expect(screen.queryByTestId('result-usage')).not.toBeInTheDocument()
+    first.unmount()
+
+    vi.resetModules()
+    const noUsage = resultSnapshot({ requestId: 'request-no-usage' })
+    const { bootstrap } = await renderResult(noUsage)
+    await waitFor(() => expect(bootstrap.recover).toHaveBeenCalled())
+    expect(screen.queryByTestId('result-usage')).not.toBeInTheDocument()
+  })
+})

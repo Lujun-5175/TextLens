@@ -27,7 +27,7 @@ use crate::{
         UpdateProviderInput, AI_PROMPT_LIMIT, AI_TEXT_LIMIT, OUTPUT_LANGUAGE_PLACEHOLDER,
         TARGET_LANGUAGE_PLACEHOLDER, TEXT_PLACEHOLDER,
     },
-    openai_protocol::provider_error_from_value,
+    openai_protocol::{provider_error_from_value, provider_error_names_field, TokenUsage},
     openai_transport::{
         await_headers, consume_json_response_for, consume_sse_response_for, read_http_error,
         GenerationBudget, ResponseTermination, ResponseTransport, TransportConfig,
@@ -215,6 +215,8 @@ pub(crate) struct ActionBeginReady {
     pub snapshot: ActionSnapshot,
     pub ack: ResultReadyAck,
     pub route: Option<SessionRouteIdentity>,
+    /// Usage of the request described by `snapshot`, when the provider reported it.
+    pub usage: Option<TokenUsage>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -676,6 +678,7 @@ impl ActionServiceState {
             snapshot: begin.snapshot,
             ack: begin.ack,
             route,
+            usage: begin.usage,
         })
     }
 }
@@ -1337,74 +1340,100 @@ impl ActionService {
         if self.ticket_is_cancelled(prepared) {
             return Ok(RequestOutcome::Cancelled);
         }
+        let protocol = prepared.session_data.route.provider.protocol;
         let base = build_base_body(prepared);
         let (controlled, applied) = build_controlled_body(
             &base,
-            prepared.session_data.route.provider.protocol,
+            protocol,
             &prepared.session_data.route.thinking,
         );
-        match self.perform_attempt(app, prepared, &controlled).await {
+        let control_status = if applied.is_some() {
+            ThinkingControlStatus::Applied
+        } else {
+            ThinkingControlStatus::Omitted
+        };
+        // Token accounting is a compatibility axis independent of thinking
+        // control: a gateway can accept the thinking field and still reject
+        // `stream_options`, so the retry below keeps the same controlled body
+        // and the thinking fallback stays available for whatever fails next.
+        let (primary, usage_requested) = with_stream_usage(&controlled, protocol);
+        let first_failure = match self.perform_attempt(app, prepared, &primary).await {
+            Ok(success) => return self.complete_generated(prepared, success, 1, control_status),
+            Err(failure) => failure,
+        };
+        let first_failure = if usage_requested && rejects_stream_options(&first_failure) {
+            if let Some(early) = self.ready_for_retry(prepared, first_failure.content_seen) {
+                return early;
+            }
+            match self.perform_attempt(app, prepared, &controlled).await {
+                Ok(success) => return self.complete_generated(prepared, success, 2, control_status),
+                Err(failure) => failure,
+            }
+        } else {
+            first_failure
+        };
+        let eligible = applied.as_ref().is_some_and(|control| {
+            thinking::should_fallback_without_control(
+                control,
+                prepared.session_data.route.thinking.mode,
+                // Still the first content-bearing attempt: the optional-field
+                // retry above only re-sends the identical controlled body.
+                1,
+                first_failure.status,
+                first_failure.provider_error.as_ref(),
+                first_failure.content_seen,
+                self.ticket_is_cancelled(prepared),
+            )
+        });
+        if !eligible {
+            return self.classify_transport_failure(prepared, first_failure);
+        }
+        if let Some(early) = self.ready_for_retry(prepared, first_failure.content_seen) {
+            return early;
+        }
+        let notice = self.submit_notice(
+            app,
+            &prepared.ticket,
+            "THINKING_CONTROL_FALLBACK",
+            "服务商拒绝了当前思考参数，本次已按服务商默认设置继续生成。",
+        );
+        if !matches!(notice, Ok(TransitionResult::Applied)) {
+            self.cleanup_stale_attempt(prepared);
+            return Ok(RequestOutcome::Stale);
+        }
+        let fallback = build_fallback_body(&base);
+        match self.perform_attempt(app, prepared, &fallback).await {
             Ok(success) => self.complete_generated(
                 prepared,
                 success,
-                1,
-                if applied.is_some() {
-                    ThinkingControlStatus::Applied
-                } else {
-                    ThinkingControlStatus::Omitted
-                },
+                2,
+                ThinkingControlStatus::ProviderDefault,
             ),
-            Err(first_failure) => {
-                let eligible = applied.as_ref().is_some_and(|control| {
-                    thinking::should_fallback_without_control(
-                        control,
-                        prepared.session_data.route.thinking.mode,
-                        1,
-                        first_failure.status,
-                        first_failure.provider_error.as_ref(),
-                        first_failure.content_seen,
-                        self.ticket_is_cancelled(prepared),
-                    )
-                });
-                if !eligible {
-                    return self.classify_transport_failure(prepared, first_failure);
-                }
-                if !self.ticket_is_current(&prepared.ticket) {
-                    self.cleanup_stale_attempt(prepared);
-                    return Ok(RequestOutcome::Stale);
-                }
-                if self.ticket_is_cancelled(prepared) {
-                    return Ok(RequestOutcome::Cancelled);
-                }
-                if tokio::time::Instant::now() >= prepared.budget.total_deadline {
-                    return Err(runtime_failure_from_transport(
-                        shared_total_timeout_failure(first_failure.content_seen),
-                    ));
-                }
-                let notice = self.submit_notice(
-                    app,
-                    &prepared.ticket,
-                    "THINKING_CONTROL_FALLBACK",
-                    "服务商拒绝了当前思考参数，本次已按服务商默认设置继续生成。",
-                );
-                if !matches!(notice, Ok(TransitionResult::Applied)) {
-                    self.cleanup_stale_attempt(prepared);
-                    return Ok(RequestOutcome::Stale);
-                }
-                let fallback = build_fallback_body(&base);
-                match self.perform_attempt(app, prepared, &fallback).await {
-                    Ok(success) => self.complete_generated(
-                        prepared,
-                        success,
-                        2,
-                        ThinkingControlStatus::ProviderDefault,
-                    ),
-                    Err(second_failure) => {
-                        self.classify_transport_failure(prepared, second_failure)
-                    }
-                }
-            }
+            Err(second_failure) => self.classify_transport_failure(prepared, second_failure),
         }
+    }
+
+    /// Preconditions shared by every second provider attempt.
+    ///
+    /// `Some(outcome)` means the request must stop without retrying: the ticket
+    /// went stale or was cancelled, or the generation budget is exhausted.
+    fn ready_for_retry(
+        &self,
+        prepared: &PreparedRequest,
+        content_seen: bool,
+    ) -> Option<Result<RequestOutcome, RuntimeFailure>> {
+        if !self.ticket_is_current(&prepared.ticket) {
+            self.cleanup_stale_attempt(prepared);
+            return Some(Ok(RequestOutcome::Stale));
+        }
+        if self.ticket_is_cancelled(prepared) {
+            return Some(Ok(RequestOutcome::Cancelled));
+        }
+        (tokio::time::Instant::now() >= prepared.budget.total_deadline).then(|| {
+            Err(runtime_failure_from_transport(
+                shared_total_timeout_failure(content_seen),
+            ))
+        })
     }
 
     fn classify_transport_failure(
@@ -1429,12 +1458,27 @@ impl ActionService {
         attempts: u8,
         thinking_control: ThinkingControlStatus,
     ) -> Result<RequestOutcome, RuntimeFailure> {
+        let TransportSuccess {
+            content,
+            transport,
+            termination,
+            usage,
+        } = success;
+        // Usage is stored before the terminal is committed; `begin_ready` can
+        // then serve it together with the completed snapshot.
+        if let Some(usage) = usage {
+            self.inner
+                .state
+                .lock()
+                .sessions
+                .record_usage(&prepared.ticket, usage);
+        }
         let generated = GeneratedResponse {
-            transport: success.transport,
-            termination: success.termination,
+            transport,
+            termination,
             attempts,
             thinking_control,
-            output_scalar_count: success.content.chars().count() as u64,
+            output_scalar_count: content.chars().count() as u64,
         };
         let record = prepared.trace.lock().finish(
             generated.transport,
@@ -2327,6 +2371,40 @@ fn build_fallback_body(base: &Value) -> Value {
     base.clone()
 }
 
+/// Ask an OpenAI Chat Completions stream for its trailing usage chunk.
+///
+/// OpenAI only reports `usage` when the request opts in with
+/// `stream_options.include_usage`; DeepSeek reports it either way. The market is
+/// full of OpenAI-compatible gateways (one-api/new-api aggregators, vLLM,
+/// LM Studio) where the field works too, so the field is always requested and a
+/// gateway that names it in a 400 gets one retry without it (see
+/// `rejects_stream_options`). A host allowlist was rejected: it would silently
+/// drop token accounting for every non-vendor host, which is where most users
+/// with pay-per-token keys actually point the app.
+fn with_stream_usage(body: &Value, protocol: crate::models::ProviderProtocol) -> (Value, bool) {
+    if protocol != crate::models::ProviderProtocol::OpenAiChat {
+        return (body.clone(), false);
+    }
+    let mut body = body.clone();
+    body["stream_options"] = serde_json::json!({ "include_usage": true });
+    (body, true)
+}
+
+/// The gateway rejected `stream_options` itself, not the request.
+///
+/// Only a request-level rejection that names the field qualifies: content that
+/// already streamed, a transient failure, or an unrelated parameter rejection
+/// must not spend a second provider round trip. The nested `include_usage` name
+/// is matched too, because some gateways report the leaf parameter.
+fn rejects_stream_options(failure: &TransportFailure) -> bool {
+    !failure.content_seen
+        && matches!(failure.status, None | Some(400) | Some(422))
+        && failure.provider_error.as_ref().is_some_and(|error| {
+            provider_error_names_field(error, "stream_options")
+                || provider_error_names_field(error, "include_usage")
+        })
+}
+
 fn shared_total_timeout_failure(content_seen: bool) -> TransportFailure {
     TransportFailure {
         code: "TOTAL_TIMEOUT",
@@ -3106,6 +3184,107 @@ mod tests {
         assert!(fallback.get("reasoning_effort").is_none());
         assert!(fallback.get("enable_thinking").is_none());
         assert!(fallback.get("chat_template_kwargs").is_none());
+    }
+
+    #[test]
+    fn stream_usage_is_requested_only_for_openai_chat_bodies() {
+        let prepared = prepared_fixture(ThinkingMode::Off, Some(ThinkingDialect::ReasoningEffort));
+        let base = build_base_body(&prepared);
+        let (body, requested) =
+            with_stream_usage(&base, crate::models::ProviderProtocol::OpenAiChat);
+        assert!(requested);
+        assert_eq!(
+            body["stream_options"],
+            serde_json::json!({"include_usage": true})
+        );
+        assert!(
+            base.get("stream_options").is_none(),
+            "the protocol-neutral base body must stay unchanged"
+        );
+
+        for protocol in [
+            crate::models::ProviderProtocol::OpenAiResponses,
+            crate::models::ProviderProtocol::AnthropicMessages,
+            crate::models::ProviderProtocol::Gemini,
+        ] {
+            let (body, requested) = with_stream_usage(&base, protocol);
+            assert!(!requested, "{protocol:?}");
+            assert!(body.get("stream_options").is_none(), "{protocol:?}");
+        }
+    }
+
+    #[test]
+    fn only_a_field_named_request_rejection_triggers_the_stream_usage_retry() {
+        let envelope = |code: Option<&str>,
+                        param: Option<&str>,
+                        message: &str| crate::openai_protocol::ProviderErrorEnvelope {
+            code: code.map(ToOwned::to_owned),
+            kind: None,
+            param: param.map(ToOwned::to_owned),
+            message: message.to_owned(),
+        };
+        let failure = |status: Option<u16>,
+                       provider_error: Option<crate::openai_protocol::ProviderErrorEnvelope>,
+                       content_seen: bool| TransportFailure {
+            code: "PROVIDER_ERROR",
+            message: "request rejected".to_owned(),
+            retryable: false,
+            status,
+            provider_error,
+            content_seen,
+        };
+
+        // The field is named by `param`...
+        assert!(rejects_stream_options(&failure(
+            Some(400),
+            Some(envelope(
+                Some("unsupported_parameter"),
+                Some("stream_options"),
+                "Unsupported parameter",
+            )),
+            false,
+        )));
+        // ...or only by the message, including the nested leaf name.
+        assert!(rejects_stream_options(&failure(
+            Some(400),
+            Some(envelope(
+                None,
+                None,
+                "Unknown parameter: 'stream_options.include_usage'",
+            )),
+            false,
+        )));
+        // An unrelated rejected field must keep the original failure.
+        assert!(!rejects_stream_options(&failure(
+            Some(400),
+            Some(envelope(
+                Some("unsupported_parameter"),
+                Some("temperature"),
+                "Unsupported parameter",
+            )),
+            false,
+        )));
+        // Content already streamed: a retry would duplicate the answer prefix.
+        assert!(!rejects_stream_options(&failure(
+            Some(400),
+            Some(envelope(
+                Some("unsupported_parameter"),
+                Some("stream_options"),
+                "Unsupported parameter",
+            )),
+            true,
+        )));
+        // Server-side failures are not request-shape rejections.
+        assert!(!rejects_stream_options(&failure(
+            Some(500),
+            Some(envelope(
+                Some("unsupported_parameter"),
+                Some("stream_options"),
+                "Unsupported parameter",
+            )),
+            false,
+        )));
+        assert!(!rejects_stream_options(&failure(None, None, false)));
     }
 
     #[test]

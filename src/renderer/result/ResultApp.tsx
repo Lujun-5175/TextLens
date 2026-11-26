@@ -42,6 +42,7 @@ import {
   type ActionRetryOptions,
   type PublicSettings,
   type ResultSessionSnapshot,
+  type TokenUsage,
   type TranslationLanguage
 } from '../../shared'
 import { ActionIcon } from '../components/ActionIcon'
@@ -160,6 +161,22 @@ export function resultFontSize(settings: PublicSettings | null): number {
   return typeof configured === 'number' && Number.isFinite(configured)
     ? Math.min(RESULT_FONT_SIZE_MAX, Math.max(RESULT_FONT_SIZE_MIN, configured))
     : DEFAULT_RESULT_FONT_SIZE
+}
+
+/**
+ * Group token counts with thousands separators.
+ *
+ * Deliberately locale-independent: the result window is a small fixed-width
+ * surface and the usage line must render identically in every test and on every
+ * host, unlike `toLocaleString()`.
+ */
+export function formatTokenCount(value: number): string {
+  return Math.max(0, Math.trunc(value)).toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',')
+}
+
+interface RequestUsage {
+  requestId: string
+  usage: TokenUsage
 }
 
 export function isWindowsResultRenderer(userAgent = window.navigator.userAgent): boolean {
@@ -538,6 +555,10 @@ function ResultSessionApp({
   const [revealCommitted, setRevealCommitted] = useState(false)
   const [bootstrapMessage, setBootstrapMessage] = useState('')
   const [bootstrapRetrying, setBootstrapRetrying] = useState(false)
+  // Token usage of the request that just completed. The hydrating snapshot is
+  // taken while streaming, so this is filled by a post-completion refresh.
+  const [requestUsage, setRequestUsage] = useState<RequestUsage | null>(null)
+  const usageRefreshRequestId = useRef<string | null>(null)
   const contentRef = useRef<HTMLDivElement>(null)
   const contentInnerRef = useRef<HTMLDivElement>(null)
   const modelSwitchRef = useRef<HTMLDivElement>(null)
@@ -874,6 +895,42 @@ function ResultSessionApp({
     status === 'error' &&
     errorSettingsRevision !== null &&
     settingsRevision > errorSettingsRevision
+
+  // The result window hydrates its snapshot while the request is still
+  // streaming, so usage can only be fetched after the terminal event. Re-running
+  // the ready handshake serves the same snapshot plus the usage the native side
+  // stored at completion; the handshake re-acks the window, so live follow-up
+  // events keep flowing afterwards.
+  useEffect(() => {
+    if (status !== 'completed' || !requestId || preparingRequestId !== null) return
+    const alreadyKnown = session?.requestId === requestId ? session.usage : undefined
+    if (alreadyKnown) {
+      setRequestUsage((current) => (
+        current?.requestId === requestId ? current : { requestId, usage: alreadyKnown }
+      ))
+      return
+    }
+    if (usageRefreshRequestId.current === requestId) return
+    usageRefreshRequestId.current = requestId
+    runDetached((async () => {
+      // Let an in-flight initial handshake settle so `recover()` starts a new
+      // one; reusing its promise would return a snapshot taken before completion.
+      await new Promise<void>((resolve) => { window.setTimeout(resolve, 0) })
+      // A retry/follow-up may have started in the meantime; never re-handshake a
+      // live stream just to decorate a finished answer.
+      const latest = getActionEventSnapshot()
+      if (disposedRef.current || latest.status !== 'completed' || latest.requestId !== requestId) return
+      const refreshed = await bootstrap.recover()
+      if (disposedRef.current || !refreshed || !refreshed.usage) return
+      if (refreshed.requestId !== requestId) return
+      setRequestUsage({ requestId, usage: refreshed.usage })
+    })(), { scope: 'result', operation: 'result-usage-refresh' })
+  }, [bootstrap, preparingRequestId, requestId, session, status])
+
+  const visibleUsage =
+    status === 'completed' && requestUsage?.requestId === requestId
+      ? requestUsage.usage
+      : null
 
   const consumeBootstrap = useCallback(async (
     start: () => Promise<ResultSessionSnapshot | null>,
@@ -1432,6 +1489,20 @@ function ResultSessionApp({
               </div>
             ) : (
               <span className="result-model-summary" title={modelSummary}>{modelSummary}</span>
+            )}
+            {visibleUsage && (
+              // The footer hides its children until hover, so the cost line
+              // lives beside the model name where it is always readable.
+              <span
+                className="result-model-summary result-usage"
+                data-testid="result-usage"
+                title="服务商返回的本次请求 token 用量"
+              >
+                本次 {formatTokenCount(visibleUsage.totalTokens)} tokens
+                {visibleUsage.inputTokens !== undefined && visibleUsage.outputTokens !== undefined
+                  ? `（输入 ${formatTokenCount(visibleUsage.inputTokens)} · 输出 ${formatTokenCount(visibleUsage.outputTokens)}）`
+                  : ''}
+              </span>
             )}
           </div>
         </div>

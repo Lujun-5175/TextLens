@@ -2,14 +2,18 @@
 //!
 //! Windows keeps this in `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`,
 //! matching the current-user installer: no elevation, no machine-wide state.
+//! The registry is written through `RegSetKeyValueW` rather than spawning
+//! `reg.exe`, which endpoint-protection suites treat as suspicious behaviour.
 //! Other platforms keep the setting but apply nothing yet.
 
 pub(crate) const RUN_VALUE_NAME: &str = "TextLens";
 #[cfg(target_os = "windows")]
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 
-/// Command line written to the Run key. Quoted because an install path can
-/// contain spaces (`D:\My Apps\TextLens`).
+/// Value data written to the Run key. Quoted because an install path can
+/// contain spaces (`D:\My Apps\TextLens`) and the value is executed as a
+/// command line.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 pub(crate) fn run_command(executable: &str) -> String {
     format!("\"{executable}\"")
 }
@@ -31,47 +35,49 @@ pub(crate) fn reconcile(enabled: bool, executable: &str) -> Result<(), String> {
 
 #[cfg(target_os = "windows")]
 fn apply_windows(enabled: bool, executable: &str) -> Result<(), String> {
-    use std::os::windows::process::CommandExt;
-    use std::process::Command;
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS, WIN32_ERROR};
+    use windows::Win32::System::Registry::{
+        RegDeleteKeyValueW, RegSetKeyValueW, HKEY_CURRENT_USER, REG_SZ,
+    };
 
-    // CREATE_NO_WINDOW: the toggle must not flash a console.
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-
-    let mut command = Command::new("reg.exe");
-    if enabled {
-        command.args([
-            "add",
-            RUN_KEY,
-            "/v",
-            RUN_VALUE_NAME,
-            "/t",
-            "REG_SZ",
-            "/d",
-            &run_command(executable),
-            "/f",
-        ]);
-    } else {
-        command.args(["delete", RUN_KEY, "/v", RUN_VALUE_NAME, "/f"]);
+    fn wide(value: &str) -> Vec<u16> {
+        value.encode_utf16().chain(std::iter::once(0)).collect()
     }
-    let output = command
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
-        .map_err(|error| format!("无法更新开机启动项：{error}"))?;
 
-    if output.status.success() {
+    let key = wide(RUN_KEY);
+    let name = wide(RUN_VALUE_NAME);
+    let key_ptr = PCWSTR(key.as_ptr());
+    let name_ptr = PCWSTR(name.as_ptr());
+
+    let status: WIN32_ERROR = unsafe {
+        if enabled {
+            let data = wide(&run_command(executable));
+            RegSetKeyValueW(
+                HKEY_CURRENT_USER,
+                key_ptr,
+                name_ptr,
+                REG_SZ.0,
+                Some(data.as_ptr().cast()),
+                u32::try_from(data.len() * std::mem::size_of::<u16>())
+                    .map_err(|_| "开机启动项路径过长".to_owned())?,
+            )
+        } else {
+            RegDeleteKeyValueW(HKEY_CURRENT_USER, key_ptr, name_ptr)
+        }
+    };
+
+    if status == ERROR_SUCCESS {
         return Ok(());
     }
-    // `reg delete` exits non-zero when the value is already absent; that is the
-    // desired end state, not a failure.
-    if !enabled {
+    // Deleting a value that was never written is the desired end state.
+    if !enabled && status == ERROR_FILE_NOT_FOUND {
         return Ok(());
     }
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-    Err(if stderr.is_empty() {
-        "无法写入开机启动项".to_owned()
-    } else {
-        format!("无法写入开机启动项：{stderr}")
-    })
+    Err(format!(
+        "无法更新开机启动项（错误码 {}）",
+        status.0
+    ))
 }
 
 #[cfg(test)]
@@ -84,7 +90,10 @@ mod tests {
             run_command(r"D:\My Apps\TextLens\textlens.exe"),
             r#""D:\My Apps\TextLens\textlens.exe""#
         );
-        assert_eq!(run_command(r"C:\TextLens\textlens.exe"), r#""C:\TextLens\textlens.exe""#);
+        assert_eq!(
+            run_command(r"C:\TextLens\textlens.exe"),
+            r#""C:\TextLens\textlens.exe""#
+        );
     }
 
     #[test]

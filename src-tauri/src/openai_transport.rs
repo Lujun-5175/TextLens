@@ -11,9 +11,9 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     models::AI_OUTPUT_LIMIT,
     openai_protocol::{
-        decode_json_content, incomplete_finish_kind, json_incomplete_kind,
+        decode_json_content, decode_json_usage, incomplete_finish_kind, json_incomplete_kind,
         provider_error_from_value, DecodedSseEvent, IncompleteKind, ProtocolError, ProtocolLimits,
-        ProviderErrorEnvelope, SseCodec, SseDecoder, SseTermination,
+        ProviderErrorEnvelope, SseCodec, SseDecoder, SseTermination, TokenUsage,
     },
 };
 
@@ -111,6 +111,11 @@ pub(crate) struct TransportSuccess {
     pub content: String,
     pub transport: ResponseTransport,
     pub termination: ResponseTermination,
+    /// Token accounting the provider reported for this request, if any.
+    ///
+    /// Only successful completions carry it: a failed or cancelled stream has no
+    /// trustworthy total, so its partial numbers are dropped rather than shown.
+    pub usage: Option<TokenUsage>,
 }
 
 #[derive(Debug)]
@@ -330,6 +335,7 @@ where
             next = chunks.next() => next,
         };
         let Some(chunk) = next else {
+            let usage = decoder.usage();
             let termination = decoder
                 .finish()
                 .map_err(|error| protocol_failure(error, content_seen))?;
@@ -340,6 +346,7 @@ where
                 content,
                 transport: ResponseTransport::Sse,
                 termination: response_termination(termination),
+                usage,
             });
         };
         let chunk = chunk?;
@@ -373,6 +380,7 @@ where
                             content,
                             transport: ResponseTransport::Sse,
                             termination: ResponseTermination::Done,
+                            usage: decoder.usage(),
                         });
                     }
                     break;
@@ -546,6 +554,7 @@ where
     }
     on_marker(TransportMarker::FirstValidEvent, Instant::now());
     let content = decode_json_content(codec, &value).unwrap_or_default();
+    let usage = decode_json_usage(codec, &value);
     let incomplete = json_incomplete_kind(codec, &value);
     let scalar_count = content.chars().count();
     if scalar_count > config.output_scalars {
@@ -571,6 +580,7 @@ where
         content,
         transport: ResponseTransport::Json,
         termination: ResponseTermination::Json,
+        usage,
     })
 }
 
@@ -1468,6 +1478,110 @@ data: {"type":"response.incomplete","response":{"status":"incomplete","incomplet
         )
         .await
         .unwrap_err()
+    }
+
+    #[tokio::test]
+    async fn transport_surfaces_provider_reported_usage_per_protocol() {
+        for (codec, wire, expected) in [
+            (
+                SseCodec::OpenAiChat,
+                concat!(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+                    "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":900,\"completion_tokens\":334,\"total_tokens\":1234}}\n\n",
+                    "data: [DONE]\n\n",
+                ),
+                (Some(900), Some(334), 1234),
+            ),
+            (
+                SseCodec::OpenAiResponses,
+                concat!(
+                    "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n",
+                    "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":900,\"output_tokens\":334,\"total_tokens\":1234}}}\n\n",
+                ),
+                (Some(900), Some(334), 1234),
+            ),
+            (
+                SseCodec::AnthropicMessages,
+                concat!(
+                    "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":900,\"output_tokens\":1}}}\n\n",
+                    "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n",
+                    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":334}}\n\n",
+                    "data: {\"type\":\"message_stop\"}\n\n",
+                ),
+                (Some(900), Some(334), 1234),
+            ),
+            (
+                SseCodec::Gemini,
+                concat!(
+                    "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hi\"}]}}],\"usageMetadata\":{\"promptTokenCount\":900,\"candidatesTokenCount\":100,\"totalTokenCount\":1000}}\n\n",
+                    "data: {\"candidates\":[{\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":900,\"candidatesTokenCount\":334,\"totalTokenCount\":1234}}\n\n",
+                ),
+                (Some(900), Some(334), 1234),
+            ),
+        ] {
+            let success = consume_sse_chunks_for(
+                codec,
+                futures_util::stream::iter(vec![Ok(Bytes::from(wire.to_owned()))]),
+                &CancellationToken::new(),
+                &GenerationBudget::new(Instant::now(), Duration::from_secs(10)),
+                Instant::now(),
+                TransportConfig::test(),
+                |_| ControlFlow::Continue(()),
+                |_| ControlFlow::Continue(()),
+                |_, _| {},
+            )
+            .await
+            .unwrap();
+            let usage = success.usage.expect("usage must survive the transport");
+            assert_eq!(
+                (
+                    usage.input_tokens,
+                    usage.output_tokens,
+                    usage.total_tokens
+                ),
+                expected,
+                "{codec:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn transport_json_success_carries_usage_and_usage_only_stream_is_empty() {
+        let success = consume_json_chunks(
+            futures_util::stream::iter(vec![Ok(Bytes::from_static(
+                br#"{"choices":[{"message":{"content":"complete"},"finish_reason":"stop"}],"usage":{"prompt_tokens":12,"completion_tokens":3,"total_tokens":15}}"#,
+            ))]),
+            &CancellationToken::new(),
+            &GenerationBudget::new(Instant::now(), Duration::from_secs(10)),
+            Instant::now(),
+            TransportConfig::test(),
+            |_| ControlFlow::Continue(()),
+            |_, _| {},
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            success.usage.map(|usage| usage.total_tokens),
+            Some(15)
+        );
+
+        // A usage-only stream still has no answer, so it must fail as empty
+        // instead of surfacing token numbers without any generated content.
+        let failure = consume_sse_chunks(
+            futures_util::stream::iter(vec![Ok(Bytes::from_static(
+                b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":900,\"completion_tokens\":0,\"total_tokens\":900}}\n\ndata: [DONE]\n\n",
+            ))]),
+            &CancellationToken::new(),
+            &GenerationBudget::new(Instant::now(), Duration::from_secs(10)),
+            Instant::now(),
+            TransportConfig::test(),
+            |_| ControlFlow::Continue(()),
+            |_| ControlFlow::Continue(()),
+            |_, _| {},
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(failure.code, "EMPTY_RESPONSE");
     }
 
     #[tokio::test]

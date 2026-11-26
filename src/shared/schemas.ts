@@ -709,6 +709,37 @@ export const preparationFailureSchema = z.object({
 }).strict()
 export type PreparationFailure = z.infer<typeof preparationFailureSchema>
 
+/**
+ * A provider-reported token count.
+ *
+ * Not `wireCounterSchema`: these numbers are display-only, and a gateway that
+ * reports an absurd or imprecise count must never fail the whole snapshot
+ * handshake (which is all-or-nothing). `int()` is avoided too because Zod's
+ * integer check is safe-integer based, which would reject a hypothetical huge
+ * count; `Number.isInteger` keeps the value usable for display either way.
+ */
+const tokenCountSchema = z
+  .number()
+  .finite()
+  .nonnegative()
+  .refine((value) => Number.isInteger(value), 'token count must be an integer')
+
+/**
+ * Provider-reported token accounting for one request.
+ *
+ * Only the total is guaranteed: protocols differ in what they expose (Anthropic
+ * reports no total at all, so the native side derives it), and the UI must be
+ * able to show a bare total without an input/output breakdown.
+ */
+export const tokenUsageSchema = z
+  .object({
+    inputTokens: tokenCountSchema.optional(),
+    outputTokens: tokenCountSchema.optional(),
+    totalTokens: tokenCountSchema
+  })
+  .strict()
+export type TokenUsage = z.infer<typeof tokenUsageSchema>
+
 export const transcriptTurnSchema = z.object({
   id: z.string().min(1).max(256),
   role: z.enum(['user', 'assistant']),
@@ -801,6 +832,8 @@ export const resultSessionSnapshotSchema = z
     lastSequence: wireCounterSchema,
     lastContentSequence: wireCounterSchema,
     contentScalarCount: wireCounterSchema.max(AI_OUTPUT_LIMIT),
+    /** Present only on the snapshot of a successfully completed request. */
+    usage: tokenUsageSchema.optional(),
     handshakeGeneration: wireCounterSchema,
     generationNotice: actionNoticeSchema.optional(),
     preparationFailure: preparationFailureSchema.optional(),
