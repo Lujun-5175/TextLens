@@ -804,6 +804,11 @@ fn windows_click_pair_matches(
         && (current_point.y - previous_point.y).abs() * 2.0 <= f64::from(double_click_size.1.max(1))
 }
 
+/// Past this much movement the gesture is a drag regardless of how the press
+/// duration measured, which keeps clock skew from swallowing real selections.
+#[cfg(any(target_os = "windows", test))]
+const WINDOWS_DRAG_DURATION_EXEMPT_SQUARED: f64 = 64.0 * 64.0;
+
 #[cfg(any(target_os = "windows", test))]
 fn classify_windows_mouse_selection(
     start: SelectionPoint,
@@ -820,7 +825,14 @@ fn classify_windows_mouse_selection(
     if is_double_click && dx * dx + dy * dy <= WINDOWS_CLICK_DRIFT_DISTANCE_SQUARED {
         return Some(SelectionTrigger::DoubleClick);
     }
-    if drag_duration_valid && dx * dx + dy * dy >= drag_threshold_squared {
+    // A large movement is a drag even when the press duration looks wrong. The
+    // duration guard exists to reject pathological presses, not to demote a
+    // half-screen selection into a double click; that demotion made every drag
+    // capture nothing and the toolbar never appear.
+    let distance_squared = dx * dx + dy * dy;
+    if distance_squared >= drag_threshold_squared
+        && (drag_duration_valid || distance_squared >= WINDOWS_DRAG_DURATION_EXEMPT_SQUARED)
+    {
         return Some(SelectionTrigger::Drag);
     }
     if is_double_click {
@@ -1367,6 +1379,46 @@ mod tests {
                 cursor
             ),
             cursor
+        );
+    }
+
+    /// Observed in the field: a half-screen drag arrived with an invalid press
+    /// duration and was demoted to a double click, so nothing was captured and
+    /// the toolbar never appeared.
+    #[test]
+    fn a_large_movement_is_a_drag_even_when_the_press_duration_is_invalid() {
+        let start = SelectionPoint { x: 70.0, y: 600.0 };
+        let end = SelectionPoint { x: 600.0, y: 602.0 };
+        let threshold = windows_drag_distance_squared(1.5);
+
+        assert_eq!(
+            classify_windows_mouse_selection(start, end, false, true, false, threshold),
+            Some(SelectionTrigger::Drag),
+            "a 530px gesture must not fall through to the double-click branch"
+        );
+        // Small movements keep their existing behaviour.
+        assert_eq!(
+            classify_windows_mouse_selection(
+                start,
+                SelectionPoint { x: 72.0, y: 600.0 },
+                false,
+                false,
+                false,
+                threshold
+            ),
+            None
+        );
+        // A clean click pair with drift stays on the double-click path.
+        assert_eq!(
+            classify_windows_mouse_selection(
+                start,
+                SelectionPoint { x: 71.0, y: 600.0 },
+                false,
+                true,
+                true,
+                threshold
+            ),
+            Some(SelectionTrigger::DoubleClick)
         );
     }
 

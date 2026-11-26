@@ -1704,8 +1704,16 @@ impl SelectionWorker {
                     self.last_click = None;
                     self.last_mouse_up = None;
                 }
+                trace_selection_line(format!(
+                    "[selection-down] at=({:.0},{:.0}) target=self:{}",
+                    point.x, point.y, target_is_self
+                ));
                 self.mouse_down = Some(point);
                 self.mouse_down_at = Some(event_time);
+                trace_selection_line(format!(
+                    "[mouse-down] point=({},{}) t={} self={}",
+                    point.x, point.y, event_time, target_is_self
+                ));
                 self.mouse_down_on_self = target_is_self;
                 self.mouse_down_target_root = target_root.0 as isize;
                 self.mouse_down_target_window = target_window.0 as isize;
@@ -1721,8 +1729,14 @@ impl SelectionWorker {
                 self.emit_dismiss("mouseDown", point, target_window, timestamp_ms);
             }
             WM_LBUTTONUP => {
+                let down_present = self.mouse_down.is_some();
+                let had_down = self.mouse_down.is_some();
                 let start = self.mouse_down.take().unwrap_or(point);
                 let pressed_at = self.mouse_down_at.take();
+                trace_selection_line(format!(
+                    "[mouse-up] point=({},{}) start=({},{}) had_down={} t={}",
+                    point.x, point.y, start.x, start.y, had_down, event_time
+                ));
                 let press_duration = pressed_at.map(|at| event_time.wrapping_sub(at));
                 // A missing mouse-down (hook started mid-gesture) must not
                 // demote a real drag to a click; movement still gates the
@@ -1776,13 +1790,36 @@ impl SelectionWorker {
                 } else {
                     target_window
                 });
+                let drag_threshold_squared = windows_drag_distance_squared(gesture_dpi_scale);
+                if selection_trace_enabled() {
+                    trace_selection_line(format!(
+                        "[selection-up] point=({:.0},{:.0}) down={}",
+                        point.x, point.y, down_present
+                    ));
+                }
+                if selection_trace_enabled() {
+                    trace_selection_line(format!(
+                        "[selection-classify] start=({:.0},{:.0}) end=({:.0},{:.0}) dx={:.0} dy={:.0} double={} duration_valid={} press_ms={:?} threshold2={:.1} scale={:.3}",
+                        start_point.x,
+                        start_point.y,
+                        end_point.x,
+                        end_point.y,
+                        dx_of(start_point, end_point),
+                        dy_of(start_point, end_point),
+                        is_double_click,
+                        drag_duration_valid,
+                        press_duration,
+                        drag_threshold_squared,
+                        gesture_dpi_scale
+                    ));
+                }
                 let trigger = classify_windows_mouse_selection(
                     start_point,
                     end_point,
                     self.mouse_down_shift,
                     is_double_click,
                     drag_duration_valid,
-                    windows_drag_distance_squared(gesture_dpi_scale),
+                    drag_threshold_squared,
                 );
                 self.last_mouse_up = Some(point);
                 if unmodified
@@ -2315,12 +2352,35 @@ impl SelectionWorker {
                     .end
                     .map(raw_selection_point)
                     .unwrap_or(raw_selection_point(request.current));
-                if !drag_selection_matches_gesture(
+                let matched_in_physical = drag_selection_matches_gesture(
                     selection.bounds,
                     drag_start,
                     drag_end,
                     POINTER_BOUNDS_TOLERANCE,
-                ) {
+                );
+                // The hook reports physical pixels, but UIA bounds come from the
+                // capture helper, which is not DPI-aware and therefore reports
+                // logical ones. Comparing the two directly rejected every drag on
+                // a scaled display, so accept whichever space matches.
+                let gesture_scale = dpi_scale_for_window(HWND(source_root_window as *mut c_void));
+                let gesture_scale = if gesture_scale.is_finite() && gesture_scale > 0.0 {
+                    gesture_scale
+                } else {
+                    1.0
+                };
+                let matched_in_logical = gesture_scale != 1.0 && {
+                    let to_logical = |point: SelectionPoint| SelectionPoint {
+                        x: point.x / gesture_scale,
+                        y: point.y / gesture_scale,
+                    };
+                    drag_selection_matches_gesture(
+                        selection.bounds,
+                        to_logical(drag_start),
+                        to_logical(drag_end),
+                        POINTER_BOUNDS_TOLERANCE,
+                    )
+                };
+                if !matched_in_physical && !matched_in_logical {
                     trace_selection_capture(
                         "rejected-drag-outside-gesture",
                         &request,
@@ -9063,6 +9123,14 @@ fn window_process_id(window: HWND) -> u32 {
 
 /// Display scale of the window the gesture started on. Hook coordinates are
 /// physical pixels, so thresholds expressed in DIPs multiply by this value.
+fn dx_of(start: SelectionPoint, end: SelectionPoint) -> f64 {
+    end.x - start.x
+}
+
+fn dy_of(start: SelectionPoint, end: SelectionPoint) -> f64 {
+    end.y - start.y
+}
+
 fn dpi_scale_for_window(window: HWND) -> f64 {
     use windows::Win32::UI::HiDpi::GetDpiForWindow;
 

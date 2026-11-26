@@ -408,8 +408,7 @@ body,
 
 .result-content {
   min-height: 0;
-  /* The footer occupies its own row now, so it needs no bottom reserve. */
-  padding: 16px 20px 18px;
+  padding: 16px 20px 56px;
   overflow-x: hidden;
   overflow-y: hidden;
   overscroll-behavior: contain;
@@ -1316,25 +1315,54 @@ body,
   bottom: 111px;
 }
 
-/* Docked in the window grid's third row instead of floating over the content.
-   The old hover-only reveal kept the reading surface clean but hid copy, retry
-   and insert-back until the pointer reached the very bottom edge: controls the
-   user cannot see are controls that do not exist. */
 .result-footer {
-  position: relative;
+  position: absolute;
   z-index: 20;
+  right: 12px;
+  bottom: 10px;
+  left: 12px;
+  /* Expand the hover hit-area upward so controls appear only near the footer,
+     not when the pointer is anywhere on the result window. */
+  padding-top: 52px;
+  margin-top: -52px;
   display: flex;
   gap: 8px;
   align-items: flex-end;
   justify-content: space-between;
-  padding: 8px 12px 10px;
-  background: var(--result-content-surface);
-  border-top: 1px solid var(--border);
+  background: transparent;
+  border: 0;
+  box-shadow: none;
+  /* Keep the expanded hit strip hoverable while the chrome stays invisible. */
+  pointer-events: auto;
+  visibility: visible;
+  opacity: 0;
+  transition: opacity 90ms ease;
+}
+
+/* Only reveal when the pointer is over the bottom footer zone (or focus is
+   inside follow-up / buttons). Whole-window hover must NOT show the chrome. */
+.result-footer:hover,
+.result-footer:focus-within {
+  opacity: 1;
+  background: transparent;
+  border: 0;
+  border-radius: 0;
   box-shadow: none;
 }
 
 .result-footer--actions-only {
   justify-content: flex-end;
+}
+
+/* While hidden, still allow hit-testing on the expanded padding strip, but
+   keep child controls from intercepting clicks until revealed. */
+.result-footer:not(:hover):not(:focus-within) > * {
+  pointer-events: none;
+}
+
+.result-footer:hover > *,
+.result-footer:focus-within > * {
+  pointer-events: auto;
 }
 
 .result-followup {

@@ -941,6 +941,7 @@ impl WindowCoordinator {
             .lock()
             .reserve_toolbar_stage(selection_id, anchor, placement);
         let Some((revision, size)) = reserved else {
+            eprintln!("[toolbar] stage skipped: reservation refused for {selection_id}");
             return Ok(());
         };
         self.stop_toolbar_pointer_tracking();
@@ -968,9 +969,13 @@ impl WindowCoordinator {
         let reserved = {
             let mut state = self.state.lock();
             if !state.toolbar_selection_is_current(selection_id) {
+                eprintln!(
+                    "[toolbar] present skipped: selection {selection_id} is no longer current"
+                );
                 return Ok(false);
             }
             let Some(anchor) = state.toolbar_anchor else {
+                eprintln!("[toolbar] present skipped: no anchor staged for {selection_id}");
                 return Ok(false);
             };
             let placement = state.toolbar_placement.unwrap_or_default();
@@ -989,6 +994,7 @@ impl WindowCoordinator {
                 .lock()
                 .toolbar_operation_is_current(revision)
             {
+                eprintln!("[toolbar] present aborted: revision superseded");
                 return Ok(false);
             }
             // macOS lays out behind alpha 0, including timeout retries.
