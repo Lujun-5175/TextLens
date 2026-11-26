@@ -572,6 +572,8 @@ struct ResultSessionMeta {
     /// result history. A retry/continue introduces a new request id and earns
     /// its own entry; repeated ready handshakes for the same request do not.
     history_request_id: Option<String>,
+    /// Request whose metadata line was already written to the audit log.
+    request_log_id: Option<String>,
 }
 
 impl ResultSessionMeta {
@@ -590,6 +592,16 @@ impl ResultSessionMeta {
             return false;
         }
         self.history_request_id = Some(request_id.to_owned());
+        true
+    }
+
+    /// Claims the audit-log slot for one finished request, whatever its status.
+    /// Repeated ready handshakes for the same request must not duplicate lines.
+    fn claim_request_log(&mut self, request_id: &str) -> bool {
+        if self.request_log_id.as_deref() == Some(request_id) {
+            return false;
+        }
+        self.request_log_id = Some(request_id.to_owned());
         true
     }
 }
@@ -1834,6 +1846,7 @@ impl RuntimeState {
                 pinned: result.default_pinned,
                 action_taken_over: false,
                 history_request_id: None,
+                request_log_id: None,
             },
         );
         let (reveal_sender, reveal_receiver) = oneshot::channel();
@@ -3504,6 +3517,7 @@ pub fn begin_result_ready(
         .begin_ready(&session_id, window.label())
         .map_err(|error| error.to_string())?;
     record_completed_history(&app, &state, &session_id, &begin);
+    record_request_log(&app, &state, &session_id, &begin);
     let width = state
         .windows
         .toolbar_max_width(&app, selection_toolbar_anchor(&meta.selection.payload).0);
@@ -3565,6 +3579,81 @@ fn record_completed_history(
             usage: begin.usage,
         },
     );
+}
+
+/// Writes one audit line per finished request: who was asked, how much text and
+/// what came back. Metadata only — never the prompt or the answer.
+fn record_request_log(
+    app: &AppHandle,
+    state: &RuntimeState,
+    session_id: &str,
+    begin: &ActionBeginReady,
+) {
+    let claimed = {
+        let mut sessions = state.result_sessions.lock();
+        sessions
+            .get_mut(session_id)
+            .is_some_and(|meta| meta.claim_request_log(&begin.snapshot.request_id))
+    };
+    if !claimed {
+        return;
+    }
+    let Ok(config_dir) = app.path().app_config_dir() else {
+        return;
+    };
+    let settings = state.settings.get_settings();
+    let action_name = settings
+        .actions
+        .iter()
+        .find(|action| action.id == begin.snapshot.action_id)
+        .map(|action| action.name.clone())
+        .unwrap_or_default();
+    let (provider_name, model_id, endpoint_host) = match begin.route.as_ref() {
+        Some(route) => {
+            let provider = settings
+                .providers
+                .iter()
+                .find(|provider| provider.id == route.provider_id);
+            (
+                provider
+                    .map(|provider| provider.name.clone())
+                    .unwrap_or_default(),
+                route.model_id.clone(),
+                provider
+                    .and_then(|provider| url::Url::parse(&provider.base_url).ok())
+                    .and_then(|url| url.host_str().map(str::to_owned))
+                    .unwrap_or_default(),
+            )
+        }
+        None => (String::new(), String::new(), String::new()),
+    };
+    let status = match begin.snapshot.status {
+        ActionSnapshotStatus::Completed => "completed",
+        ActionSnapshotStatus::Error => "failed",
+        ActionSnapshotStatus::Cancelled => "cancelled",
+        _ => "running",
+    };
+    if status == "running" {
+        return;
+    }
+    let character_count = settings
+        .actions
+        .iter()
+        .find(|action| action.id == begin.snapshot.action_id)
+        .map(|_| begin.snapshot.content.chars().count() as u64)
+        .unwrap_or(0);
+    let entry = crate::request_log::RequestLogEntry {
+        created_at: crate::request_log::now_iso8601(),
+        action_name,
+        provider_name,
+        model_id,
+        endpoint_host,
+        character_count,
+        status: status.to_owned(),
+        error_code: begin.snapshot.error_code.clone(),
+        total_tokens: begin.usage.map(|usage| usage.total_tokens),
+    };
+    crate::request_log::record(&crate::request_log::log_path(&config_dir), entry);
 }
 
 #[tauri::command]
@@ -3741,6 +3830,9 @@ pub fn show_result_selection(
             .min(u128::from(u64::MAX)) as u64,
         sequence: 0,
         windows_selection_evidence: None,
+        // A selection made inside the result window has no other application
+        // to paste back into.
+        source_window: None,
     };
     let current = CurrentSelection {
         id: Uuid::new_v4().to_string(),
@@ -3922,6 +4014,78 @@ pub fn continue_action(
         )),
         Err(error) => follow_up_error_result(error),
     }
+}
+
+/// Recent request metadata for the audit panel, newest first.
+#[tauri::command]
+pub async fn list_request_log(
+    app: AppHandle,
+    window: WebviewWindow,
+    limit: Option<usize>,
+) -> Result<Vec<crate::request_log::RequestLogEntry>, String> {
+    ensure_settings_caller(&window)?;
+    let config_dir = app
+        .path()
+        .app_config_dir()
+        .map_err(|error| format!("无法定位设置目录：{error}"))?;
+    let path = crate::request_log::log_path(&config_dir);
+    let requested = limit.unwrap_or(crate::request_log::DEFAULT_LIST_LIMIT);
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::request_log::list_recent(&path, requested)
+            .map(|read| read.entries)
+            .map_err(|error| format!("无法读取请求日志：{error}"))
+    })
+    .await
+    .map_err(|error| format!("无法读取请求日志：{error}"))?
+}
+
+#[tauri::command]
+pub async fn clear_request_log(app: AppHandle, window: WebviewWindow) -> Result<(), String> {
+    ensure_settings_caller(&window)?;
+    let config_dir = app
+        .path()
+        .app_config_dir()
+        .map_err(|error| format!("无法定位设置目录：{error}"))?;
+    let path = crate::request_log::log_path(&config_dir);
+    tauri::async_runtime::spawn_blocking(move || crate::request_log::clear(&path))
+        .await
+        .map_err(|error| format!("无法清空请求日志：{error}"))?
+        .map_err(|error| format!("无法清空请求日志：{error}"))
+}
+
+/// Puts a finished answer back where the selection came from.
+///
+/// The text reaches the clipboard first, so a refused paste still leaves the
+/// user one keystroke away. `"pasted"` and `"copied"` tell the renderer which
+/// message to show.
+#[tauri::command]
+pub fn reinsert_result(
+    window: WebviewWindow,
+    state: State<'_, RuntimeState>,
+    session_id: String,
+    text: String,
+) -> Result<String, String> {
+    ensure_result_window(&window)?;
+    if text.trim().is_empty() {
+        return Err("结果为空".to_owned());
+    }
+    if text.chars().count() > 1_000_000 {
+        return Err("结果过长".to_owned());
+    }
+    let source_window = state
+        .result_sessions
+        .lock()
+        .get(&session_id)
+        .and_then(|meta| meta.selection.payload.source_window);
+    clipboard::write_text(&text)?;
+    // Hide first: the OS restores the previous foreground window, so the
+    // verification inside `reinsert` has a chance to pass.
+    let _ = window.hide();
+    std::thread::sleep(Duration::from_millis(40));
+    Ok(match crate::reinsert::reinsert(source_window) {
+        crate::reinsert::ReinsertOutcome::Pasted => "pasted".to_owned(),
+        crate::reinsert::ReinsertOutcome::CopiedOnly => "copied".to_owned(),
+    })
 }
 
 #[tauri::command]
@@ -4576,6 +4740,7 @@ mod tests {
                     timestamp_ms: 0,
                     sequence: 0,
                     windows_selection_evidence: None,
+                    source_window: None,
                 },
                 source_result_session_id: Some("s".to_owned()),
                 host_clear_generation: 5,
@@ -4584,6 +4749,7 @@ mod tests {
             pinned: false,
             action_taken_over: false,
             history_request_id: None,
+            request_log_id: None,
         }
     }
 
@@ -5544,6 +5710,7 @@ mod tests {
             timestamp_ms: 1,
             sequence: 1,
             windows_selection_evidence: None,
+            source_window: None,
         }
     }
 

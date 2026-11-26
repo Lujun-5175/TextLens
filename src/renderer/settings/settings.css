@@ -2271,3 +2271,72 @@ textarea.control::-webkit-scrollbar-thumb:hover,
   white-space: pre-wrap;
   word-break: break-word;
 }
+
+/* Request log: one dense row per request, metadata only. */
+.request-log-note {
+  margin: 4px 0 0;
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+  line-height: 1.5;
+}
+
+.request-log-toolbar {
+  margin-top: 12px;
+}
+
+.request-log-empty {
+  margin: 16px 0 0;
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+}
+
+.request-log-list {
+  list-style: none;
+  display: grid;
+  gap: 2px;
+  margin: 14px 0 0;
+  padding: 0;
+}
+
+.request-log-row {
+  display: grid;
+  grid-template-columns: 76px minmax(64px, 1fr) minmax(96px, 1.2fr) 52px auto;
+  align-items: baseline;
+  gap: 10px;
+  padding: 7px 10px;
+  border-radius: var(--radius-sm);
+  font-size: var(--text-sm);
+}
+
+.request-log-row:nth-child(odd) {
+  background: var(--surface-muted);
+}
+
+.request-log-row__time,
+.request-log-row__numbers {
+  color: var(--text-tertiary);
+  font-variant-numeric: tabular-nums;
+}
+
+.request-log-row__action {
+  font-weight: var(--weight-medium);
+}
+
+.request-log-row__model {
+  color: var(--text-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.request-log-row__status {
+  color: var(--text-secondary);
+}
+
+.request-log-row__status--failed {
+  color: var(--danger);
+}
+
+.request-log-row__numbers {
+  text-align: right;
+}

@@ -153,6 +153,10 @@ pub struct SelectionPayload {
     pub sequence: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub windows_selection_evidence: Option<WindowsSelectionEvidence>,
+    /// Top-level window the selection came from, so a finished answer can be
+    /// pasted back into it. Windows only; other platforms leave it empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_window: Option<i64>,
 }
 
 impl SelectionPayload {
@@ -344,6 +348,7 @@ impl From<WireEvent> for SelectionEvent {
                 timestamp_ms,
                 sequence,
                 windows_selection_evidence: None,
+                source_window: None,
             }),
             WireEvent::Dismiss {
                 reason,
@@ -1764,6 +1769,7 @@ mod tests {
             timestamp_ms: 1,
             sequence: 0,
             windows_selection_evidence: None,
+            source_window: None,
         }
     }
 }

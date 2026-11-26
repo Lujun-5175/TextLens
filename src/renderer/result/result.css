@@ -1013,6 +1013,178 @@ body,
   background: transparent;
 }
 
+/* Fenced code blocks are wrapped so the copy control can sit outside the
+   horizontally scrolling <pre>. Margins move to the wrapper; the inner <pre>
+   collapses its own so the block keeps the same rhythm as before. */
+.markdown-code-block {
+  position: relative;
+  margin: 0.52em 0;
+}
+
+.markdown-code-block > pre {
+  margin: 0;
+}
+
+/* Hidden until the block is hovered or the button itself takes focus, so the
+   chrome stays out of the way of someone reading code. Touch devices have no
+   hover, so they get a permanently visible control instead. */
+.markdown-code-block__copy {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 22px;
+  padding: 2px 8px;
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+  font-weight: var(--weight-semibold);
+  line-height: 1;
+  background: var(--surface-solid);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-tag);
+  box-shadow: var(--shadow-sm);
+  opacity: 0;
+  pointer-events: none;
+  transition:
+    opacity 90ms ease,
+    color 90ms ease,
+    border-color 90ms ease;
+}
+
+.markdown-code-block:hover > .markdown-code-block__copy,
+.markdown-code-block:focus-within > .markdown-code-block__copy,
+.markdown-code-block__copy:focus-visible {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.markdown-code-block__copy:hover {
+  color: var(--text);
+  border-color: var(--border-strong);
+}
+
+.markdown-code-block__copy:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+/* Success and failure are colour-coded but also spelled out in the label. */
+.markdown-code-block__copy[data-copy-state='copied'] {
+  color: var(--success);
+  border-color: var(--success);
+  border-color: color-mix(in srgb, var(--success) 45%, transparent);
+}
+
+.markdown-code-block__copy[data-copy-state='failed'] {
+  color: var(--danger);
+  border-color: var(--danger);
+  border-color: color-mix(in srgb, var(--danger) 45%, transparent);
+}
+
+@media (hover: none) {
+  .markdown-code-block__copy {
+    opacity: 1;
+    pointer-events: auto;
+  }
+}
+
+/* Syntax colours live in one palette per appearance so the .hljs-* rules below
+   stay single-token. The values are warm-neutral and keep >=4.5:1 contrast on
+   every theme's muted code surface. */
+.markdown-body {
+  --syntax-comment: #6f675a;
+  --syntax-keyword: #a03a68;
+  --syntax-string: #2f6b45;
+  --syntax-number: #8f4e0c;
+  --syntax-title: var(--accent);
+  --syntax-type: #6f47b0;
+  --syntax-tag: #4a453c;
+  --syntax-meta: #94622e;
+}
+
+.markdown-body .hljs {
+  color: var(--text);
+  background: transparent;
+}
+
+.markdown-body .hljs-comment,
+.markdown-body .hljs-quote {
+  color: var(--syntax-comment);
+  font-style: italic;
+}
+
+.markdown-body .hljs-keyword,
+.markdown-body .hljs-selector-tag,
+.markdown-body .hljs-literal,
+.markdown-body .hljs-doctag,
+.markdown-body .hljs-section {
+  color: var(--syntax-keyword);
+}
+
+.markdown-body .hljs-string,
+.markdown-body .hljs-regexp,
+.markdown-body .hljs-char.escape_ {
+  color: var(--syntax-string);
+}
+
+.markdown-body .hljs-number,
+.markdown-body .hljs-symbol,
+.markdown-body .hljs-bullet,
+.markdown-body .hljs-selector-class,
+.markdown-body .hljs-selector-id,
+.markdown-body .hljs-selector-pseudo {
+  color: var(--syntax-number);
+}
+
+.markdown-body .hljs-title,
+.markdown-body .hljs-function,
+.markdown-body .hljs-name {
+  color: var(--syntax-title);
+}
+
+.markdown-body .hljs-type,
+.markdown-body .hljs-attr,
+.markdown-body .hljs-attribute,
+.markdown-body .hljs-variable,
+.markdown-body .hljs-template-variable,
+.markdown-body .hljs-built_in,
+.markdown-body .hljs-params {
+  color: var(--syntax-type);
+}
+
+.markdown-body .hljs-tag,
+.markdown-body .hljs-punctuation,
+.markdown-body .hljs-operator {
+  color: var(--syntax-tag);
+}
+
+.markdown-body .hljs-meta,
+.markdown-body .hljs-link {
+  color: var(--syntax-meta);
+}
+
+.markdown-body .hljs-addition {
+  color: var(--success);
+  background: var(--success-soft);
+  background: color-mix(in srgb, var(--success-soft) 70%, transparent);
+}
+
+.markdown-body .hljs-deletion {
+  color: var(--danger);
+  background: var(--danger-soft);
+  background: color-mix(in srgb, var(--danger-soft) 70%, transparent);
+}
+
+.markdown-body .hljs-emphasis {
+  font-style: italic;
+}
+
+.markdown-body .hljs-strong {
+  font-weight: var(--weight-bold);
+}
+
 .markdown-body a {
   color: var(--accent);
   text-underline-offset: 2px;
@@ -1403,7 +1575,8 @@ body,
   .result-model-switch__trigger svg,
   .result-footer,
   .result-followup textarea,
-  .result-footer-button {
+  .result-footer-button,
+  .markdown-code-block__copy {
     transition: none;
   }
 }
@@ -1421,6 +1594,27 @@ body,
     background: color-mix(in srgb, var(--surface-muted) 88%, var(--text) 8%);
     border-color: var(--border);
     border-color: color-mix(in srgb, var(--border) 70%, var(--text) 12%);
+  }
+
+  /* Darker code surfaces need lighter syntax colours; the light palette is
+     tuned for warm near-white backgrounds and would sit below 4.5:1 here. */
+  .markdown-body {
+    --syntax-comment: #a49c8e;
+    --syntax-keyword: #f2a0c0;
+    --syntax-string: #9ed3a8;
+    --syntax-number: #efc07a;
+    --syntax-title: var(--accent);
+    --syntax-type: #c8a8f2;
+    --syntax-tag: #cbd0d8;
+    --syntax-meta: #e0bb8e;
+  }
+
+  .markdown-code-block__copy {
+    background: var(--surface-muted);
+    background: color-mix(in srgb, var(--surface-muted) 88%, var(--text) 8%);
+    border-color: var(--border);
+    border-color: color-mix(in srgb, var(--border) 70%, var(--text) 12%);
+    box-shadow: none;
   }
 
   .markdown-body code {

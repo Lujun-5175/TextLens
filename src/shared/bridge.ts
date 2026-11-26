@@ -5,6 +5,7 @@ import type {
   ProviderModel,
   ProviderUpdateInput,
   PublicSettings,
+  RequestLogEntry,
   ResultHistoryEntry,
   ResultReadyAck,
   ResultSessionSnapshot,
@@ -122,6 +123,10 @@ export interface WindowTextLensApi {
   ): Promise<RunActionResult>
   continueAction?(sessionId: string, question: string): Promise<RunActionResult>
   copyText(text: string): Promise<void>
+  /** Pastes the answer back into the window the selection came from. */
+  reinsertResult?(sessionId: string, text: string): Promise<'pasted' | 'copied'>
+  listRequestLog?(limit?: number): Promise<RequestLogEntry[]>
+  clearRequestLog?(): Promise<void>
   openExternal(url: string): Promise<void>
   openSettings?(options?: OpenSettingsOptions): Promise<void>
   /** Settings window only: consume one-shot open guidance (focus + notice). */

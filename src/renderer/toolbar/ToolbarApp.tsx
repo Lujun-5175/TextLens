@@ -15,6 +15,7 @@ import {
   type PublicSettings,
   type SelectionPayload
 } from '../../shared'
+import { detectSensitiveKinds, sensitiveWarning } from '../../shared/sensitive'
 import { ActionIcon } from '../components/ActionIcon'
 import { runDetached } from '../lib/asyncEffects'
 import { getErrorMessage } from '../lib/errors'
@@ -116,6 +117,8 @@ export function ToolbarApp(): JSX.Element {
   const measuredSizeRef = useRef<{ selectionId?: string; width: number; height: number } | null>(null)
   const busyActionRef = useRef<string | null>(null)
   const [busyActionId, setBusyActionId] = useState<string | null>(null)
+  // Selection+action that the user already confirmed despite sensitive content.
+  const [sensitiveConfirmed, setSensitiveConfirmed] = useState<string | null>(null)
   const [copySuccessActionId, setCopySuccessActionId] = useState<string | null>(null)
   const [hoveredControlId, setHoveredControlId] = useState<string | null>(null)
   const [message, setMessage] = useState('')
@@ -497,6 +500,17 @@ export function ToolbarApp(): JSX.Element {
     if (busyActionRef.current) return
     const action = visibleActions.find((candidate) => candidate.id === actionId)
     if (!action) return
+    // Copy and search never leave the machine; everything else talks to a
+    // provider, so credentials in the selection deserve one deliberate click.
+    if (action.kind !== 'copy' && action.kind !== 'search') {
+      const kinds = detectSensitiveKinds(selection?.text ?? '')
+      const confirmationKey = `${selection?.selectionId ?? ''}:${actionId}`
+      if (kinds.length > 0 && sensitiveConfirmed !== confirmationKey) {
+        setSensitiveConfirmed(confirmationKey)
+        setMessage(sensitiveWarning(kinds))
+        return
+      }
+    }
     resetCopySuccess()
     const pointerTriggered = event.detail > 0
     const actedSelectionId = selection?.selectionId

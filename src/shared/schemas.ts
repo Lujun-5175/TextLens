@@ -548,6 +548,21 @@ export const applicationSettingsSchema = z
   .strict()
 export type ApplicationSettings = z.infer<typeof applicationSettingsSchema>
 
+export const requestLogEntrySchema = z
+  .object({
+    createdAt: z.string(),
+    actionName: z.string(),
+    providerName: z.string(),
+    modelId: z.string(),
+    endpointHost: z.string(),
+    characterCount: z.number().int().nonnegative(),
+    status: z.enum(['completed', 'failed', 'cancelled']),
+    errorCode: z.string().optional(),
+    totalTokens: z.number().int().nonnegative().optional()
+  })
+  .strict()
+export type RequestLogEntry = z.infer<typeof requestLogEntrySchema>
+
 export const filterSettingsSchema = z
   .object({
     mode: z.enum(['default', 'whitelist', 'blacklist']),

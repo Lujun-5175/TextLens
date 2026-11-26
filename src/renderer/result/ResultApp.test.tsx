@@ -550,7 +550,8 @@ describe('ResultApp window interactions', () => {
       '输入继续提问'
     )
     expect(footer.firstElementChild).toHaveClass('result-followup')
-    expect([...footerActions.children]).toHaveLength(2)
+    // Retry, copy and insert-back: all footer controls share one style.
+    expect([...footerActions.children]).toHaveLength(3)
     for (const control of footerActions.children) {
       expect(control).toHaveClass('result-footer-button')
     }
@@ -627,7 +628,7 @@ describe('ResultApp window interactions', () => {
       'const answer = 42',
       '```'
     ].join('\n')
-    await renderResult({
+    const { container } = await renderResult({
       ...completedSession,
       content,
       contentScalarCount: countUnicodeScalars(content)
@@ -638,7 +639,9 @@ describe('ResultApp window interactions', () => {
     ).toBeInTheDocument()
     expect(screen.getAllByRole('listitem')).toHaveLength(2)
     expect(screen.getByText('引用内容').closest('blockquote')).toBeInTheDocument()
-    expect(screen.getByText('const answer = 42').closest('pre')).toBeInTheDocument()
+    // Syntax highlighting splits the fence into token spans, so the block text
+    // is asserted on the <pre> instead of a single text node.
+    expect(container.querySelector('pre')?.textContent).toContain('const answer = 42')
   })
 
   it('keeps Markdown plain during streaming and renders it after completion', async () => {

@@ -23,6 +23,7 @@ export type ActionEventFlushReason =
   | 'pageshow'
   | 'native-reveal'
   | 'copy'
+  | 'reinsert'
 
 // A newly revealed or hidden WebView can delay rAF. Keep the fallback within
 // one nominal frame so the immediate first token is not followed by a 50ms gap.

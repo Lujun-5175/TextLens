@@ -86,6 +86,7 @@ import { getErrorMessage } from '../lib/errors'
 import { applyTheme } from '../lib/theme'
 import { CustomActionDialog, type ActionEditorValue } from './CustomActionDialog'
 import { ProviderPresetDialog } from './ProviderPresetDialog'
+import { RequestLogPanel } from './RequestLogPanel'
 import { mergeProviderModelsOnPick } from './providerModels'
 import {
   actionsBoundToModel,
@@ -122,6 +123,7 @@ type SettingsSectionId =
   | 'providers'
   | 'actions'
   | 'history'
+  | 'requests'
   | 'language'
   | 'capture'
 
@@ -159,6 +161,11 @@ const SETTINGS_SECTIONS: ReadonlyArray<{
     id: 'history',
     label: '历史记录',
     blurb: '本机保存的最近 200 条 AI 结果，可搜索、复制或删除。'
+  },
+  {
+    id: 'requests',
+    label: '请求日志',
+    blurb: '每次请求的时间、动作、模型与 token 用量，只存在本机。'
   },
   {
     id: 'language',
@@ -2032,6 +2039,18 @@ export function SettingsApp(): JSX.Element {
               onEdit={setEditor} onDelete={removeAction} onToggle={(action) => moveToZone(action.id, true, enabledActions.length)} />
           </div>
         </DndContext>
+      </section>
+          )}
+
+          {activeSectionId === 'requests' && (
+      <section className="settings-section settings-section--enter" aria-labelledby="requests-title">
+        <div className="section-heading">
+          <div>
+            <h2 id="requests-title">{activeMeta.label}</h2>
+            <p>{activeMeta.blurb}</p>
+          </div>
+        </div>
+        <RequestLogPanel />
       </section>
           )}
 

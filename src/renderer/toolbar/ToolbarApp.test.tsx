@@ -55,6 +55,38 @@ describe('ToolbarApp', () => {
     Reflect.deleteProperty(document, 'elementFromPoint')
   })
 
+  it('asks once before sending a selection that looks like it holds a credential', async () => {
+    const runAction = vi.fn().mockResolvedValue({ accepted: true })
+    const api = {
+      getSettings: vi.fn().mockResolvedValue(DEFAULT_PUBLIC_SETTINGS),
+      getCurrentSelection: vi.fn().mockResolvedValue({
+        ...selection,
+        text: '我的 key 是 sk-abcdefghijklmnop1234'
+      }),
+      runAction,
+      hideToolbar: vi.fn().mockResolvedValue(undefined),
+      reportToolbarSize: vi.fn().mockResolvedValue(undefined),
+      presentToolbar: vi.fn().mockResolvedValue(true),
+      onSelection: vi.fn().mockReturnValue(() => undefined),
+      onSettingsChanged: vi.fn().mockReturnValue(() => undefined)
+    } as unknown as WindowTextLensApi
+    Object.defineProperty(window, 'textLens', { configurable: true, value: api })
+    const view = render(<ToolbarApp />)
+
+    const translate = await screen.findByRole('button', { name: '翻译' })
+    await waitFor(() => expect(api.getCurrentSelection).toHaveBeenCalled())
+    fireEvent.click(translate)
+    // First click only warns: nothing is sent to a provider yet.
+    expect(runAction).not.toHaveBeenCalled()
+    expect(await screen.findByText(/可能包含API Key/u)).toBeInTheDocument()
+
+    fireEvent.click(translate)
+    await waitFor(() =>
+      expect(runAction).toHaveBeenCalledWith('translate', undefined, 'selection-1')
+    )
+    view.unmount()
+  })
+
   it('keeps the toolbar visible and shows a temporary success icon after copy succeeds', async () => {
     const hideToolbar = vi.fn().mockResolvedValue(undefined)
     const runAction = vi.fn().mockResolvedValue({ accepted: true })

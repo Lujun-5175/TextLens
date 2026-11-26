@@ -5,6 +5,7 @@ import {
   actionStreamEventSchema,
   providerModelSchema,
   publicSettingsSchema,
+  requestLogEntrySchema,
   resultHistoryEntrySchema,
   resultReadyAckSchema,
   resultSessionSnapshotSchema,
@@ -422,6 +423,17 @@ export function installTauriBridge(): void {
     },
     async copyText(text: string) {
       await invoke(TAURI_COMMANDS.copyText, { text })
+    },
+    async reinsertResult(sessionId: string, text: string) {
+      const outcome = await invoke<string>(TAURI_COMMANDS.reinsertResult, { sessionId, text })
+      return outcome === 'pasted' ? 'pasted' : 'copied'
+    },
+    async listRequestLog(limit?: number) {
+      const payload = await invoke<unknown[]>(TAURI_COMMANDS.listRequestLog, { limit: limit ?? null })
+      return payload.map((entry) => requestLogEntrySchema.parse(entry))
+    },
+    async clearRequestLog() {
+      await invoke(TAURI_COMMANDS.clearRequestLog)
     },
     async openExternal(url: string) {
       await invoke(TAURI_COMMANDS.openExternal, { url })

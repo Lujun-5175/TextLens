@@ -4600,6 +4600,7 @@ impl CaptureEngine {
                 request.end.map(raw_selection_point),
             ),
             is_fullscreen: window_is_fullscreen(source_window),
+            source_window: Some(source_window.0 as i64),
             method: SelectionMethod::Clipboard,
             trigger: request.trigger,
             timestamp_ms: timestamp_ms(),
@@ -4744,6 +4745,7 @@ impl CaptureEngine {
                     request.end.map(raw_selection_point),
                 ),
                 is_fullscreen: window_is_fullscreen(source_root),
+                source_window: Some(source_root.0 as i64),
                 method: SelectionMethod::Accessibility,
                 trigger: request.trigger,
                 timestamp_ms: timestamp_ms(),
@@ -5591,6 +5593,7 @@ impl CaptureEngine {
             },
             direction,
             is_fullscreen: window_is_fullscreen(source_window),
+            source_window: Some(source_window.0 as i64),
             method: SelectionMethod::Accessibility,
             trigger: request.trigger,
             timestamp_ms: timestamp_ms(),
@@ -5985,6 +5988,7 @@ impl CaptureEngine {
                             },
                             direction,
                             is_fullscreen: window_is_fullscreen(source_window),
+                            source_window: Some(source_window.0 as i64),
                             method: SelectionMethod::Accessibility,
                             trigger: request.trigger,
                             timestamp_ms: timestamp_ms(),
@@ -6233,6 +6237,7 @@ fn accessibility_selection_payload(
         },
         direction,
         is_fullscreen: window_is_fullscreen(source_window),
+        source_window: Some(source_window.0 as i64),
         method: SelectionMethod::Accessibility,
         trigger: request.trigger,
         timestamp_ms: timestamp_ms(),
@@ -9904,6 +9909,7 @@ mod tests {
             timestamp_ms: 1,
             sequence: 0,
             windows_selection_evidence: None,
+            source_window: None,
         }
     }
 
@@ -9971,6 +9977,7 @@ mod tests {
             timestamp_ms: 0,
             sequence: 0,
             windows_selection_evidence: None,
+            source_window: None,
         };
         assert!(!accessibility_selection_payload_is_plausible(
             &acrobat_selection,

@@ -19,6 +19,7 @@ import {
   ChevronDown,
   CircleAlert,
   Copy,
+  CornerDownLeft,
   LoaderCircle,
   Maximize2,
   Minimize2,
@@ -808,6 +809,34 @@ function ResultSessionApp({
       setCommandMessage(getErrorMessage(error, '复制失败'))
     }
   }, [isAsk, turns])
+
+  const reinsert = useCallback(async (): Promise<void> => {
+    flushPendingActionEvents('reinsert')
+    const latest = getActionEventSnapshot()
+    const completeTurns = reconcileTranscriptContent(
+      latest.transcript ?? turns, latest.content, latest.status === 'streaming',
+      latest.requestId, latest.contentScalarCount
+    )
+    const content = isAsk && completeTurns.length > 0
+      ? transcriptToPlainText(completeTurns)
+      : latest.content
+    if (!content) return
+    if (!window.textLens.reinsertResult) {
+      setCommandMessage('当前版本不支持插入原文，请使用复制')
+      return
+    }
+    setCommandMessage('')
+    try {
+      const outcome = await window.textLens.reinsertResult(sessionId, content)
+      setCommandMessage(
+        outcome === 'pasted'
+          ? '已插入到原应用'
+          : '已复制到剪贴板；若未自动插入，请回到原应用按 Ctrl+V'
+      )
+    } catch (error) {
+      setCommandMessage(getErrorMessage(error, '插入原文失败'))
+    }
+  }, [isAsk, sessionId, turns])
 
   const submitFollowUp = useCallback(async (): Promise<void> => {
     const question = followUpQuestion.trim()
@@ -1727,6 +1756,16 @@ function ResultSessionApp({
             copyComplete={copyComplete}
             onCopy={() => void copy()}
           />
+          <button
+            className="result-footer-button"
+            type="button"
+            disabled={retrying || followUpSubmitting || preparingRequestId !== null || !requestId || status === 'streaming'}
+            onClick={() => void reinsert()}
+            title="把结果粘贴回选中文字所在的应用（会覆盖剪贴板）"
+          >
+            <CornerDownLeft size={14} />
+            插入原文
+          </button>
         </div>
       </footer>
     </main>

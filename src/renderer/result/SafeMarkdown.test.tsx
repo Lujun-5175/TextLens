@@ -1,7 +1,19 @@
-import { fireEvent, render, screen } from '@testing-library/react'
-import { describe, expect, it, vi } from 'vitest'
+import { fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { SafeMarkdown } from './SafeMarkdown'
+
+function stubClipboard(copyText: (text: string) => Promise<void>): void {
+  Object.defineProperty(window, 'textLens', {
+    value: { copyText },
+    configurable: true,
+    writable: true
+  })
+}
+
+afterEach(() => {
+  Reflect.deleteProperty(window, 'textLens')
+})
 
 describe('SafeMarkdown', () => {
   it('does not create executable DOM nodes from raw HTML', () => {
@@ -109,7 +121,7 @@ describe('SafeMarkdown', () => {
   })
 
   it('renders headings, ordered and unordered lists, blockquotes and fenced code', () => {
-    render(
+    const { container } = render(
       <SafeMarkdown
         content={[
           '# 一级标题',
@@ -135,7 +147,9 @@ describe('SafeMarkdown', () => {
     expect(screen.getByText('无序项目').closest('ul')).toBeInTheDocument()
     expect(screen.getByText('引用段落').closest('blockquote')).toBeInTheDocument()
     expect(screen.getByText('const value = 1').tagName).toBe('CODE')
-    expect(screen.getByText('const answer = 42').closest('pre')).toBeInTheDocument()
+    // Highlighting splits the fence into token spans, so the block text is
+    // asserted on the <pre> instead of a single text node.
+    expect(container.querySelector('pre')?.textContent).toContain('const answer = 42')
   })
 
   it('preserves translation paragraphs separated by a single newline', () => {
@@ -192,7 +206,7 @@ describe('SafeMarkdown', () => {
 
     expect(screen.getByRole('heading', { name: '总结', level: 1 })).toBeInTheDocument()
     expect(screen.getByText('要点一').closest('ul')).toBeInTheDocument()
-    expect(screen.getByText('const ok = true').closest('pre')).toBeInTheDocument()
+    expect(container.querySelector('pre')?.textContent).toContain('const ok = true')
     expect(container.querySelector('.katex')).toBeNull()
     expect(container.querySelector('math')).toBeNull()
   })
@@ -222,5 +236,108 @@ describe('SafeMarkdown', () => {
     expect(container.querySelector('a')).toBeNull()
     expect(container.querySelector('img')).toBeNull()
     expect(container.querySelector('.katex')).toBeInTheDocument()
+  })
+
+  it('highlights fenced code that declares a language', () => {
+    const { container } = render(
+      <SafeMarkdown content={'```ts\nconst answer = 42\n```'} onOpenExternal={() => undefined} />
+    )
+
+    const code = container.querySelector('pre > code')
+    expect(code).toHaveClass('hljs')
+    expect(code).toHaveClass('language-ts')
+    expect(container.querySelector('.hljs-keyword')).toHaveTextContent('const')
+    expect(container.querySelector('.hljs-number')).toHaveTextContent('42')
+    expect(container.querySelector('pre')?.textContent).toContain('const answer = 42')
+  })
+
+  it('leaves an unlabelled fence unhighlighted instead of guessing a language', () => {
+    const { container } = render(
+      <SafeMarkdown
+        content={'```\nconst answer = 42\n2026-01-02 INFO ready\n```'}
+        onOpenExternal={() => undefined}
+      />
+    )
+
+    expect(container.querySelector('.hljs')).toBeNull()
+    expect(container.querySelector('[class*="hljs-"]')).toBeNull()
+    expect(container.querySelector('pre')?.textContent).toContain('2026-01-02 INFO ready')
+  })
+
+  it('leaves an unregistered language as plain code without failing the render', () => {
+    const { container } = render(
+      <SafeMarkdown content={'```brainfuck\n+++[>+<-]\n```'} onOpenExternal={() => undefined} />
+    )
+
+    expect(container.querySelector('[class*="hljs-"]')).toBeNull()
+    expect(container.querySelector('pre')?.textContent).toContain('+++[>+<-]')
+  })
+
+  it('keeps KaTeX formulas out of the highlighter', () => {
+    const { container } = render(
+      <SafeMarkdown
+        content={'$$\n\\int_0^1 x^2\\,dx=\\frac{1}{3}\n$$\n\n```ts\nconst answer = 42\n```'}
+        onOpenExternal={() => undefined}
+      />
+    )
+
+    expect(container.querySelector('.katex-display')).toBeInTheDocument()
+    expect(container.querySelector('.katex .hljs')).toBeNull()
+    expect(container.querySelectorAll('pre > code.hljs')).toHaveLength(1)
+  })
+
+  it('copies the raw text of a fenced block through the clipboard bridge', async () => {
+    const copyText = vi.fn<(text: string) => Promise<void>>(async () => undefined)
+    stubClipboard(copyText)
+
+    render(
+      <SafeMarkdown
+        content={'```ts\nconst first = 1\nconst second = 2\n```'}
+        onOpenExternal={() => undefined}
+      />
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: '复制代码' }))
+
+    await waitFor(() => expect(copyText).toHaveBeenCalledTimes(1))
+    expect(copyText).toHaveBeenCalledWith('const first = 1\nconst second = 2\n')
+  })
+
+  it('reports a successful copy in the button label', async () => {
+    stubClipboard(async () => undefined)
+
+    render(
+      <SafeMarkdown content={'```js\nconsole.log(1)\n```'} onOpenExternal={() => undefined} />
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: '复制代码' }))
+
+    expect(await screen.findByRole('button', { name: '已复制' })).toBeInTheDocument()
+  })
+
+  it('does not claim success when the clipboard write fails', async () => {
+    stubClipboard(async () => {
+      throw new Error('ipc unavailable')
+    })
+
+    render(
+      <SafeMarkdown content={'```js\nconsole.log(1)\n```'} onOpenExternal={() => undefined} />
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: '复制代码' }))
+
+    expect(await screen.findByRole('button', { name: '复制失败' })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: '已复制' })).toBeNull()
+  })
+
+  it('gives every fenced block one copy control and leaves inline code alone', () => {
+    render(
+      <SafeMarkdown
+        content={'行内 `npm run dev`\n\n```js\nconsole.log(1)\n```\n\n```bash\nls -la\n```'}
+        onOpenExternal={() => undefined}
+      />
+    )
+
+    expect(screen.getAllByRole('button', { name: '复制代码' })).toHaveLength(2)
   })
 })

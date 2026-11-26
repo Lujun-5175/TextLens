@@ -7,6 +7,8 @@ pub mod models;
 mod openai_protocol;
 mod openai_transport;
 mod protocols;
+mod reinsert;
+mod request_log;
 mod result_history;
 pub mod runtime;
 pub mod selection;
@@ -130,6 +132,9 @@ pub fn run() {
             runtime::get_settings,
             runtime::settings_ready,
             runtime::set_settings_dirty,
+            runtime::reinsert_result,
+            runtime::list_request_log,
+            runtime::clear_request_log,
             runtime::update_settings,
             runtime::reset_result_size,
             runtime::create_provider,
