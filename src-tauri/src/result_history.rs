@@ -15,7 +15,7 @@
 
 use std::{
     fs::{self, OpenOptions},
-    io::{self, Write},
+    io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -280,7 +280,23 @@ fn append_locked(path: &Path, entry: ResultHistoryEntry) -> io::Result<()> {
     let mut line = serde_json::to_string(&entry)
         .map_err(|error| io::Error::other(format!("history entry is not serializable: {error}")))?;
     line.push('\n');
-    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    // A crash mid-write leaves a partial last line. Appending straight onto it
+    // would fuse two records into one unparseable line and lose both, so close
+    // the fragment off first.
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .read(true)
+        .open(path)?;
+    let length = file.metadata()?.len();
+    if length > 0 {
+        let mut last = [0u8; 1];
+        file.seek(SeekFrom::Start(length - 1))?;
+        file.read_exact(&mut last)?;
+        if last[0] != b'\n' {
+            file.write_all(b"\n")?;
+        }
+    }
     file.write_all(line.as_bytes())
 }
 

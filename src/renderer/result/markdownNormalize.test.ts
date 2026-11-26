@@ -171,3 +171,28 @@ c = d
     )
   })
 })
+
+describe('LaTeX inside existing math', () => {
+  it('keeps a display block untouched, including row spacing', () => {
+    const input = [
+      '$$',
+      String.raw`\begin{aligned}`,
+      String.raw`a &= b \\[2pt]`,
+      'c &= d',
+      String.raw`\end{aligned}`,
+      '$$',
+      '',
+      '后文。'
+    ].join('\n')
+    const out = normalizeMarkdownSource(input)
+    // `\\[2pt]` is LaTeX row spacing, not a delimiter: it must survive verbatim.
+    expect(out).toContain(String.raw`a &= b \\[2pt]`)
+    expect(out.split('$$')).toHaveLength(3)
+    expect(out).toContain(String.raw`\begin{aligned}`)
+  })
+
+  it('never turns a doubled backslash into an opener', () => {
+    const input = String.raw`公式里换行 \\[2pt] 是行距`
+    expect(normalizeMarkdownSource(input)).toBe(input)
+  })
+})

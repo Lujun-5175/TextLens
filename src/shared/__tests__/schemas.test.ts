@@ -403,6 +403,14 @@ describe('settings schemas and defaults', () => {
     }
 
     for (const shortcut of [
+      // A bare printable key would be registered globally and swallow ordinary
+      // typing, so it has to carry a modifier.
+      'Enter',
+      'Space',
+      'A',
+      'KeyS',
+      'Digit1',
+      'F5',
       'Cmd++S',
       'Cmd+NotARealKey',
       'AltGr+S',

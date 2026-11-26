@@ -238,7 +238,10 @@ export function isValidTauriGlobalShortcut(value: string): boolean {
 
   const tokens = trimmed.split('+').map((part) => part.trim())
   if (tokens.some((token) => token.length === 0)) return false
-  if (tokens.length === 1) return isTauriShortcutKey(tokens[0]!)
+  // A bare printable key (letter, digit, Enter, Space…) would become a global
+  // hotkey that swallows normal typing everywhere, so only function and media
+  // keys may stand alone.
+  if (tokens.length === 1) return isStandaloneGlobalKey(tokens[0]!)
 
   let foundKey = false
   for (const token of tokens) {
@@ -248,6 +251,14 @@ export function isValidTauriGlobalShortcut(value: string): boolean {
     foundKey = true
   }
   return foundKey
+}
+
+/** Keys that are safe to register without any modifier. */
+function isStandaloneGlobalKey(key: string): boolean {
+  const lower = key.toLowerCase()
+  // F13–F24 and media keys are not part of normal typing; letters, digits,
+  // Enter, Space and F1–F12 are, so they must carry a modifier.
+  return /^f(?:1[3-9]|2[0-4])$/u.test(lower) || lower.startsWith('media')
 }
 
 export const captureShortcutSchema = z

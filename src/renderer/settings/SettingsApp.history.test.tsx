@@ -107,7 +107,9 @@ describe('SettingsApp result history', () => {
     await openHistorySection()
 
     expect(await screen.findByText('翻译')).toBeInTheDocument()
-    expect(screen.getByText('2026-11-26 08:30')).toBeInTheDocument()
+    // Rendered in the machine's local zone, so assert the shape: the bug this
+    // guards against was showing the stored UTC value as if it were local.
+    expect(screen.getAllByText(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$/u)).toHaveLength(2)
     expect(screen.getByText('gpt-4o')).toBeInTheDocument()
     expect(screen.getByText('第一行结论')).toBeInTheDocument()
     expect(screen.getByText('总结')).toBeInTheDocument()

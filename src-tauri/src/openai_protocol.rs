@@ -596,7 +596,7 @@ fn absorb_protocol_usage(codec: SseCodec, value: &Value, usage: &mut UsageAccumu
         SseCodec::AnthropicMessages => value
             .pointer("/message/usage")
             .or_else(|| value.get("usage"))
-            .map(|usage| usage_counts(usage, "input_tokens", "output_tokens", "total_tokens")),
+            .map(anthropic_usage_counts),
         SseCodec::Gemini => value.get("usageMetadata").map(|usage| {
             usage_counts(
                 usage,
@@ -609,6 +609,25 @@ fn absorb_protocol_usage(codec: SseCodec, value: &Value, usage: &mut UsageAccumu
     if let Some(raw) = raw {
         usage.observe(raw);
     }
+}
+
+/// Anthropic reports cache reads/writes separately from `input_tokens`, so a
+/// cache hit would otherwise look far cheaper than it was. Fold them into the
+/// input count and let the total follow.
+fn anthropic_usage_counts(usage: &Value) -> RawUsage {
+    let mut raw = usage_counts(usage, "input_tokens", "output_tokens", "total_tokens");
+    let cached = count_field(usage.get("cache_read_input_tokens"))
+        .unwrap_or(0)
+        .saturating_add(count_field(usage.get("cache_creation_input_tokens")).unwrap_or(0));
+    if cached > 0 {
+        if let Some(input) = raw.input {
+            raw.input = Some(input.saturating_add(cached));
+        }
+        // The vendor sends no total for Anthropic; a derived one must include
+        // the cached prompt tokens too.
+        raw.total = None;
+    }
+    raw
 }
 
 fn usage_counts(usage: &Value, input: &str, output: &str, total: &str) -> RawUsage {

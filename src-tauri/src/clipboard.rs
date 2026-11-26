@@ -215,7 +215,12 @@ pub(crate) fn snapshot_windows_clipboard() -> Option<WindowsClipboardSnapshot> {
             continue;
         }
 
-        let handle = unsafe { GetClipboardData(format) }.ok()?;
+        // One unreadable format (delayed OLE rendering, a busy owner) must not
+        // discard the formats already captured: keep going and record it.
+        let Ok(handle) = (unsafe { GetClipboardData(format) }) else {
+            accounting.observe(format, WindowsClipboardFormatOutcome::Unreadable);
+            continue;
+        };
         let remaining = WINDOWS_CLIPBOARD_SNAPSHOT_LIMIT.saturating_sub(total_bytes);
         let (data, kind) = if format == u32::from(CF_ENHMETAFILE.0) {
             let metafile = HENHMETAFILE(handle.0);
@@ -234,7 +239,8 @@ pub(crate) fn snapshot_windows_clipboard() -> Option<WindowsClipboardSnapshot> {
             }
             let mut data = vec![0u8; size];
             if unsafe { GetEnhMetaFileBits(metafile, Some(&mut data)) } as usize != size {
-                return None;
+                accounting.observe(format, WindowsClipboardFormatOutcome::Unreadable);
+                continue;
             }
             (data, WindowsClipboardFormatKind::EnhancedMetafile)
         } else {
@@ -246,7 +252,8 @@ pub(crate) fn snapshot_windows_clipboard() -> Option<WindowsClipboardSnapshot> {
             }
             let pointer = unsafe { GlobalLock(global) }.cast::<u8>();
             if pointer.is_null() {
-                return None;
+                accounting.observe(format, WindowsClipboardFormatOutcome::Unreadable);
+                continue;
             }
             let _lock = GlobalLockGuard(global);
             (

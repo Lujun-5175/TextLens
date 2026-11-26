@@ -24,7 +24,9 @@ const SENTENCE_END = /(?:[.!?…。！？；;]|\u2026)["'”’」』》）)\]]*
 
 // Some providers collapse list items into one line while keeping bullet glyphs.
 // Require multiple sentence-ending boundaries to avoid rewriting ordinary prose.
-const INLINE_BULLET_BOUNDARY = /(?<=[。！？.!?])\s+[•·●○]\s+/gu
+// A capture group replaces the lookbehind this used to need: the build targets
+// Safari 15, whose WebKit throws on lookbehind and would blank the whole window.
+const INLINE_BULLET_BOUNDARY = /([。！？.!?])\s+[•·●○]\s+/gu
 
 export function hasCollapsedBulletList(line: string): boolean {
   if (/[`$|]/u.test(line) || /^[ \t]*(?:[#>*+\-]|\d+[.)])/u.test(line)) return false
@@ -33,7 +35,7 @@ export function hasCollapsedBulletList(line: string): boolean {
 
 function expandCollapsedBulletList(line: string): string {
   if (!hasCollapsedBulletList(line)) return line
-  return '- ' + line.replace(/^[ \t]*[•·●○]\s+/u, '').replace(INLINE_BULLET_BOUNDARY, '\n- ')
+  return '- ' + line.replace(/^[ \t]*[•·●○]\s+/u, '').replace(INLINE_BULLET_BOUNDARY, '$1\n- ')
 }
 
 type LineKind = 'blank' | 'list' | 'table' | 'heading' | 'quote' | 'hr' | 'fence' | 'math' | 'prose'
@@ -69,7 +71,11 @@ function indexOutsideInlineCode(line: string, needle: string, from = 0): number 
   const spans = inlineCodeSpans(line)
   let index = line.indexOf(needle, from)
   while (index !== -1) {
-    if (!spans.some(([start, end]) => index >= start && index < end)) return index
+    const inCode = spans.some(([start, end]) => index >= start && index < end)
+    // A doubled backslash is LaTeX's own line break (`\\[2pt]`), not a
+    // delimiter: the two-character needle would otherwise match its tail.
+    const escaped = index > 0 && line[index - 1] === '\\'
+    if (!inCode && !escaped) return index
     index = line.indexOf(needle, index + 1)
   }
   return -1
@@ -88,6 +94,9 @@ export function normalizeLatexDelimiters(source: string): string {
   let fenceChar: string | null = null
   let fenceLength = 0
   let display: string[] | null = null
+  // `$$` blocks are already valid math: leave their contents alone so aligned
+  // environments keep their `\\[2pt]` row spacing.
+  let dollarBlock = false
 
   const flushDisplay = (): void => {
     if (display === null) return
@@ -111,6 +120,17 @@ export function normalizeLatexDelimiters(source: string): string {
       fenceChar = fenceMatch[1]![0]!
       fenceLength = fenceMatch[1]!.length
       out.push(raw)
+      continue
+    }
+
+    if (dollarBlock) {
+      out.push(raw)
+      if (raw.trim() === '$$') dollarBlock = false
+      continue
+    }
+    if (raw.trim() === '$$') {
+      out.push(raw)
+      dollarBlock = true
       continue
     }
 

@@ -73,13 +73,15 @@ pub fn run() {
             let settings = Arc::new(SettingsRepository::new_with_legacy_migration_deferred(
                 settings_path,
             )?);
-            autostart::reconcile(
-                settings.get_settings().application.launch_at_login,
-                &std::env::current_exe()
-                    .map(|path| path.to_string_lossy().into_owned())
-                    .unwrap_or_default(),
-            )
-            .ok();
+            // Skip the reconcile entirely when the executable path is unknown: a
+            // blank Run value would make Windows try to launch nothing at login.
+            if let Ok(executable) = std::env::current_exe() {
+                autostart::reconcile(
+                    settings.get_settings().application.launch_at_login,
+                    &executable.to_string_lossy(),
+                )
+                .ok();
+            }
             let actions = ActionService::new(settings.clone())?;
             let mut monitor = SelectionMonitor::new(&app.config().identifier)?;
             let receiver = monitor

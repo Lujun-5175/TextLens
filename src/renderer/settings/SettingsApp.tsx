@@ -242,18 +242,35 @@ function createId(prefix: string): string {
   return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
 }
 
-/** UTC ISO8601 → `YYYY-MM-DD HH:mm` without locale or timezone surprises. */
+/** Stored timestamps are UTC; show them in the user's local zone. */
 function formatHistoryTimestamp(value: string): string {
-  const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})/.exec(value)
-  return match
-    ? `${match[1]}-${match[2]}-${match[3]} ${match[4]}:${match[5]}`
-    : value
+  const parsed = new Date(value)
+  if (Number.isNaN(parsed.getTime())) return value
+  const pad = (part: number): string => String(part).padStart(2, '0')
+  return `${parsed.getFullYear()}-${pad(parsed.getMonth() + 1)}-${pad(parsed.getDate())} ${
+    pad(parsed.getHours())}:${pad(parsed.getMinutes())}`
 }
 
-/** First non-empty line of an answer, used as the collapsed summary. */
+/**
+ * First readable line of an answer, used as the collapsed summary. Markdown
+ * scaffolding (fences, headings, table rules, quotes) carries no meaning here.
+ */
 function historySummary(content: string): string {
-  const line = content.split(/\r?\n/u).find((candidate) => candidate.trim().length > 0)
-  return line?.trim() || '（空结果）'
+  const line = content.split(/\r?\n/u).find((candidate) => {
+    const trimmed = candidate.trim()
+    return trimmed.length > 0 &&
+      !trimmed.startsWith('```') &&
+      !trimmed.startsWith('~~~') &&
+      !/^#{1,6}\s/u.test(trimmed) &&
+      !/^\|?[\s:|-]+$/u.test(trimmed) &&
+      !trimmed.startsWith('>')
+  })
+  const cleaned = line
+    ?.trim()
+    .replace(/^#{1,6}\s+/u, '')
+    .replace(/^\|\s*/u, '')
+    .replace(/\s*\|$/u, '')
+  return cleaned || '（空结果）'
 }
 
 function matchesHistoryQuery(entry: ResultHistoryEntry, query: string): boolean {
@@ -600,7 +617,10 @@ export function SettingsApp(): JSX.Element {
 
   // The settings window hides to the tray by default, so the backend has to
   // know when closing would drop edits: a tray quit is refused while dirty.
-  const settingsDirtyForTray = dirty || keysDirty
+  // An open editor or model picker holds uncommitted work the form state cannot
+  // see, so it must count as dirty for the tray-quit guard.
+  const settingsDirtyForTray =
+    dirty || keysDirty || editor !== null || modelPicker !== null
   useEffect(() => {
     void window.textLens.setSettingsDirty?.(settingsDirtyForTray).catch(() => undefined)
   }, [settingsDirtyForTray])
@@ -746,7 +766,8 @@ export function SettingsApp(): JSX.Element {
     setHistoryStatus('loading')
     setHistoryError('')
     try {
-      const entries = await window.textLens.listResultHistory()
+      // Ask for the full ring so older entries stay searchable.
+      const entries = (await window.textLens.listResultHistory?.(200)) ?? []
       setHistoryEntries(entries)
       setHistoryStatus('ready')
     } catch (error) {

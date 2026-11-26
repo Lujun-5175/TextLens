@@ -209,7 +209,8 @@ textarea.control::-webkit-scrollbar-thumb:hover,
   right: 20px;
   left: auto;
   transform: none;
-  z-index: 1000;
+  /* Below .dialog-backdrop (30): a persistent error must not cover a modal. */
+  z-index: 20;
   display: flex;
   gap: 10px;
   align-items: flex-start;
@@ -1606,7 +1607,7 @@ textarea.control::-webkit-scrollbar-thumb:hover,
   display: grid;
   place-items: center;
   padding: 28px;
-  background: rgba(8, 12, 20, 0.42);
+  background: var(--scrim);
   -webkit-backdrop-filter: blur(4px);
   backdrop-filter: blur(4px);
 }
