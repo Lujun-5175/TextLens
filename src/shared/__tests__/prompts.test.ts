@@ -20,10 +20,13 @@ import {
   type ActionKind
 } from '..'
 
+// Normalise checkout line endings: with core.autocrlf=true the working copy is
+// CRLF while the shared prompts use "\n", so this comparison failed on every
+// Windows checkout instead of only on real prompt drift.
 const rustModelsSource = readFileSync(
   resolve(process.cwd(), 'src-tauri/src/models.rs'),
   'utf8'
-)
+).replace(/\r\n/gu, '\n')
 
 function rustPromptDefault(name: string): string {
   const source = rustModelsSource

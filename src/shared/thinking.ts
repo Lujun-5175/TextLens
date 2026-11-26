@@ -19,7 +19,10 @@ export const thinkingDialectSchema = z.enum([
   'chatTemplateKwargs',
   'thinkingToggle',
   'openRouterReasoning',
-  'geminiLevel'
+  'geminiLevel',
+  // Anthropic-shaped endpoints that take `output_config.effort` plus a
+  // `thinking.type` toggle instead of a token budget (DeepSeek's compatible API).
+  'anthropicOutputConfig'
 ])
 export type ThinkingDialect = z.infer<typeof thinkingDialectSchema>
 
@@ -182,8 +185,20 @@ function detectOpenAiFamily(id: string): ThinkingFamily | null {
   return null
 }
 
+/** Official DeepSeek ids carry no version number (`deepseek-flash`). */
+function isDeepSeekReasoningWithoutVersion(id: string): boolean {
+  return id.includes('deepseek') && id.includes('flash') && !familyVersion(id, 'deepseek')
+}
+
 function detectThinkingFamily(id: string, protocol: ProviderProtocol): ThinkingFamily | null {
-  if (protocol === 'anthropicMessages') return isReasoningClaude(id) ? 'claude' : null
+  if (protocol === 'anthropicMessages') {
+    // DeepSeek's Anthropic-compatible endpoint takes `output_config.effort`
+    // plus a `thinking.type` toggle, so Claude-style budgets do not apply.
+    if (isDeepSeekReasoningWithoutVersion(id) || (familyVersion(id, 'deepseek')?.[0] ?? 0) >= 4) {
+      return 'deepseekMax'
+    }
+    return isReasoningClaude(id) ? 'claude' : null
+  }
   if (protocol === 'gemini') return isReasoningGemini(id) ? 'gemini' : null
   return detectOpenAiFamily(id)
 }
@@ -201,9 +216,11 @@ export function detectModelThinking(
   if (!family && openAiProtocol && deepseek?.[0] === 3) family = 'generic'
   if (!family || /non[- ]?(?:reasoning|thinking)/u.test(id)) return { levels: [], capability: null }
   let levels = [...FAMILY_LEVELS[family]]
-  let dialect: ThinkingDialect | null = protocol === 'anthropicMessages' || protocol === 'gemini'
+  let dialect: ThinkingDialect | null = protocol === 'gemini'
     ? null
-    : family === 'deepseekMax' ? 'reasoningEffortMax' : 'reasoningEffort'
+    : protocol === 'anthropicMessages'
+      ? family === 'deepseekMax' ? 'anthropicOutputConfig' : null
+      : family === 'deepseekMax' ? 'reasoningEffortMax' : 'reasoningEffort'
   let supportsOff = true
   if (protocol === 'gemini') {
     if (id.includes('gemini-2.0-flash-thinking') || id.includes('thinking-exp')) {

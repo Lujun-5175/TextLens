@@ -525,6 +525,12 @@ function ResultSessionApp({
   const [retrying, setRetrying] = useState(false)
   const [preparingRequestId, setPreparingRequestId] = useState<string | null>(null)
   const [commandMessage, setCommandMessage] = useState('')
+  // Settings edits (provider/model/key) can fix a non-retryable failure such
+  // as an authentication or configuration error, so the retry affordance is
+  // re-enabled after the settings snapshot changes.
+  const [settingsRevision, setSettingsRevision] = useState(0)
+  const [errorSettingsRevision, setErrorSettingsRevision] = useState<number | null>(null)
+  const previousStatusRef = useRef<ResultState['status'] | null>(null)
   const [copyComplete, setCopyComplete] = useState(false)
   const [followUpQuestion, setFollowUpQuestion] = useState('')
   const [followUpExpanded, setFollowUpExpanded] = useState(false)
@@ -834,6 +840,9 @@ function ResultSessionApp({
       settingsRevisionRef.current += 1
       setSettings(next)
       setSettingsLoaded(true)
+      // Bumped separately from `settings` state so a failed request can tell
+      // that something user-fixable changed even when the snapshot is equal.
+      setSettingsRevision((current) => current + 1)
     })
     void window.textLens.getSettings().then((initial) => {
       if (!disposed && settingsRevisionRef.current === startedAtRevision) {
@@ -850,6 +859,21 @@ function ResultSessionApp({
       unsubscribe()
     }
   }, [sessionId])
+
+  useEffect(() => {
+    const previous = previousStatusRef.current
+    previousStatusRef.current = status
+    if (status === 'error') {
+      if (previous !== 'error') setErrorSettingsRevision(settingsRevision)
+      return
+    }
+    if (errorSettingsRevision !== null) setErrorSettingsRevision(null)
+  }, [errorSettingsRevision, settingsRevision, status])
+
+  const settingsChangedSinceError =
+    status === 'error' &&
+    errorSettingsRevision !== null &&
+    settingsRevision > errorSettingsRevision
 
   const consumeBootstrap = useCallback(async (
     start: () => Promise<ResultSessionSnapshot | null>,
@@ -1618,9 +1642,9 @@ function ResultSessionApp({
             <button
               className="result-footer-button"
               type="button"
-              disabled={retrying || followUpSubmitting || preparingRequestId !== null || !requestId || (status === 'error' && !retryable)}
+              disabled={retrying || followUpSubmitting || preparingRequestId !== null || !requestId || (status === 'error' && !retryable && !settingsChangedSinceError)}
               onClick={() => void retry()}
-              title="使用相同选区重新生成"
+              title={settingsChangedSinceError ? '设置已更改，可重新发起' : '使用相同选区重新生成'}
             >
               <RefreshCw size={14} />
               重试

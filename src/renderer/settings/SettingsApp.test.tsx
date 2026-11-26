@@ -346,7 +346,7 @@ describe('SettingsApp provider deletion', () => {
     }, { timeout: 1_000 })
   })
 
-  it('fades an error banner after 1.4 seconds and removes it after 2 seconds', async () => {
+  it('keeps an error banner until the user closes it', async () => {
     const updateSettings = vi.fn(async (): Promise<PublicSettings> => {
       throw new Error('保存失败了')
     })
@@ -371,16 +371,38 @@ describe('SettingsApp provider deletion', () => {
 
     const banner = await screen.findByText('保存失败了')
     expect(banner.parentElement).toHaveClass('notice--error')
+    expect(banner.parentElement).toHaveClass('settings-banner--error')
     expect(banner.parentElement).not.toHaveClass('settings-banner--fading')
 
     await act(async () => {
-      await new Promise((resolve) => window.setTimeout(resolve, 1_450))
+      await new Promise((resolve) => window.setTimeout(resolve, 2_200))
     })
-    expect(banner.parentElement).toHaveClass('settings-banner--fading')
+    expect(screen.getByText('保存失败了')).toBeInTheDocument()
+    expect(screen.getByText('保存失败了').parentElement).not.toHaveClass(
+      'settings-banner--fading'
+    )
 
-    await waitFor(() => {
-      expect(screen.queryByText('保存失败了')).not.toBeInTheDocument()
-    }, { timeout: 1_000 })
+    fireEvent.click(screen.getByRole('button', { name: '关闭错误提示' }))
+    expect(screen.queryByText('保存失败了')).not.toBeInTheDocument()
+    expect(updateSettings).toHaveBeenCalledOnce()
+  })
+
+  it('renders a retry state instead of spinning forever when settings fail to load', async () => {
+    const getSettings = vi.fn()
+      .mockRejectedValueOnce(new Error('设置文件损坏'))
+      .mockResolvedValue(DEFAULT_PUBLIC_SETTINGS)
+    installDefaultBridge({ getSettings })
+
+    render(<SettingsApp />)
+
+    expect(await screen.findByText('无法载入设置')).toBeInTheDocument()
+    expect(screen.getByText('设置文件损坏')).toBeInTheDocument()
+    expect(screen.queryByText('正在载入设置…')).not.toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: '重试' }))
+    expect(await screen.findByRole('navigation', { name: '设置分区' })).toBeInTheDocument()
+    expect(getSettings).toHaveBeenCalledTimes(2)
+    expect(screen.queryByText('无法载入设置')).not.toBeInTheDocument()
   })
 
   it('keeps Windows lifecycle controls out of the macOS settings UI', async () => {
@@ -937,7 +959,8 @@ describe('SettingsApp provider deletion', () => {
     const baseUrl = await screen.findByDisplayValue('https://api.openai.com/v1')
     fireEvent.change(baseUrl, { target: { value: 'https://gateway.example/v1' } })
     fireEvent.click(screen.getByRole('button', { name: '添加服务商' }))
-    expect(screen.getByDisplayValue('服务商 2')).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: /自定义/ }))
+    expect(screen.getByDisplayValue('自定义')).toBeInTheDocument()
 
     const keyInputs = document.querySelectorAll<HTMLInputElement>('input[type="password"]')
     expect(keyInputs).toHaveLength(2)
@@ -950,7 +973,7 @@ describe('SettingsApp provider deletion', () => {
 
     await waitFor(() => expect(clearProviderApiKey).toHaveBeenCalledWith(DEFAULT_PROVIDER_ID))
     expect(screen.getByDisplayValue('https://gateway.example/v1')).toBeInTheDocument()
-    expect(screen.getByDisplayValue('服务商 2')).toBeInTheDocument()
+    expect(screen.getByDisplayValue('自定义')).toBeInTheDocument()
     expect(document.querySelectorAll<HTMLInputElement>('input[type="password"]')[1]).toHaveValue(
       'sk-new-provider'
     )
@@ -1019,6 +1042,7 @@ describe('SettingsApp provider deletion', () => {
 
     await screen.findByDisplayValue('OpenAI Compatible')
     fireEvent.click(screen.getByRole('button', { name: '添加服务商' }))
+    fireEvent.click(screen.getByRole('button', { name: /自定义/ }))
     const keyInputs = document.querySelectorAll<HTMLInputElement>('input[type="password"]')
     fireEvent.change(keyInputs[1]!, { target: { value: 'sk-retry-me' } })
     fireEvent.click(screen.getByRole('button', { name: '保存设置' }))
@@ -1029,7 +1053,7 @@ describe('SettingsApp provider deletion', () => {
     expect(updateSettings.mock.invocationCallOrder[0]).toBeLessThan(
       setProviderApiKey.mock.invocationCallOrder[0]!
     )
-    expect(screen.getByDisplayValue('服务商 2')).toBeInTheDocument()
+    expect(screen.getByDisplayValue('自定义')).toBeInTheDocument()
     expect(document.querySelectorAll<HTMLInputElement>('input[type="password"]')[1]).toHaveValue(
       'sk-retry-me'
     )
@@ -1379,6 +1403,130 @@ describe('SettingsApp provider deletion', () => {
       (updateSettings.mock.calls[0]?.[0].providers?.[0]?.models ?? []).map((model) => model.id)
     ).toEqual(['o3-mini', 'gpt-4o-mini'])
   })
+
+  function settingsWithBoundModel(): PublicSettings {
+    return {
+      ...DEFAULT_PUBLIC_SETTINGS,
+      providers: DEFAULT_PUBLIC_SETTINGS.providers.map((provider) => ({
+        ...provider,
+        models: [{ id: 'model-1', name: '模型一', thinkingLevels: [] }]
+      })),
+      actions: DEFAULT_PUBLIC_SETTINGS.actions.map((action) =>
+        'providerId' in action
+          ? { ...action, modelId: action.id === 'translate' ? 'model-1' : '' }
+          : action
+      )
+    }
+  }
+
+  it('asks before deleting a model that actions still bind and names them', async () => {
+    const settings = settingsWithBoundModel()
+    window.textLens = {
+      getSettings: vi.fn(async () => settings),
+      updateSettings: vi.fn(async () => settings),
+      getAccessibilityStatus: vi.fn(async () => ({
+        platform: 'windows',
+        trusted: true,
+        canRequest: false
+      })),
+      requestAccessibility: vi.fn(),
+      onSettingsChanged: vi.fn(() => () => undefined)
+    } as unknown as WindowTextLensApi
+
+    render(<SettingsApp />)
+    await goToSettingsSection('AI 服务商')
+    fireEvent.click(await screen.findByRole('button', { name: '移除模型 模型一' }))
+
+    const dialog = await screen.findByRole('dialog', { name: '删除模型“模型一”？' })
+    expect(dialog).toHaveTextContent('翻译')
+    expect(dialog).toHaveTextContent('失去模型绑定')
+    // Nothing is deleted until the confirmation is accepted.
+    expect(screen.getByText('模型一', { selector: '.model-row__name' })).toBeInTheDocument()
+
+    fireEvent.click(within(dialog).getByRole('button', { name: '删除模型' }))
+    await waitFor(() => {
+      expect(screen.queryByRole('dialog', { name: '删除模型“模型一”？' })).not.toBeInTheDocument()
+    })
+    expect(screen.queryByText('模型一', { selector: '.model-row__name' })).not.toBeInTheDocument()
+    expect(screen.getByRole('alert')).toHaveTextContent('1 个动作已失去模型')
+    expect(screen.getByRole('alert')).toHaveTextContent('翻译')
+  })
+
+  it('distinguishes an empty server model list from an empty search', async () => {
+    window.textLens = {
+      getSettings: vi.fn(async () => settingsWithBoundModel()),
+      updateSettings: vi.fn(async () => settingsWithBoundModel()),
+      listProviderModels: vi.fn(async () => ({ ok: true as const, models: [] })),
+      getAccessibilityStatus: vi.fn(async () => ({
+        platform: 'windows',
+        trusted: true,
+        canRequest: false
+      })),
+      requestAccessibility: vi.fn(),
+      onSettingsChanged: vi.fn(() => () => undefined)
+    } as unknown as WindowTextLensApi
+
+    render(<SettingsApp />)
+    await goToSettingsSection('AI 服务商')
+    fireEvent.click(await screen.findByRole('button', { name: '获取模型' }))
+
+    const dialog = await screen.findByRole('dialog', { name: '选择模型' })
+    expect(within(dialog).getByRole('alert')).toHaveTextContent('服务端未返回任何模型')
+    expect(within(dialog).getByRole('button', { name: /应用所选/ })).toBeDisabled()
+
+    fireEvent.change(within(dialog).getByRole('textbox', { name: '搜索模型' }), {
+      target: { value: '不存在的模型' }
+    })
+    expect(within(dialog).getByText('没有匹配的模型')).toBeInTheDocument()
+  })
+
+  it('warns that actions will fail when their provider is disabled', async () => {
+    const settings = settingsWithBoundModel()
+    window.textLens = {
+      getSettings: vi.fn(async () => settings),
+      updateSettings: vi.fn(async () => settings),
+      getAccessibilityStatus: vi.fn(async () => ({
+        platform: 'windows',
+        trusted: true,
+        canRequest: false
+      })),
+      requestAccessibility: vi.fn(),
+      onSettingsChanged: vi.fn(() => () => undefined)
+    } as unknown as WindowTextLensApi
+
+    render(<SettingsApp />)
+    await goToSettingsSection('AI 服务商')
+    fireEvent.click(await screen.findByRole('switch', { name: /关闭服务商/ }))
+
+    const alert = await screen.findByRole('alert')
+    expect(alert).toHaveTextContent('已停用')
+    expect(alert).toHaveTextContent('翻译')
+    expect(alert).toHaveTextContent('启用前运行会失败')
+    expect(screen.getByText(/使用它的动作在运行时会失败/)).toBeInTheDocument()
+  })
+})
+
+describe('SettingsApp accessible names', () => {
+  it('labels the close mode, removal delay, toolbar mode and opacity controls', async () => {
+    installDefaultBridge()
+    render(<SettingsApp />)
+
+    expect(await screen.findByRole('combobox', { name: '关闭方式' })).toBeInTheDocument()
+    fireEvent.change(screen.getByRole('combobox', { name: '关闭方式' }), {
+      target: { value: 'pointer-leave' }
+    })
+    expect(screen.getByRole('slider', { name: '移出延迟' })).toHaveAttribute(
+      'aria-valuetext',
+      expect.stringContaining('毫秒')
+    )
+
+    await goToSettingsSection('外观')
+    expect(screen.getByRole('combobox', { name: '工具条显示' })).toBeInTheDocument()
+    expect(screen.getByRole('slider', { name: '窗口透明度' })).toHaveAttribute(
+      'aria-valuetext',
+      expect.stringContaining('%')
+    )
+  })
 })
 
 describe('SettingsApp provider protocols', () => {
@@ -1680,5 +1828,31 @@ describe('SettingsApp safeguards', () => {
     } finally {
       window.sessionStorage.removeItem('textlens.settings.active-section')
     }
+  })
+})
+
+describe('SettingsApp provider presets', () => {
+  it('fills protocol and base URL from the chosen preset', async () => {
+    render(<SettingsApp />)
+    await goToSettingsSection('AI 服务商')
+
+    fireEvent.click(screen.getByRole('button', { name: '添加服务商' }))
+    expect(screen.getByRole('heading', { name: '添加服务商' })).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: /DeepSeek/ }))
+
+    expect(screen.getByDisplayValue('DeepSeek')).toBeInTheDocument()
+    expect(screen.getByDisplayValue('https://api.deepseek.com/v1')).toBeInTheDocument()
+  })
+
+  it('keeps the dialog open until a preset is chosen or cancelled', async () => {
+    render(<SettingsApp />)
+    await goToSettingsSection('AI 服务商')
+
+    const before = document.querySelectorAll('input[type="password"]').length
+    fireEvent.click(screen.getByRole('button', { name: '添加服务商' }))
+    fireEvent.click(screen.getByRole('button', { name: '取消' }))
+
+    expect(screen.queryByRole('heading', { name: '添加服务商' })).not.toBeInTheDocument()
+    expect(document.querySelectorAll('input[type="password"]')).toHaveLength(before)
   })
 })

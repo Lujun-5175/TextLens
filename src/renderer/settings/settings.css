@@ -242,6 +242,40 @@ textarea.control::-webkit-scrollbar-thumb:hover,
   border: 1px solid color-mix(in srgb, var(--danger) 30%, transparent);
 }
 
+/* Errors stay readable and copyable until the user dismisses them. */
+.settings-banner--error {
+  pointer-events: auto;
+  user-select: text;
+}
+
+.settings-banner__close {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  margin: -2px -4px -2px auto;
+  color: inherit;
+  cursor: pointer;
+  background: transparent;
+  border: 0;
+  border-radius: var(--radius-sm);
+  opacity: 0.75;
+}
+
+.settings-banner__close:hover,
+.settings-banner__close:focus-visible {
+  opacity: 1;
+  background: color-mix(in srgb, var(--danger) 14%, transparent);
+  outline: none;
+}
+
+.settings-banner__close svg {
+  margin-top: 0;
+}
+
 .settings-banner svg {
   flex: 0 0 auto;
   margin-top: 2px;
@@ -692,6 +726,21 @@ textarea.control::-webkit-scrollbar-thumb:hover,
 
 .provider-card--disabled {
   opacity: 0.72;
+}
+
+.provider-disabled-note {
+  margin: 0;
+  padding: 9px 17px;
+  color: var(--warning);
+  font-size: 12px;
+  font-weight: var(--weight-semibold);
+  line-height: 1.45;
+  background: color-mix(in srgb, var(--warning) 12%, var(--surface-solid));
+  border-bottom: 1px solid color-mix(in srgb, var(--warning) 35%, var(--border));
+}
+
+.provider-field-error {
+  margin: 10px 17px 0;
 }
 
 .provider-card__header {
@@ -1524,6 +1573,28 @@ textarea.control::-webkit-scrollbar-thumb:hover,
   color: var(--text-secondary);
 }
 
+.settings-load-error {
+  display: grid;
+  gap: 10px;
+  justify-items: center;
+  max-width: 420px;
+  padding: 24px;
+  color: var(--text-secondary);
+  text-align: center;
+}
+
+.settings-load-error strong {
+  color: var(--text);
+  font-size: 16px;
+}
+
+.settings-load-error p {
+  margin: 0;
+  color: var(--danger);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
 .settings-spin {
   animation: settings-spin 850ms linear infinite;
 }
@@ -1985,4 +2056,56 @@ textarea.control::-webkit-scrollbar-thumb:hover,
   align-items: center;
   justify-content: space-between;
   gap: 12px;
+}
+
+/* Provider preset picker: one choice replaces typing a protocol and base URL. */
+.provider-preset-dialog {
+  width: min(560px, 100%);
+}
+
+.provider-preset-list {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  padding: 4px 20px 0;
+}
+
+.provider-preset {
+  display: grid;
+  gap: 4px;
+  padding: 12px 14px;
+  text-align: left;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-control);
+  background: var(--surface-solid);
+  color: inherit;
+  cursor: pointer;
+  transition: border-color 120ms ease, background 120ms ease;
+}
+
+.provider-preset:hover,
+.provider-preset:focus-visible {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.provider-preset__name {
+  font-weight: var(--weight-semibold);
+}
+
+.provider-preset__hint {
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+  line-height: 1.45;
+}
+
+.provider-preset__url {
+  color: var(--text-tertiary);
+  font-size: var(--text-xs);
+  font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  overflow-wrap: anywhere;
+}
+
+.provider-preset-dialog__actions {
+  padding: 16px 20px 20px;
 }

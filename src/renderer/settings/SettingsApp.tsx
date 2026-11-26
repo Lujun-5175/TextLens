@@ -74,14 +74,18 @@ import {
   type SupportedLocale,
   type TranslationLanguage
 } from '../../shared'
+import type { ProviderPreset } from '../../shared/providers'
 import { ActionIcon } from '../components/ActionIcon'
 import { Dialog } from '../components/Dialog'
 import { runDetached } from '../lib/asyncEffects'
 import { getErrorMessage } from '../lib/errors'
 import { applyTheme } from '../lib/theme'
 import { CustomActionDialog, type ActionEditorValue } from './CustomActionDialog'
+import { ProviderPresetDialog } from './ProviderPresetDialog'
 import { mergeProviderModelsOnPick } from './providerModels'
 import {
+  actionsBoundToModel,
+  actionsUsingProvider,
   buildSettingsUpdate,
   moveActionToZone,
   removeProviderModelFromSettings,
@@ -333,6 +337,8 @@ export function SettingsApp(): JSX.Element {
   const [operation, setOperation] = useState<Operation>(null)
   const [banner, setBanner] = useState<Banner>(null)
   const [bannerFading, setBannerFading] = useState(false)
+  const [loadError, setLoadError] = useState<string | null>(null)
+  const [loadAttempt, setLoadAttempt] = useState(0)
   const [fieldError, setFieldError] = useState<{
     field: SettingsFieldError
     message: string
@@ -348,8 +354,15 @@ export function SettingsApp(): JSX.Element {
   }, [draft?.filter.applications])
 
   const [editor, setEditor] = useState<ActionDefinition | 'new' | null>(null)
+  const [providerPresetOpen, setProviderPresetOpen] = useState(false)
   const [providerPendingDelete, setProviderPendingDelete] = useState<PublicProviderSettings | null>(null)
   const [actionPendingDelete, setActionPendingDelete] = useState<ActionDefinition | null>(null)
+  const [modelPendingDelete, setModelPendingDelete] = useState<{
+    providerName: string
+    providerId: string
+    model: ProviderModel
+    actionNames: string[]
+  } | null>(null)
   const [modelPicker, setModelPicker] = useState<ModelPickerState | null>(null)
   const [providerActionPrompt, setProviderActionPrompt] = useState<{
     kind: 'test' | 'fetch'
@@ -530,7 +543,10 @@ export function SettingsApp(): JSX.Element {
     }
 
     setBannerFading(false)
-    // Shared toast lifetime: fade starts at 1.4s, remove at 2.0s (both green and red).
+    // Only success toasts self-dismiss; errors stay until the user reads,
+    // copies or closes them (they may explain why saving failed).
+    if (banner.kind !== 'success') return
+    // Shared toast lifetime: fade starts at 1.4s, remove at 2.0s.
     const fadeTimer = window.setTimeout(() => setBannerFading(true), 1_400)
     const removeTimer = window.setTimeout(() => {
       setBanner(null)
@@ -629,6 +645,7 @@ export function SettingsApp(): JSX.Element {
     void window.textLens.getSettings()
       .then((settings) => {
         if (disposed) return
+        setLoadError(null)
         const normalized = normalizePublicSettings(settings)
         setDraft(normalized)
         applyTheme(normalized.appearance.theme)
@@ -636,7 +653,7 @@ export function SettingsApp(): JSX.Element {
         resetProviderKeyFields()
       })
       .catch((error: unknown) => {
-        if (!disposed) setBanner({ kind: 'error', text: getErrorMessage(error, '无法读取设置') })
+        if (!disposed) setLoadError(getErrorMessage(error, '无法读取设置'))
       })
     void window.textLens.getAccessibilityStatus()
       .then((status) => {
@@ -672,7 +689,7 @@ export function SettingsApp(): JSX.Element {
       unsubscribe()
       window.removeEventListener('focus', refreshAccessibility)
     }
-  }, [resetProviderKeyFields, refreshRuntimeStatus])
+  }, [resetProviderKeyFields, refreshRuntimeStatus, loadAttempt])
 
   const changeDraft = useCallback((updater: (current: PublicSettings) => PublicSettings): void => {
     draftRevisionRef.current += 1
@@ -751,7 +768,9 @@ export function SettingsApp(): JSX.Element {
         setFieldError({ field: validation.field, message: validation.message })
         const section = validation.field === 'translation' ? 'language'
           : validation.field === 'captureShortcut' ? 'general'
-            : validation.field.startsWith('provider:') ? 'providers' : 'actions'
+            : validation.field === 'filter' || validation.field.startsWith('captureRule:')
+              ? 'capture'
+              : validation.field.startsWith('provider:') ? 'providers' : 'actions'
         setActiveSection(section)
       } else setFieldError(null)
       return null
@@ -904,14 +923,14 @@ export function SettingsApp(): JSX.Element {
     }
   }
 
-  const addProvider = (): void => {
+  const addProvider = (preset?: ProviderPreset): void => {
     const id = createId('provider')
     const provider: PublicProviderSettings = {
       id,
-      name: `服务商 ${(draft?.providers.length ?? 0) + 1}`,
+      name: preset?.name ?? `服务商 ${(draft?.providers.length ?? 0) + 1}`,
       enabled: true,
-      protocol: 'openAiChat',
-      baseUrl: DEFAULT_OPENAI_BASE_URL,
+      protocol: preset?.protocol ?? 'openAiChat',
+      baseUrl: preset?.baseUrl ?? DEFAULT_OPENAI_BASE_URL,
       keyConfigured: false,
       models: []
     }
@@ -1128,6 +1147,13 @@ export function SettingsApp(): JSX.Element {
     const removedIds = previous
       .map((model) => model.id)
       .filter((id) => !nextModels.some((model) => model.id === id))
+    const lostActionNames = (draft?.actions ?? [])
+      .filter((action) =>
+        isAiActionDefinition(action) &&
+        action.providerId === providerId &&
+        removedIds.includes(action.modelId)
+      )
+      .map((action) => action.name)
     changeDraft((current) => {
       let next = current
       for (const modelId of removedIds) {
@@ -1141,9 +1167,56 @@ export function SettingsApp(): JSX.Element {
       }
     })
     setModelPicker(null)
+    const lostText = lostActionNames.length > 0
+      ? `；${lostActionNames.length} 个动作已失去模型（${lostActionNames.join('、')}），请重新选择`
+      : ''
     setBanner({
-      kind: 'success',
-      text: `已选择 ${nextModels.length} 个模型，请保存设置`
+      kind: lostActionNames.length > 0 ? 'error' : 'success',
+      text: `已选择 ${nextModels.length} 个模型，请保存设置${lostText}`
+    })
+  }
+
+  const removeProviderModel = (provider: PublicProviderSettings, model: ProviderModel): void => {
+    const affected = actionsBoundToModel(draftRef.current?.actions ?? [], provider.id, model.id)
+    changeDraft((current) => removeProviderModelFromSettings(current, provider.id, model.id))
+    setModelPendingDelete(null)
+    setBanner(affected.length > 0
+      ? {
+          kind: 'error',
+          text: `已删除模型“${model.name}”；${affected.length} 个动作已失去模型（${affected
+            .map((action) => action.name)
+            .join('、')}），请在「工具栏动作」中重新选择`
+        }
+      : { kind: 'success', text: `已删除模型“${model.name}”；保存设置后生效` })
+  }
+
+  const requestRemoveProviderModel = (
+    provider: PublicProviderSettings,
+    model: ProviderModel
+  ): void => {
+    const affected = actionsBoundToModel(draft?.actions ?? [], provider.id, model.id)
+    if (affected.length === 0) {
+      removeProviderModel(provider, model)
+      return
+    }
+    setModelPendingDelete({
+      providerId: provider.id,
+      providerName: provider.name,
+      model,
+      actionNames: affected.map((action) => action.name)
+    })
+  }
+
+  const toggleProviderEnabled = (provider: PublicProviderSettings, enabled: boolean): void => {
+    changeProvider(provider.id, (current) => ({ ...current, enabled }))
+    if (enabled) return
+    const affected = actionsUsingProvider(draftRef.current?.actions ?? [], provider.id)
+    if (affected.length === 0) return
+    setBanner({
+      kind: 'error',
+      text: `已停用“${provider.name}”；${affected.length} 个动作（${affected
+        .map((action) => action.name)
+        .join('、')}）在使用该服务商，启用前运行会失败`
     })
   }
 
@@ -1306,11 +1379,31 @@ export function SettingsApp(): JSX.Element {
   }
 
   if (!draft) {
+    if (loadError) {
+      return (
+        <main className="settings-loading">
+          <div className="settings-load-error" role="alert">
+            <CircleAlert size={26} aria-hidden="true" />
+            <strong>无法载入设置</strong>
+            <p>{loadError}</p>
+            <button
+              className="button"
+              type="button"
+              onClick={() => {
+                setLoadError(null)
+                setLoadAttempt((current) => current + 1)
+              }}
+            >
+              重试
+            </button>
+          </div>
+        </main>
+      )
+    }
     return (
       <main className="settings-loading">
         <LoaderCircle className="settings-spin" size={24} aria-hidden="true" />
         <span>正在载入设置…</span>
-        {banner?.kind === 'error' && <div className="notice notice--error">{banner.text}</div>}
       </main>
     )
   }
@@ -1354,12 +1447,25 @@ export function SettingsApp(): JSX.Element {
         {banner && (
           <div
             className={`notice notice--${banner.kind} settings-banner ${
-              bannerFading ? 'settings-banner--fading' : ''
-            }`}
+              banner.kind === 'error' ? 'settings-banner--error' : ''
+            } ${bannerFading ? 'settings-banner--fading' : ''}`}
             role={banner.kind === 'error' ? 'alert' : 'status'}
           >
             {banner.kind === 'success' ? <Check size={16} aria-hidden="true" /> : <CircleAlert size={16} aria-hidden="true" />}
             <span>{banner.text}</span>
+            {banner.kind === 'error' && (
+              <button
+                className="settings-banner__close"
+                type="button"
+                aria-label="关闭错误提示"
+                onClick={() => {
+                  setBanner(null)
+                  setBannerFading(false)
+                }}
+              >
+                <X size={14} aria-hidden="true" />
+              </button>
+            )}
           </div>
         )}
 
@@ -1492,12 +1598,14 @@ export function SettingsApp(): JSX.Element {
                   <SettingSwitch title="默认置顶" description="新打开的结果窗口保持在其他窗口上方；也可在窗口标题栏临时切换。"
                     checked={draft.result.defaultPinned} onChange={(defaultPinned) => changeDraft((current) => ({ ...current, result: { ...current.result, defaultPinned } }))} />
                   <div className="setting-row"><div><strong>关闭方式</strong><p>仅未置顶窗口执行；置顶窗口始终忽略自动关闭。</p></div>
-                    <select className="control result-mode-control" value={draft.result.dismissMode}
+                    <select className="control result-mode-control" aria-label="关闭方式" value={draft.result.dismissMode}
                       onChange={(event) => changeDraft((current) => ({ ...current, result: { ...current.result, dismissMode: event.target.value as PublicSettings['result']['dismissMode'] } }))}>
                       <option value="blur">失去焦点时关闭（推荐）</option><option value="pointer-leave">鼠标移出后关闭</option><option value="manual">手动关闭</option>
                     </select></div>
                   {draft.result.dismissMode === 'pointer-leave' && <div className="setting-row"><div><strong>移出延迟</strong><p>短暂移出不会误关窗口。</p></div>
-                    <div className="range-control"><input type="range" min={100} max={2000} step={50} value={draft.result.dismissDelayMs}
+                    <div className="range-control"><input type="range" min={100} max={2000} step={50} aria-label="移出延迟"
+                      aria-valuetext={`${draft.result.dismissDelayMs} 毫秒`}
+                      value={draft.result.dismissDelayMs}
                       onChange={(event) => changeDraft((current) => ({ ...current, result: { ...current.result, dismissDelayMs: Number(event.target.value) } }))} /><span>{draft.result.dismissDelayMs} ms</span></div></div>}
                 </div>
               </section>
@@ -1541,7 +1649,7 @@ export function SettingsApp(): JSX.Element {
           <section className="settings-section settings-section--enter" aria-labelledby="providers-title">
         <div className="section-heading section-heading--actions">
           <div><h2 id="providers-title">AI 服务商与模型</h2><p>{activeMeta.blurb}</p></div>
-          <button className="button" type="button" onClick={addProvider}><Plus size={15} />添加服务商</button>
+          <button className="button" type="button" onClick={() => setProviderPresetOpen(true)}><Plus size={15} />添加服务商</button>
         </div>
         <div className="settings-tip" role="note">
           <span className="settings-tip__label">配置顺序</span>
@@ -1561,9 +1669,10 @@ export function SettingsApp(): JSX.Element {
               <header className="provider-card__header">
                 <div className="provider-card__identity"><span className="provider-avatar"><Sparkles size={17} /></span>
                   <input className="provider-name-input" value={provider.name} maxLength={80} aria-label="服务商名称"
+                    data-field-error={`provider:${provider.id}:name`}
                     onChange={(event) => changeProvider(provider.id, (current) => ({ ...current, name: event.target.value }))} /></div>
                 <div className="provider-card__header-actions">
-                  <label className="provider-enabled-toggle" title={provider.enabled === false ? '已关闭：动作与结果中不显示其模型' : '已启用'}>
+                  <label className="provider-enabled-toggle" title={provider.enabled === false ? '已停用：使用该服务商的动作会失败，直到重新启用' : '已启用'}>
                     <span className="provider-enabled-toggle__label">
                       {provider.enabled === false ? '已关闭' : '已启用'}
                     </span>
@@ -1572,16 +1681,22 @@ export function SettingsApp(): JSX.Element {
                       role="switch"
                       aria-label={`${provider.name}：${provider.enabled === false ? '启用' : '关闭'}服务商`}
                       checked={provider.enabled !== false}
-                      onChange={(event) => changeProvider(provider.id, (current) => ({
-                        ...current,
-                        enabled: event.target.checked
-                      }))}
+                      onChange={(event) => toggleProviderEnabled(provider, event.target.checked)}
                     />
                   </label>
                   <button className="icon-button action-delete" type="button" title="删除服务商" aria-label={`删除${provider.name}`}
                     onClick={() => setProviderPendingDelete(provider)}><Trash2 size={16} /></button>
                 </div>
               </header>
+              {provider.enabled === false && (
+                <p className="provider-disabled-note" role="note">
+                  该服务商已停用：使用它的动作在运行时会失败，动作编辑器也不会列出其模型。重新启用后才会恢复可用。
+                </p>
+              )}
+              {(fieldError?.field === `provider:${provider.id}:name`
+                || fieldError?.field === `provider:${provider.id}:models`) && (
+                <p className="field-error provider-field-error" role="alert">{fieldError.message}</p>
+              )}
               <div className="provider-grid">
                 <label className="field field--wide"><span className="field__label">接口协议</span>
                   <select
@@ -1659,6 +1774,7 @@ export function SettingsApp(): JSX.Element {
                 <div className="field field--wide"><span className="field__label">模型（{provider.models.length}）</span>
                   <div className="model-add-row"><input className="control" value={newModelInputs[provider.id] ?? ''}
                     placeholder="手动添加模型 ID" spellCheck={false}
+                    data-field-error={`provider:${provider.id}:models`}
                     onChange={(event) => setNewModelInputs((current) => ({ ...current, [provider.id]: event.target.value }))}
                     onKeyDown={(event) => { if (event.key === 'Enter') { event.preventDefault(); addManualModel(provider) } }} />
                     <button className="button" type="button" onClick={() => addManualModel(provider)}>添加</button></div>
@@ -1684,9 +1800,7 @@ export function SettingsApp(): JSX.Element {
                             key={model.id}
                             model={model}
                             dragging={draggingModelId === model.id}
-                            onRemove={() => changeDraft((current) =>
-                              removeProviderModelFromSettings(current, provider.id, model.id)
-                            )}
+                            onRemove={() => requestRemoveProviderModel(provider, model)}
                           />
                         ))}
                         {provider.models.length === 0 && (
@@ -1853,7 +1967,7 @@ export function SettingsApp(): JSX.Element {
         <div className="settings-card settings-card--rows">
           <div className="setting-row">
             <div><strong>工具条显示</strong><p>仅显示图标时仍保留悬浮提示和辅助功能名称。</p></div>
-            <select className="control compact-control" value={draft.toolbar.displayMode}
+            <select className="control compact-control" aria-label="工具条显示" value={draft.toolbar.displayMode}
               onChange={(event) => changeDraft((current) => ({
                 ...current,
                 toolbar: { displayMode: event.target.value as PublicSettings['toolbar']['displayMode'] }
@@ -1864,6 +1978,7 @@ export function SettingsApp(): JSX.Element {
           <div className="setting-row"><div><strong>结果文字大小</strong><p>调整翻译、总结、解释等结果正文的字号。</p></div>
             <div className="range-control"><input type="range" aria-label="结果文字大小"
               min={RESULT_FONT_SIZE_MIN} max={RESULT_FONT_SIZE_MAX} step={1} value={draft.result.fontSize}
+              aria-valuetext={`${draft.result.fontSize} 像素`}
               onChange={(event) => changeDraft((current) => ({ ...current, result: { ...current.result, fontSize: Number(event.target.value) } }))} />
               <span>{draft.result.fontSize} px</span></div></div>
           <div className="setting-row setting-row--stackable">
@@ -1905,7 +2020,9 @@ export function SettingsApp(): JSX.Element {
             </div>
           </div>
           <div className="setting-row"><div><strong>窗口透明度</strong><p>内容和控件会保持统一透明度。</p></div>
-            <div className="range-control"><input type="range" min={20} max={100} value={Math.round(draft.result.opacity * 100)}
+            <div className="range-control"><input type="range" min={20} max={100} aria-label="窗口透明度"
+              aria-valuetext={`${Math.round(draft.result.opacity * 100)}%`}
+              value={Math.round(draft.result.opacity * 100)}
               onChange={(event) => changeDraft((current) => ({ ...current, result: { ...current.result, opacity: Number(event.target.value) / 100 } }))} /><span>{Math.round(draft.result.opacity * 100)}%</span></div></div>
         </div>
       </section>
@@ -1939,6 +2056,7 @@ export function SettingsApp(): JSX.Element {
                   <input
                     className="control"
                     aria-label={`程序规则 ${index + 1}`}
+                    data-field-error={`captureRule:${index}`}
                     value={rule.application}
                     placeholder="acrobat.exe"
                     spellCheck={false}
@@ -1988,6 +2106,9 @@ export function SettingsApp(): JSX.Element {
                 </div>
               ))}
             </div>
+            {fieldError?.field.startsWith('captureRule:') && (
+              <p className="field-error" role="alert">{fieldError.message}</p>
+            )}
             <div className="setting-row__end">
               <button
                 className="button button--quiet"
@@ -2046,6 +2167,7 @@ export function SettingsApp(): JSX.Element {
                 </div>
               )}
               <textarea className="control filter-list-input" aria-label="应用过滤列表" value={filterText}
+                data-field-error="filter"
                 onChange={(event) => {
                   const nextText = event.target.value
                   const applications = nextText
@@ -2059,6 +2181,9 @@ export function SettingsApp(): JSX.Element {
                     filter: { ...current.filter, applications }
                   }))
                 }} />
+              {fieldError?.field === 'filter' && (
+                <p className="field-error" role="alert">{fieldError.message}</p>
+              )}
             </label>
           )}
         </div>
@@ -2099,6 +2224,15 @@ export function SettingsApp(): JSX.Element {
 
       {editor && <CustomActionDialog action={editor === 'new' ? null : editor} providers={draft.providers}
         onCancel={() => setEditor(null)} onSave={saveAction} />}
+      {providerPresetOpen && (
+        <ProviderPresetDialog
+          onCancel={() => setProviderPresetOpen(false)}
+          onSelect={(preset) => {
+            setProviderPresetOpen(false)
+            addProvider(preset)
+          }}
+        />
+      )}
       {providerPendingDelete && (
         <ProviderDeleteDialog
           provider={providerPendingDelete}
@@ -2121,6 +2255,20 @@ export function SettingsApp(): JSX.Element {
           action={actionPendingDelete}
           onCancel={() => setActionPendingDelete(null)}
           onConfirm={() => deleteAction(actionPendingDelete)}
+        />
+      )}
+      {modelPendingDelete && (
+        <ModelDeleteDialog
+          providerName={modelPendingDelete.providerName}
+          modelName={modelPendingDelete.model.name}
+          actionNames={modelPendingDelete.actionNames}
+          onCancel={() => setModelPendingDelete(null)}
+          onConfirm={() => {
+            const pending = modelPendingDelete
+            const provider = draft.providers.find((candidate) => candidate.id === pending.providerId)
+            if (provider) removeProviderModel(provider, pending.model)
+            else setModelPendingDelete(null)
+          }}
         />
       )}
       {quitConfirmationOpen && (
@@ -2213,6 +2361,25 @@ export function ActionDeleteDialog({ action, onCancel, onConfirm }: {
       description="该动作会从工具栏和设置中移除，保存设置后生效。"
       confirmLabel="移除动作"
       closeLabel="关闭动作删除确认"
+      onCancel={onCancel}
+      onConfirm={onConfirm}
+    />
+  )
+}
+
+export function ModelDeleteDialog({ providerName, modelName, actionNames, onCancel, onConfirm }: {
+  providerName: string
+  modelName: string
+  actionNames: readonly string[]
+  onCancel: () => void
+  onConfirm: () => void
+}): JSX.Element {
+  return (
+    <DeleteConfirmationDialog
+      title={`删除模型“${modelName}”？`}
+      description={`“${providerName}”中的该模型正被 ${actionNames.length} 个动作使用：${actionNames.join('、')}。删除后这些动作会失去模型绑定，需要重新选择；保存设置后生效。`}
+      confirmLabel="删除模型"
+      closeLabel="关闭模型删除确认"
       onCancel={onCancel}
       onConfirm={onConfirm}
     />
@@ -2407,6 +2574,13 @@ function ModelPickerDialog({
     })
   }
 
+  const noRemoteModels = remoteModels.length === 0
+  const emptyMessage = query.trim() && listModels.length > 0
+    ? '没有匹配的模型'
+    : noRemoteModels && listModels.length === 0
+      ? '服务端没有返回任何模型，请检查接口地址与密钥后重试'
+      : '暂无可选模型'
+
   return (
     <Dialog className="model-picker-dialog" labelledBy="model-picker-title" onClose={onCancel}>
         <header className="dialog-header">
@@ -2433,6 +2607,11 @@ function ModelPickerDialog({
             spellCheck={false}
             onChange={(event) => setQuery(event.target.value)}
           />
+          {noRemoteModels && (
+            <p className="field__hint field__hint--error" role="alert">
+              服务端未返回任何模型，无法应用新的选择；下方仅显示已保存的模型。请检查接口地址与密钥后重新获取。
+            </p>
+          )}
           <div className="model-picker-list" role="list">
             {filtered.map((model) => {
               const checked = checkedIds.has(model.id)
@@ -2461,7 +2640,7 @@ function ModelPickerDialog({
               )
             })}
             {filtered.length === 0 && (
-              <div className="model-empty">没有匹配的模型</div>
+              <div className="model-empty">{emptyMessage}</div>
             )}
           </div>
         </div>
@@ -2470,6 +2649,8 @@ function ModelPickerDialog({
           <button
             className="button button--primary"
             type="button"
+            disabled={noRemoteModels}
+            title={noRemoteModels ? '服务端未返回模型，无法应用' : undefined}
             onClick={() => onApply(checkedIds)}
           >
             应用所选（{checkedIds.size}）

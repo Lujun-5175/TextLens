@@ -302,4 +302,149 @@ describe('CustomActionDialog thinking detection', () => {
     fireEvent.click(screen.getByRole('button', { name: '重新自动识别' }))
     expect(screen.getByLabelText('思考强度')).toBeInTheDocument()
   })
+
+  it('reports what heuristic re-detection found and that it must be saved', () => {
+    render(createElement(CustomActionDialog, { action, providers, onSave: vi.fn(), onCancel: vi.fn() }))
+    fireEvent.click(screen.getByRole('button', { name: '重新自动识别' }))
+
+    const summary = screen.getByRole('status')
+    expect(summary).toHaveTextContent('已识别出 4 个思考档位')
+    expect(summary).toHaveTextContent('启发式识别')
+    expect(summary).toHaveTextContent('保存设置后生效')
+    expect(summary).toHaveTextContent('影响其它工具')
+  })
+})
+
+describe('CustomActionDialog disabled provider binding', () => {
+  const disabledProviders = [{
+    id: 'provider-off',
+    name: '旧服务商',
+    enabled: false,
+    baseUrl: 'https://example.com/v1',
+    keyConfigured: true,
+    models: [{
+      id: 'model-hidden',
+      name: '隐藏模型',
+      thinkingLevels: ['low' as const, 'medium' as const, 'high' as const]
+    }]
+  }]
+  const boundAction: ActionDefinition = {
+    id: 'tool-off',
+    name: '工具',
+    icon: 'sparkles',
+    kind: 'custom',
+    enabled: true,
+    order: 1,
+    providerId: 'provider-off',
+    modelId: 'model-hidden',
+    thinkingMode: 'high',
+    prompt: '处理：{{text}}'
+  }
+
+  it('shows a disabled placeholder for the bound model instead of a blank select', () => {
+    render(createElement(CustomActionDialog, {
+      action: boundAction,
+      providers: disabledProviders,
+      onSave: vi.fn(),
+      onCancel: vi.fn()
+    }))
+
+    const select = screen.getByLabelText('模型') as HTMLSelectElement
+    expect(select.value).toBe(JSON.stringify(['provider-off', 'model-hidden']))
+    const option = Array.from(select.querySelectorAll('option')).find(
+      (candidate) => candidate.textContent === '（已停用）隐藏模型'
+    )
+    expect(option).toBeDefined()
+    expect(option?.disabled).toBe(true)
+    expect(screen.getByText(/该动作绑定的服务商「旧服务商」已停用/)).toBeInTheDocument()
+  })
+
+  it('keeps the stored thinking mode when saving with a disabled provider', () => {
+    const onSave = vi.fn()
+    render(createElement(CustomActionDialog, {
+      action: boundAction,
+      providers: disabledProviders,
+      onSave,
+      onCancel: vi.fn()
+    }))
+
+    fireEvent.click(screen.getByRole('button', { name: '保存修改' }))
+    expect(onSave).toHaveBeenCalledWith(expect.objectContaining({
+      providerId: 'provider-off',
+      modelId: 'model-hidden',
+      thinkingMode: 'high'
+    }))
+  })
+})
+
+describe('CustomActionDialog thinking switch memory', () => {
+  const providers = [{
+    id: 'provider-one',
+    name: '服务商一',
+    enabled: true,
+    baseUrl: 'https://example.com/v1',
+    keyConfigured: true,
+    models: [{
+      id: 'model-think',
+      name: '思考模型',
+      thinkingLevels: ['low' as const, 'medium' as const, 'high' as const],
+      thinkingCapability: {
+        source: 'manual' as const,
+        dialect: 'reasoningEffort' as const,
+        supportsOff: true
+      }
+    }]
+  }]
+
+  it('restores the last enabled level after toggling thinking off and on', () => {
+    render(createElement(CustomActionDialog, {
+      action: null,
+      providers,
+      onSave: vi.fn(),
+      onCancel: vi.fn()
+    }))
+    fireEvent.change(screen.getByLabelText('模型'), {
+      target: { value: JSON.stringify(['provider-one', 'model-think']) }
+    })
+    const select = screen.getByLabelText('思考强度')
+    fireEvent.change(select, { target: { value: 'high' } })
+    expect(select).toHaveValue('high')
+
+    const toggle = screen.getByRole('switch', { name: '启用思考' })
+    fireEvent.click(toggle)
+    expect(select).toHaveValue('off')
+    fireEvent.click(toggle)
+    expect(select).toHaveValue('high')
+  })
+
+  it('hides the automatic option for toggle-only models', () => {
+    const toggleProviders = [{
+      ...providers[0]!,
+      models: [{
+        ...providers[0]!.models[0]!,
+        id: 'glm-toggle',
+        name: '开关模型',
+        thinkingLevels: ['medium' as const],
+        thinkingCapability: {
+          source: 'manual' as const,
+          dialect: 'thinkingToggle' as const,
+          supportsOff: true
+        }
+      }]
+    }]
+    render(createElement(CustomActionDialog, {
+      action: null,
+      providers: toggleProviders,
+      onSave: vi.fn(),
+      onCancel: vi.fn()
+    }))
+    fireEvent.change(screen.getByLabelText('模型'), {
+      target: { value: JSON.stringify(['provider-one', 'glm-toggle']) }
+    })
+
+    expect(screen.queryByRole('option', { name: '自动选择档位' })).not.toBeInTheDocument()
+    const toggle = screen.getByRole('switch', { name: '启用思考' })
+    fireEvent.click(toggle)
+    expect(screen.getByLabelText('思考强度')).toHaveValue('medium')
+  })
 })

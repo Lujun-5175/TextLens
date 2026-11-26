@@ -5,7 +5,9 @@ import {
   TEXT_PLACEHOLDER
 } from '../../shared'
 import {
+  actionsBoundToModel,
   buildSettingsUpdate,
+  fieldForIssuePath,
   moveActionToZone,
   removeProviderModelFromSettings,
   removeProviderFromSettings,
@@ -213,5 +215,115 @@ describe('settings form helpers', () => {
     expect(updated.actions[0]).toHaveProperty('modelId', '')
     expect(updated.actions[1]).toHaveProperty('modelId', otherModel.id)
     expect(configured.providers[0]?.models).toHaveLength(2)
+  })
+
+  it('lists the actions bound to one provider+model before deleting it', () => {
+    const configured = {
+      ...DEFAULT_PUBLIC_SETTINGS,
+      actions: DEFAULT_PUBLIC_SETTINGS.actions.map((action) =>
+        'providerId' in action && action.id === 'translate'
+          ? { ...action, modelId: 'model-selected' }
+          : action
+      )
+    }
+
+    expect(
+      actionsBoundToModel(configured.actions, DEFAULT_PROVIDER_ID, 'model-selected')
+        .map((action) => action.name)
+    ).toEqual(['翻译'])
+    expect(actionsBoundToModel(configured.actions, DEFAULT_PROVIDER_ID, 'other')).toEqual([])
+  })
+})
+
+describe('settings form validation messages', () => {
+  it('reports an empty provider name in Chinese with the provider field', () => {
+    const result = buildSettingsUpdate({
+      ...DEFAULT_PUBLIC_SETTINGS,
+      providers: DEFAULT_PUBLIC_SETTINGS.providers.map((provider) => ({
+        ...provider,
+        name: '   '
+      }))
+    })
+
+    expect(result).toEqual({
+      valid: false,
+      field: `provider:${DEFAULT_PROVIDER_ID}:name`,
+      message: '服务商名称不能为空'
+    })
+  })
+
+  it('reports a duplicate capture rule with its one-based index', () => {
+    const result = buildSettingsUpdate({
+      ...DEFAULT_PUBLIC_SETTINGS,
+      selectionCapture: {
+        defaultStrategy: 'selection-hook',
+        applications: [
+          { application: 'reader.exe', strategy: 'clipboard' },
+          { application: 'Reader.exe', strategy: 'auto' }
+        ]
+      }
+    })
+
+    expect(result).toEqual({
+      valid: false,
+      field: 'captureRule:1',
+      message: '第 2 条程序规则与第 1 条重复'
+    })
+  })
+
+  it('reports models without an ID against the provider model field', () => {
+    const result = buildSettingsUpdate({
+      ...DEFAULT_PUBLIC_SETTINGS,
+      providers: DEFAULT_PUBLIC_SETTINGS.providers.map((provider) => ({
+        ...provider,
+        models: [{ id: '  ', name: '空 ID', thinkingLevels: [] }]
+      }))
+    })
+
+    expect(result).toEqual({
+      valid: false,
+      field: `provider:${DEFAULT_PROVIDER_ID}:models`,
+      message: expect.stringContaining('模型 ID 为空')
+    })
+  })
+
+  it('replaces a raw Zod English issue with a generic Chinese message', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+    try {
+      const result = buildSettingsUpdate({
+        ...DEFAULT_PUBLIC_SETTINGS,
+        appearance: { theme: 'not-a-theme' as never }
+      })
+
+      expect(result).toEqual({
+        valid: false,
+        field: undefined,
+        message: '设置内容不符合保存要求，请检查标出的字段'
+      })
+      expect(warn).toHaveBeenCalled()
+    } finally {
+      warn.mockRestore()
+    }
+  })
+
+  it('maps Zod issue paths back to focusable field keys', () => {
+    expect(fieldForIssuePath(['translate'], [], [])).toBe('translation')
+    expect(fieldForIssuePath(['filter', 'applications', 0], [], [])).toBe('filter')
+    expect(
+      fieldForIssuePath(
+        ['selectionCapture', 'applications', 2, 'application'],
+        [],
+        []
+      )
+    ).toBe('captureRule:2')
+    expect(fieldForIssuePath(['providers', 0, 'name'], [{ id: 'p1' }], [])).toBe(
+      'provider:p1:name'
+    )
+    expect(fieldForIssuePath(['providers', 0, 'models'], [{ id: 'p1' }], [])).toBe(
+      'provider:p1:models'
+    )
+    expect(fieldForIssuePath(['actions', 1], [], [{ id: 'a1' }, { id: 'a2' }])).toBe(
+      'action:a2'
+    )
   })
 })

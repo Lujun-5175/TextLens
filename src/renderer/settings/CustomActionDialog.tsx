@@ -1,4 +1,4 @@
-import { useMemo, useRef, useState, type FormEvent, type JSX } from 'react'
+import { useEffect, useMemo, useRef, useState, type FormEvent, type JSX } from 'react'
 import { Braces, RefreshCw, RotateCcw, X } from 'lucide-react'
 
 import {
@@ -146,8 +146,15 @@ export function CustomActionDialog({
   const [searchEngineId, setSearchEngineId] = useState<SearchEngineId>(initialSearchEngineId)
   const [prompt, setPrompt] = useState(initialAi?.prompt ?? DEFAULT_ACTION_PROMPTS.custom)
   const [error, setError] = useState('')
+  const [detectSummary, setDetectSummary] = useState('')
   const [detectedModels, setDetectedModels] = useState<Record<string, ProviderModel>>({})
   const nameRef = useRef<HTMLInputElement>(null)
+  // Remember the last enabled level so re-enabling thinking does not fall back
+  // to the model default after a temporary off.
+  const lastThinkingModeRef = useRef<ThinkingMode>(thinkingMode !== 'off' ? thinkingMode : 'off')
+  useEffect(() => {
+    if (thinkingMode !== 'off') lastThinkingModeRef.current = thinkingMode
+  }, [thinkingMode])
 
   const enabledProviders = useMemo(
     () => providers.filter((provider) => provider.enabled !== false),
@@ -205,6 +212,20 @@ export function CustomActionDialog({
     ) ?? null
   }, [modelChoices, modelId, providerId])
 
+  // A route can point at a provider that was disabled (or a model it no
+  // longer lists). Keep the stored route visible instead of showing an empty
+  // select, and do not rewrite the action's thinking preference.
+  const unavailableRoute = useMemo(() => {
+    if (selectedChoice || !providerId || !modelId) return null
+    const provider = providers.find((item) => item.id === providerId)
+    const model = provider?.models.find((item) => item.id === modelId)
+    return {
+      providerName: provider?.name ?? providerId,
+      disabled: provider?.enabled === false,
+      modelName: model?.name ?? modelId
+    }
+  }, [modelId, providerId, providers, selectedChoice])
+
   const modelSelectValue = providerId && modelId
     ? modelRouteValue({ providerId, modelId })
     : ''
@@ -228,6 +249,21 @@ export function CustomActionDialog({
     setThinkingMode((current) => isThinkingToggle(detected.capability)
       ? current === 'off' ? 'off' : 'medium'
       : clampThinkingMode(current, detected.levels))
+    const detectedLevels = isThinkingToggle(detected.capability)
+      ? ['medium' as const]
+      : detected.levels
+    const scope = '这是启发式识别（按模型 ID 与协议推断），保存设置后生效；识别结果会写回该服务商的模型设置，并影响其它工具使用该模型时可选的档位。'
+    if (isThinkingToggle(detected.capability)) {
+      setDetectSummary(`已识别为仅支持开关的思考模型，不提供可调档位。${scope}`)
+    } else if (detectedLevels.length > 0) {
+      setDetectSummary(
+        `已识别出 ${detectedLevels.length} 个思考档位：${detectedLevels
+          .map((level) => THINKING_LEVEL_LABELS[level])
+          .join('、')}。${scope}`
+      )
+    } else {
+      setDetectSummary(`未发现可调节档位。${scope}`)
+    }
   }
 
   const submit = (event: FormEvent): void => {
@@ -243,6 +279,14 @@ export function CustomActionDialog({
         return setError(`提示词必须包含 ${TEXT_PLACEHOLDER}`)
       }
       if (cleanPrompt.length > 10_000) return setError('提示词不能超过 10,000 个字符')
+      // Without a resolvable model choice (disabled provider / removed model)
+      // the stored thinking preference is kept as-is instead of silently
+      // becoming "off".
+      const resolvedThinkingMode = selectedChoice
+        ? resolveThinkingMode(selectedChoice, thinkingMode)
+        : providerId && modelId
+          ? thinkingMode
+          : 'off'
       onSave({
         name: cleanName,
         icon,
@@ -250,7 +294,7 @@ export function CustomActionDialog({
         prompt: cleanPrompt,
         providerId,
         modelId,
-        thinkingMode: resolveThinkingMode(selectedChoice, thinkingMode),
+        thinkingMode: resolvedThinkingMode,
         ...(selectedChoice && detectedModels[selectedChoice.value] ? { thinkingModel: detectedModels[selectedChoice.value] } : {})
       })
       return
@@ -282,6 +326,7 @@ export function CustomActionDialog({
   }
 
   const changeModelRoute = (value: string): void => {
+    setDetectSummary('')
     const route = parseModelRoute(value)
     if (!route) {
       setProviderId('')
@@ -384,6 +429,18 @@ export function CustomActionDialog({
                   onChange={(event) => changeModelRoute(event.target.value)}
                 >
                   <option value="">尚未选择</option>
+                  {unavailableRoute && (
+                    <optgroup
+                      label={unavailableRoute.disabled
+                        ? `${unavailableRoute.providerName}（已停用）`
+                        : `${unavailableRoute.providerName}（不可用）`}
+                    >
+                      <option value={modelSelectValue} disabled>
+                        {unavailableRoute.disabled ? '（已停用）' : '（不可用）'}
+                        {unavailableRoute.modelName}
+                      </option>
+                    </optgroup>
+                  )}
                   {modelGroups.map((group) => (
                     <optgroup
                       key={group.id}
@@ -400,6 +457,11 @@ export function CustomActionDialog({
                 <span className="field__hint">
                   已启用的服务商与其模型列在同一列表中；可在「服务商」中关闭不需要的服务商。
                 </span>
+                {unavailableRoute?.disabled && (
+                  <span className="field__hint field__hint--error" role="alert">
+                    该动作绑定的服务商「{unavailableRoute.providerName}」已停用，使用此动作会失败；请启用该服务商或改选模型。思考设置保持原值，不会自动关闭。
+                  </span>
+                )}
               </label>
 
               {selectedChoice && (
@@ -410,12 +472,30 @@ export function CustomActionDialog({
                       <RefreshCw size={12} />重新自动识别
                     </button>
                   </div>
+                  {detectSummary && (
+                    <p className="field__hint action-detect-summary" role="status">{detectSummary}</p>
+                  )}
                   {thinkingLevels.length > 0 ? (
                     <>
                       <label className="model-thinking-toggle">
                         <input type="checkbox" role="switch" aria-label="启用思考"
                           checked={resolveThinkingMode(selectedChoice, thinkingMode) !== 'off'}
-                          onChange={(event) => setThinkingMode(event.target.checked ? defaultThinkingLevel(thinkingLevels) ?? 'off' : 'off')} />
+                          onChange={(event) => {
+                            if (!event.target.checked) {
+                              setThinkingMode('off')
+                              return
+                            }
+                            const remembered = resolveThinkingMode(
+                              selectedChoice,
+                              lastThinkingModeRef.current
+                            )
+                            setThinkingMode(remembered !== 'off'
+                              ? remembered
+                              : resolveThinkingMode(
+                                  selectedChoice,
+                                  defaultThinkingLevel(thinkingLevels) ?? 'off'
+                                ))
+                          }} />
                         启用思考
                       </label>
                       <label className="field">
@@ -424,7 +504,7 @@ export function CustomActionDialog({
                           value={resolveThinkingMode(selectedChoice, thinkingMode)}
                           onChange={(event) => setThinkingMode(event.target.value as ThinkingMode)}>
                           <option value="off">{selectedChoice.supportsOff ? '关闭思考（更快首字）' : '关闭思考（使用最低支持档位）'}</option>
-                          <option value="auto">自动选择档位</option>
+                          {!toggleOnly && <option value="auto">自动选择档位</option>}
                           {thinkingLevels.map((level) => (
                             <option key={level} value={level}>
                               {toggleOnly ? '启用（模型默认）' : level === 'xhigh' && selectedChoice.thinkingCapability?.dialect === 'reasoningEffortMax' ? '最高' : THINKING_LEVEL_LABELS[level]}

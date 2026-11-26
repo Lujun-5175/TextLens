@@ -1,6 +1,7 @@
 import {
   MAX_CUSTOM_ACTIONS,
   MAX_ENABLED_ACTIONS,
+  MAX_PROVIDER_MODELS,
   TEXT_PLACEHOLDER,
   isAiActionDefinition,
   isSearchActionDefinition,
@@ -80,12 +81,76 @@ export function removeProviderModelFromSettings(
   }
 }
 
+/** Actions bound to one provider+model, used to warn before the binding is broken. */
+export function actionsBoundToModel(
+  actions: readonly ActionDefinition[],
+  providerId: string,
+  modelId: string
+): ActionDefinition[] {
+  return actions.filter(
+    (action) =>
+      isAiActionDefinition(action) &&
+      action.providerId === providerId &&
+      action.modelId === modelId
+  )
+}
+
+export function actionsUsingProvider(
+  actions: readonly ActionDefinition[],
+  providerId: string
+): ActionDefinition[] {
+  return actions.filter(
+    (action) => isAiActionDefinition(action) && action.providerId === providerId
+  )
+}
+
 export type SettingsFieldError =
   | 'translation'
   | 'captureShortcut'
   | 'actions'
+  | 'filter'
   | `provider:${string}:baseUrl`
+  | `provider:${string}:name`
+  | `provider:${string}:models`
+  | `captureRule:${number}`
   | `action:${string}`
+
+const PROVIDER_NAME_MAX = 80
+const MODEL_FIELD_MAX = 256
+const CAPTURE_RULE_MAX = 512
+
+/**
+ * Best-effort mapping from a Zod issue path to the control that should get
+ * focus. Zod's own English messages never reach the user; this only decides
+ * where the generic Chinese message is shown.
+ */
+export function fieldForIssuePath(
+  path: readonly PropertyKey[],
+  providers: readonly Pick<PublicProviderSettings, 'id'>[],
+  actions: readonly Pick<ActionDefinition, 'id'>[]
+): SettingsFieldError | undefined {
+  const [head, index, ...rest] = path
+  if (head === 'translate') return 'translation'
+  if (head === 'captureShortcut') return 'captureShortcut'
+  if (head === 'actions') {
+    if (typeof index !== 'number') return 'actions'
+    const action = actions[index]
+    return action ? `action:${action.id}` : 'actions'
+  }
+  if (head === 'filter') return 'filter'
+  if (head === 'selectionCapture' && index === 'applications' && typeof rest[0] === 'number') {
+    return `captureRule:${rest[0]}`
+  }
+  if (head === 'providers' && typeof index === 'number') {
+    const provider = providers[index]
+    if (!provider) return undefined
+    const leaf = rest[0]
+    if (leaf === 'baseUrl') return `provider:${provider.id}:baseUrl`
+    if (leaf === 'name') return `provider:${provider.id}:name`
+    return `provider:${provider.id}:models`
+  }
+  return undefined
+}
 
 export function buildSettingsUpdate(settings: PublicSettings):
   | { valid: true; value: SettingsUpdate }
@@ -111,13 +176,109 @@ export function buildSettingsUpdate(settings: PublicSettings):
   }
 
   for (const provider of settings.providers) {
+    const name = provider.name.trim()
+    if (name === '') {
+      return {
+        valid: false,
+        field: `provider:${provider.id}:name`,
+        message: '服务商名称不能为空'
+      }
+    }
+    if (name.length > PROVIDER_NAME_MAX) {
+      return {
+        valid: false,
+        field: `provider:${provider.id}:name`,
+        message: `服务商名称不能超过 ${PROVIDER_NAME_MAX} 个字符`
+      }
+    }
     const validation = validateOpenAiBaseUrl(provider.baseUrl.trim())
     if (!validation.valid) {
       return {
         valid: false,
         field: `provider:${provider.id}:baseUrl`,
-        message: `“${provider.name}”：${validation.reason}`
+        message: `“${name}”：${validation.reason}`
       }
+    }
+    if (provider.models.length > MAX_PROVIDER_MODELS) {
+      return {
+        valid: false,
+        field: `provider:${provider.id}:models`,
+        message: `“${name}”最多只能保留 ${MAX_PROVIDER_MODELS} 个模型，请先删除多余模型`
+      }
+    }
+    const seenModels = new Set<string>()
+    for (const model of provider.models) {
+      const modelId = model.id.trim()
+      const modelName = model.name.trim()
+      if (modelId === '') {
+        return {
+          valid: false,
+          field: `provider:${provider.id}:models`,
+          message: `“${name}”中存在模型 ID 为空的项，请删除或补全`
+        }
+      }
+      if (modelName === '') {
+        return {
+          valid: false,
+          field: `provider:${provider.id}:models`,
+          message: `“${name}”中的模型“${modelId}”缺少名称，请补全`
+        }
+      }
+      if (modelId.length > MODEL_FIELD_MAX || modelName.length > MODEL_FIELD_MAX) {
+        return {
+          valid: false,
+          field: `provider:${provider.id}:models`,
+          message: `模型 ID 与名称不能超过 ${MODEL_FIELD_MAX} 个字符`
+        }
+      }
+      if (seenModels.has(modelId)) {
+        return {
+          valid: false,
+          field: `provider:${provider.id}:models`,
+          message: `“${name}”中存在重复的模型 ID：${modelId}`
+        }
+      }
+      seenModels.add(modelId)
+    }
+  }
+
+  const seenCaptureRules = new Map<string, number>()
+  for (const [index, rule] of settings.selectionCapture.applications.entries()) {
+    const application = rule.application.trim()
+    if (application === '') {
+      return {
+        valid: false,
+        field: `captureRule:${index}`,
+        message: `第 ${index + 1} 条程序规则不能为空，请填写程序名或删除该条规则`
+      }
+    }
+    if (application.length > CAPTURE_RULE_MAX) {
+      return {
+        valid: false,
+        field: `captureRule:${index}`,
+        message: `第 ${index + 1} 条程序规则不能超过 ${CAPTURE_RULE_MAX} 个字符`
+      }
+    }
+    const key = application.replaceAll('/', '\\').toLowerCase()
+    const duplicateIndex = seenCaptureRules.get(key)
+    if (duplicateIndex !== undefined) {
+      return {
+        valid: false,
+        field: `captureRule:${index}`,
+        message: `第 ${index + 1} 条程序规则与第 ${duplicateIndex + 1} 条重复`
+      }
+    }
+    seenCaptureRules.set(key, index)
+  }
+
+  const oversizedFilterIndex = settings.filter.applications.findIndex(
+    (application) => application.trim().length > CAPTURE_RULE_MAX
+  )
+  if (oversizedFilterIndex >= 0) {
+    return {
+      valid: false,
+      field: 'filter',
+      message: `应用过滤列表第 ${oversizedFilterIndex + 1} 项不能超过 ${CAPTURE_RULE_MAX} 个字符`
     }
   }
 
@@ -238,11 +399,25 @@ export function buildSettingsUpdate(settings: PublicSettings):
     }))
   })
   if (!fullSettings.success) {
-    return { valid: false, message: fullSettings.error.issues[0]?.message ?? '设置内容无效' }
+    // Zod messages are diagnostics, not user copy: keep them in the console
+    // and show a Chinese message that points at the offending control.
+    console.warn('[settings] 设置内容未通过结构化校验', fullSettings.error.issues)
+    const issue = fullSettings.error.issues[0]
+    return {
+      valid: false,
+      field: issue ? fieldForIssuePath(issue.path, settings.providers, actions) : undefined,
+      message: '设置内容不符合保存要求，请检查标出的字段'
+    }
   }
   const parsed = settingsUpdateSchema.safeParse(candidate)
   if (!parsed.success) {
-    return { valid: false, message: parsed.error.issues[0]?.message ?? '设置内容无效' }
+    console.warn('[settings] 设置更新未通过结构化校验', parsed.error.issues)
+    const issue = parsed.error.issues[0]
+    return {
+      valid: false,
+      field: issue ? fieldForIssuePath(issue.path, settings.providers, actions) : undefined,
+      message: '设置内容不符合保存要求，请检查标出的字段'
+    }
   }
   return { valid: true, value: parsed.data }
 }

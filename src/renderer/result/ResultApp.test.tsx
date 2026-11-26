@@ -361,6 +361,38 @@ describe('ResultApp window interactions', () => {
     await act(async () => pending.resolve({ accepted: true }))
   })
 
+  it('keeps retry disabled for a non-retryable error until settings change', async () => {
+    const { api, emitSettings } = await renderResult(resultSnapshot({
+      status: 'error',
+      content: '',
+      contentScalarCount: 0,
+      errorMessage: 'API Key 无效',
+      retryable: false
+    }))
+    const retry = screen.getByRole('button', { name: '重试' })
+    expect(retry).toBeDisabled()
+    expect(retry).toHaveAttribute('title', '使用相同选区重新生成')
+
+    act(() => emitSettings(settingsWithFontSize(20)))
+
+    await waitFor(() => expect(retry).not.toBeDisabled())
+    expect(retry).toHaveAttribute('title', '设置已更改，可重新发起')
+    fireEvent.click(retry)
+    await waitFor(() => expect(api.retryAction).toHaveBeenCalledWith('session-1', undefined))
+  })
+
+  it('consumes the backend retryable flag for authentication and rate-limit errors', async () => {
+    await renderResult(resultSnapshot({
+      status: 'error',
+      content: '',
+      contentScalarCount: 0,
+      errorMessage: '请求过于频繁',
+      retryable: true
+    }))
+
+    expect(screen.getByRole('button', { name: '重试' })).not.toBeDisabled()
+  })
+
   it('exposes all eight native resize directions in Windows WebView2', async () => {
     const userAgent = vi
       .spyOn(window.navigator, 'userAgent', 'get')
