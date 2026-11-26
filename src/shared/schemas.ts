@@ -527,7 +527,13 @@ export const applicationCloseBehaviorSchema = z.enum(['hide-to-tray', 'quit'])
 export type ApplicationCloseBehavior = z.infer<typeof applicationCloseBehaviorSchema>
 
 export const applicationSettingsSchema = z
-  .object({ closeBehavior: applicationCloseBehaviorSchema })
+  .object({
+    closeBehavior: applicationCloseBehaviorSchema,
+    // Missing means "written before this existed", i.e. an upgrade: leave the
+    // startup entry alone instead of adding one. `DEFAULT_APP_SETTINGS` is what
+    // gives a fresh install `true`.
+    launchAtLogin: z.boolean().default(false)
+  })
   .strict()
 export type ApplicationSettings = z.infer<typeof applicationSettingsSchema>
 

@@ -2808,6 +2808,7 @@ mod tests {
             .update(SettingsUpdate {
                 application: Some(crate::models::ApplicationSettings {
                     close_behavior: crate::models::ApplicationCloseBehavior::Quit,
+                    launch_at_login: true,
                 }),
                 ..Default::default()
             })

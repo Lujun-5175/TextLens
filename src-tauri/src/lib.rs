@@ -1,4 +1,5 @@
 pub mod actions;
+mod autostart;
 mod clipboard;
 mod language_detection;
 mod local_secrets;
@@ -71,6 +72,13 @@ pub fn run() {
             let settings = Arc::new(SettingsRepository::new_with_legacy_migration_deferred(
                 settings_path,
             )?);
+            autostart::reconcile(
+                settings.get_settings().application.launch_at_login,
+                &std::env::current_exe()
+                    .map(|path| path.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+            )
+            .ok();
             let actions = ActionService::new(settings.clone())?;
             let mut monitor = SelectionMonitor::new(&app.config().identifier)?;
             let receiver = monitor

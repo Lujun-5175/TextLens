@@ -2607,6 +2607,22 @@ fn quit_application(app: &AppHandle) {
     app.exit(0);
 }
 
+/// Keeps the startup entry in step with the saved setting.
+///
+/// A failure is logged instead of failing the save: the stored setting still
+/// expresses the user's intent and the next launch reconciles again.
+fn reconcile_autostart(settings: &PublicSettings) {
+    let Ok(executable) = std::env::current_exe() else {
+        return;
+    };
+    if let Err(error) = crate::autostart::reconcile(
+        settings.application.launch_at_login,
+        &executable.to_string_lossy(),
+    ) {
+        eprintln!("failed to reconcile launch-at-login: {error}");
+    }
+}
+
 /// Tray quit must not silently discard edits held by the hidden settings window.
 ///
 /// The renderer reports its dirty state, so quitting with unsaved edits opens
@@ -2892,6 +2908,7 @@ pub async fn update_settings(
             return Err(error);
         }
     };
+    reconcile_autostart(&public);
     broadcast_settings_changed(&app, &public).await?;
     Ok(public)
 }

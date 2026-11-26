@@ -30,14 +30,16 @@ describe('settings form helpers', () => {
     }
   })
 
-  it('includes the Windows close behavior in ordinary settings updates', () => {
+  it('includes the Windows close behavior and startup preference in ordinary settings updates', () => {
     const result = buildSettingsUpdate({
       ...DEFAULT_PUBLIC_SETTINGS,
-      application: { closeBehavior: 'quit' }
+      application: { closeBehavior: 'quit', launchAtLogin: false }
     })
 
     expect(result.valid).toBe(true)
-    if (result.valid) expect(result.value.application).toEqual({ closeBehavior: 'quit' })
+    if (result.valid) {
+      expect(result.value.application).toEqual({ closeBehavior: 'quit', launchAtLogin: false })
+    }
   })
 
   it('includes the appearance theme in ordinary settings updates', () => {

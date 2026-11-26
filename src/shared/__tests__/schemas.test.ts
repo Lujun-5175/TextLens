@@ -39,7 +39,10 @@ describe('settings schemas and defaults', () => {
     expect(DEFAULT_APP_SETTINGS.actions.find((action) => action.kind === 'search')).toMatchObject({
       searchEngineId: 'google'
     })
-    expect(DEFAULT_APP_SETTINGS.application).toEqual({ closeBehavior: 'hide-to-tray' })
+    expect(DEFAULT_APP_SETTINGS.application).toEqual({
+      closeBehavior: 'hide-to-tray',
+      launchAtLogin: true
+    })
     expect(DEFAULT_APP_SETTINGS.selectionCapture.defaultStrategy).toBe('selection-hook')
     expect(DEFAULT_APP_SETTINGS.selectionCapture.applications).toContainEqual({
       application: 'acrobat.exe',
@@ -716,15 +719,18 @@ Return only the translated content. Do not include explanations, labels, tags, o
     const { application: _legacyApplication, ...legacyApp } = DEFAULT_APP_SETTINGS
     const { application: _legacyPublicApplication, ...legacyPublic } = DEFAULT_PUBLIC_SETTINGS
 
+    // A legacy file must not gain a startup entry: missing means off.
     expect(migrateAppSettings({ ...legacyApp, version: 5 }).application).toEqual({
-      closeBehavior: 'hide-to-tray'
+      closeBehavior: 'hide-to-tray',
+      launchAtLogin: false
     })
     expect(migratePublicSettings({ ...legacyPublic, version: 5 }).application).toEqual({
-      closeBehavior: 'hide-to-tray'
+      closeBehavior: 'hide-to-tray',
+      launchAtLogin: false
     })
     expect(migrateAppSettings({
       ...DEFAULT_APP_SETTINGS,
-      application: { closeBehavior: 'quit' }
+      application: { closeBehavior: 'quit', launchAtLogin: false }
     }).application.closeBehavior).toBe('quit')
   })
 

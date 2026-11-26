@@ -1586,6 +1586,7 @@ export function SettingsApp(): JSX.Element {
                         onChange={(event) => changeDraft((current) => ({
                           ...current,
                           application: {
+                            ...current.application,
                             closeBehavior: event.target.value as PublicSettings['application']['closeBehavior']
                           }
                         }))}
@@ -1594,6 +1595,17 @@ export function SettingsApp(): JSX.Element {
                         <option value="quit">退出 TextLens</option>
                       </select>
                     </div>
+                  )}
+                  {accessibility?.platform === 'windows' && (
+                    <SettingSwitch
+                      title="登录时自动启动"
+                      description="登录 Windows 后自动运行并常驻通知区域，否则需要手动打开 TextLens。"
+                      checked={draft.application.launchAtLogin}
+                      onChange={(launchAtLogin) => changeDraft((current) => ({
+                        ...current,
+                        application: { ...current.application, launchAtLogin }
+                      }))}
+                    />
                   )}
                 </div>
                 <div className="settings-card settings-card--rows">

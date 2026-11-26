@@ -251,7 +251,10 @@ describe('SettingsApp provider deletion', () => {
     fireEvent.click(screen.getByRole('button', { name: '保存设置' }))
 
     await waitFor(() => expect(updateSettings).toHaveBeenCalledTimes(1))
-    expect(updateSettings.mock.calls[0]?.[0].application).toEqual({ closeBehavior: 'quit' })
+    expect(updateSettings.mock.calls[0]?.[0].application).toEqual({
+      closeBehavior: 'quit',
+      launchAtLogin: true
+    })
 
     expect(screen.queryByRole('button', { name: '退出 TextLens' })).not.toBeInTheDocument()
   })

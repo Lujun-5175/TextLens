@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
-pub const SETTINGS_VERSION: u8 = 13;
+pub const SETTINGS_VERSION: u8 = 14;
 pub const TEXT_PLACEHOLDER: &str = "{{text}}";
 pub const OUTPUT_LANGUAGE_PLACEHOLDER: &str = "{{language}}";
 pub const TARGET_LANGUAGE_PLACEHOLDER: &str = "{{target_language}}";
@@ -275,11 +275,27 @@ impl Default for ApplicationCloseBehavior {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ApplicationSettings {
     #[serde(default)]
     pub close_behavior: ApplicationCloseBehavior,
+    /// Whether the app should start with the user session.
+    ///
+    /// `serde(default)` yields `false` for a settings file written before this
+    /// field existed, so an upgrade never adds a startup entry behind the
+    /// user's back; a fresh install gets `true` from the manual `Default`.
+    #[serde(default)]
+    pub launch_at_login: bool,
+}
+
+impl Default for ApplicationSettings {
+    fn default() -> Self {
+        Self {
+            close_behavior: ApplicationCloseBehavior::HideToTray,
+            launch_at_login: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -1661,6 +1677,23 @@ fn valid_shortcut(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// Fresh installs start with the app, upgrades keep whatever the user had.
+    #[test]
+    fn launch_at_login_is_on_for_new_installs_and_off_for_upgrades() {
+        assert!(ApplicationSettings::default().launch_at_login);
+
+        // A file written before this field existed must deserialize to `false`
+        // so an upgrade never adds a startup entry behind the user's back.
+        let legacy: ApplicationSettings =
+            serde_json::from_str(r#"{"closeBehavior":"hide-to-tray"}"#).unwrap();
+        assert!(!legacy.launch_at_login);
+
+        let opted_in: ApplicationSettings =
+            serde_json::from_str(r#"{"closeBehavior":"quit","launchAtLogin":true}"#).unwrap();
+        assert!(opted_in.launch_at_login);
+        assert_eq!(opted_in.close_behavior, ApplicationCloseBehavior::Quit);
+    }
+
     use super::*;
 
     #[test]

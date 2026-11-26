@@ -136,7 +136,8 @@ export const DEFAULT_TRIGGER_SETTINGS = {
 } as const
 
 export const DEFAULT_APPLICATION_SETTINGS = {
-  closeBehavior: 'hide-to-tray'
+  closeBehavior: 'hide-to-tray',
+  launchAtLogin: true
 } as const
 
 export const DEFAULT_FILTER_SETTINGS = {

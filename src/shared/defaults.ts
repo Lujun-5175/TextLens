@@ -377,7 +377,7 @@ function migrateV2Candidate(candidate: UnknownRecord): UnknownRecord {
       : DEFAULT_RESULT_SETTINGS.fontSize
   return migratePromptDefaultsCandidate({
     ...candidate,
-    application: candidate.application ?? DEFAULT_APPLICATION_SETTINGS,
+    application: candidate.application ?? LEGACY_APPLICATION_SETTINGS,
     result: {
       ...DEFAULT_RESULT_SETTINGS,
       ...result,
@@ -390,10 +390,16 @@ function migrateV2Candidate(candidate: UnknownRecord): UnknownRecord {
   })
 }
 
+/**
+ * Fallback for files written before the startup preference existed. Migrating
+ * must not add a startup entry, so this differs from the fresh-install default.
+ */
+const LEGACY_APPLICATION_SETTINGS = { ...DEFAULT_APPLICATION_SETTINGS, launchAtLogin: false }
+
 function migrateV3ToV5Candidate(candidate: UnknownRecord): UnknownRecord {
   return migratePromptDefaultsCandidate({
     ...candidate,
-    application: candidate.application ?? DEFAULT_APPLICATION_SETTINGS
+    application: candidate.application ?? LEGACY_APPLICATION_SETTINGS
   })
 }
 
