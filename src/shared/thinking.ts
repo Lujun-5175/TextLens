@@ -44,7 +44,9 @@ export const THINKING_LEVEL_LABELS: Record<ThinkingLevel, string> = {
 const STANDARD_THREE: ThinkingLevel[] = ['low', 'medium', 'high']
 const OPENAI_FULL: ThinkingLevel[] = ['minimal', 'low', 'medium', 'high', 'xhigh']
 // DeepSeek V4 exposes low/high/max rather than the OpenAI middle gear.
-const DEEPSEEK_V4_LEVELS: ThinkingLevel[] = ['low', 'high', 'xhigh']
+// DeepSeek V4 accepts exactly none/low/high/max; `none` is the off position,
+// so the gear list is the three integer steps.
+const DEEPSEEK_V4_LEVELS: ThinkingLevel[] = ['low', 'high', 'max']
 
 type ThinkingFamily =
   | 'oSeries'
@@ -161,6 +163,13 @@ function detectOpenAiFamily(id: string): ThinkingFamily | null {
   if (deepSeek && deepSeek[0] >= 4) return 'deepseekMax'
   if (id.includes('deepseek') && (id.includes('r1') || id.includes('reasoner'))) {
     return 'deepseekReasoner'
+  }
+  // Official ids carry no version number (`deepseek-flash`), so they never
+  // match familyVersion. Flash reasons by default on the low/high/max gears.
+  // The version guard keeps dated ids such as `deepseek-v3.2-flash` on their
+  // own family.
+  if (id.includes('deepseek') && id.includes('flash') && !familyVersion(id, 'deepseek')) {
+    return 'deepseekMax'
   }
   if (isReasoningQwen(id)) return 'qwen'
   if (isReasoningGlm(id)) return 'glm'

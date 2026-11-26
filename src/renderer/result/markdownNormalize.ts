@@ -36,18 +36,195 @@ function expandCollapsedBulletList(line: string): string {
   return '- ' + line.replace(/^[ \t]*[•·●○]\s+/u, '').replace(INLINE_BULLET_BOUNDARY, '\n- ')
 }
 
-type LineKind = 'blank' | 'list' | 'table' | 'heading' | 'quote' | 'hr' | 'fence' | 'prose'
+type LineKind = 'blank' | 'list' | 'table' | 'heading' | 'quote' | 'hr' | 'fence' | 'math' | 'prose'
+
+const INLINE_CODE = /(`+)[^`]*?\1/gu
+const LATEX_INLINE = /\\\(([^\n]*?)\\\)/gu
+const LATEX_COMMAND = /\\[a-z]{2,}/u
+const BARE_PAREN = /\(([^()\n]{1,200})\)/gu
+
+/** Ranges covered by inline code so rewrites never touch code samples. */
+function inlineCodeSpans(line: string): Array<[number, number]> {
+  const spans: Array<[number, number]> = []
+  for (const match of line.matchAll(INLINE_CODE)) {
+    spans.push([match.index, match.index + match[0].length])
+  }
+  return spans
+}
+
+function mapOutsideInlineCode(line: string, map: (segment: string) => string): string {
+  const spans = inlineCodeSpans(line)
+  if (spans.length === 0) return map(line)
+  let result = ''
+  let cursor = 0
+  for (const [start, end] of spans) {
+    result += map(line.slice(cursor, start))
+    result += line.slice(start, end)
+    cursor = end
+  }
+  return result + map(line.slice(cursor))
+}
+
+function indexOutsideInlineCode(line: string, needle: string, from = 0): number {
+  const spans = inlineCodeSpans(line)
+  let index = line.indexOf(needle, from)
+  while (index !== -1) {
+    if (!spans.some(([start, end]) => index >= start && index < end)) return index
+    index = line.indexOf(needle, index + 1)
+  }
+  return -1
+}
+
+/**
+ * Map LaTeX's own math delimiters onto the `$` forms remark-math understands.
+ *
+ * Models routinely emit `\[ ... \]` / `\( ... \)`, which CommonMark would
+ * escape into literal brackets. Fenced code and inline code keep their literal
+ * content so LaTeX sources shown as code stay intact.
+ */
+export function normalizeLatexDelimiters(source: string): string {
+  if (!source || !source.includes('\\')) return source
+  const out: string[] = []
+  let fenceChar: string | null = null
+  let fenceLength = 0
+  let display: string[] | null = null
+
+  const flushDisplay = (): void => {
+    if (display === null) return
+    // Blank lines inside a display formula only add noise for KaTeX.
+    const body = display.filter((line) => line.trim() !== '')
+    out.push('$$')
+    for (const line of body) out.push(line)
+    out.push('$$')
+    display = null
+  }
+
+  for (const raw of source.replace(/\r\n?/gu, '\n').split('\n')) {
+    if (fenceChar !== null) {
+      out.push(raw)
+      if (isMatchingFenceClose(raw, fenceChar, fenceLength)) fenceChar = null
+      continue
+    }
+    const fenceMatch = raw.match(FENCE_MARKER)
+    if (fenceMatch && !(fenceMatch[1]![0] === '`' && fenceMatch[2]!.includes('`'))) {
+      flushDisplay()
+      fenceChar = fenceMatch[1]![0]!
+      fenceLength = fenceMatch[1]!.length
+      out.push(raw)
+      continue
+    }
+
+    if (display !== null) {
+      const closed = indexOutsideInlineCode(raw, '\\]')
+      if (closed === -1) {
+        display.push(raw)
+        continue
+      }
+      display.push(raw.slice(0, closed))
+      flushDisplay()
+      const rest = rewriteInlineLine(raw.slice(closed + 2))
+      if (rest.length > 0) out.push(rest)
+      continue
+    }
+
+    const open = indexOutsideInlineCode(raw, '\\[')
+    if (open === -1) {
+      out.push(rewriteInlineLine(raw))
+      continue
+    }
+    const head = rewriteInlineLine(raw.slice(0, open))
+    if (head.length > 0) out.push(head)
+    const close = indexOutsideInlineCode(raw, '\\]', open + 2)
+    if (close === -1) {
+      const seed = rewriteInlineLine(raw.slice(open + 2))
+      display = seed.length > 0 ? [seed] : []
+    } else {
+      const body = rewriteInlineLine(raw.slice(open + 2, close)).trim()
+      if (body.length > 0) out.push(`$$${body}$$`)
+      const tail = rewriteInlineLine(raw.slice(close + 2))
+      if (tail.length > 0) out.push(tail)
+    }
+  }
+
+  // Unterminated opener: keep the original text instead of eating the rest.
+  if (display !== null) {
+    out.push('\\[')
+    for (const line of display) out.push(line)
+  }
+  return out.join('\n')
+}
+
+/** Apply every inline rewrite outside inline code spans. */
+function rewriteInlineLine(line: string): string {
+  return wrapBareParenMath(rewriteInlineMath(line))
+}
+
+/** Rewrite `\( ... \)` outside inline code spans. */
+function rewriteInlineMath(line: string): string {
+  if (!line.includes('\\(')) return line
+  return mapOutsideInlineCode(line, (segment) =>
+    segment.replace(LATEX_INLINE, (_all, body: string) => {
+      const trimmed = body.trim()
+      return trimmed.length > 0 ? `$${trimmed}$` : '$$'
+    })
+  )
+}
+
+/**
+ * Models often write inline formulas as a bare parenthesised run, e.g.
+ * `(Y=\beta_0+\beta_1X)`. Wrap those in `$...$` so KaTeX renders them.
+ *
+ * Deliberately narrow: the body must contain a real LaTeX command, stay on one
+ * line, sit outside inline code and outside existing math. Multi-line or
+ * already-correct output is never rewritten.
+ */
+export function wrapBareParenMath(line: string): string {
+  if (!line.includes('\\')) return line
+  return mapOutsideInlineCode(line, (segment) =>
+    mapOutsideDollarMath(segment, (text) =>
+      text.replace(BARE_PAREN, (all, body: string) =>
+        // Keep the parentheses inside the formula: `(a+b)` is content, not
+        // grouping for the delimiters.
+        LATEX_COMMAND.test(body) && !body.includes('$') ? `$${all}$` : all
+      )
+    )
+  )
+}
+
+/** Apply `map` only to runs outside `$...$` / `$$...$$`. */
+function mapOutsideDollarMath(line: string, map: (text: string) => string): string {
+  let result = ''
+  let cursor = 0
+  let index = 0
+  while (index < line.length) {
+    if (line[index] !== '$') {
+      index += 1
+      continue
+    }
+    let run = 0
+    while (line[index + run] === '$') run += 1
+    const fence = '$'.repeat(run)
+    const close = line.indexOf(fence, index + run)
+    if (close === -1) break
+    result += map(line.slice(cursor, index))
+    result += line.slice(index, close + run)
+    cursor = close + run
+    index = cursor
+  }
+  return result + map(line.slice(cursor))
+}
 
 export function normalizeMarkdownSource(source: string): string {
   if (!source) return source
 
   // The transport has already decoded JSON. Literal escapes are content,
   // especially inside code, regular expressions and Windows paths.
-  const text = source.replace(/\r\n?/gu, '\n')
+  const text = normalizeLatexDelimiters(source).replace(/\r\n?/gu, '\n')
   const lines = text.split('\n')
   const out: string[] = []
   let fenceChar: string | null = null
   let fenceLength = 0
+  let mathBlock = false
   let previousKind: LineKind = 'blank'
   let previousLine = ''
 
@@ -85,6 +262,24 @@ export function normalizeMarkdownSource(source: string): string {
 
     if (raw.trim().length === 0) {
       emitBlank()
+      continue
+    }
+
+    // A `$$` block is a single unit: never insert paragraph breaks, list
+    // rewrites or bullet expansion inside it.
+    if (raw.trim() === '$$') {
+      if (mathBlock) {
+        emitLine(raw, 'math')
+        mathBlock = false
+        continue
+      }
+      if (previousKind !== 'blank') emitBlank()
+      emitLine(raw, 'math')
+      mathBlock = true
+      continue
+    }
+    if (mathBlock) {
+      emitLine(raw, 'math')
       continue
     }
 

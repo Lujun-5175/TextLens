@@ -55,13 +55,23 @@ describe('inferThinkingLevels', () => {
     expect(inferThinkingLevels('deepseek-ai/deepseek-v4.1-flash-1017')).toEqual([
       'low',
       'high',
-      'xhigh'
+      'max'
     ])
     expect(inferredThinkingCapability('deepseek-ai/deepseek-v4.1-flash-1017')).toMatchObject({
       source: 'heuristic',
       dialect: 'reasoningEffortMax',
       supportsOff: true
     })
+    // Official ids carry no version number, so they never match familyVersion.
+    expect(inferThinkingLevels('deepseek-flash')).toEqual(['low', 'high', 'max'])
+    expect(inferredThinkingCapability('deepseek-flash', 'openAiResponses')).toMatchObject({
+      source: 'heuristic',
+      dialect: 'reasoningEffortMax',
+      supportsOff: true
+    })
+    expect(inferThinkingLevels('deepseek-chat')).toEqual([])
+    // A dated v3 flash id must keep the v3 toggle dialect, not V4 gears.
+    expect(inferThinkingLevels('deepseek-v3.2-flash')).toEqual(['medium'])
   })
 
   it('detects Anthropic and Gemini families under native and gateway protocols', () => {

@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 
 import { convertListMarkers, normalizeMarkdownSource } from './markdownNormalize'
+import { contentLooksLikeMath } from './markdownPolicy'
 
 describe('convertListMarkers', () => {
   it('maps Chinese ordered markers to GFM ordered lists', () => {
@@ -97,5 +98,76 @@ describe('normalizeMarkdownSource', () => {
   it('is a pure no-op for already-clean Markdown', () => {
     const input = ['# 标题', '', '段落一。', '', '- a', '- b', '', '段落二。'].join('\n')
     expect(normalizeMarkdownSource(input)).toBe(input)
+  })
+})
+
+describe('LaTeX delimiters', () => {
+  it('turns a multi-line bracket formula into a display block', () => {
+    const input = [
+      '样本 OLS 斜率可以写成：',
+      '',
+      String.raw`\[\hat\alpha_1`,
+      String.raw`\frac{\sum_i (X_i-\bar X)(Y_i-\bar Y)} {\sum_i (X_i-\bar X)^2} \]`,
+      '',
+      '由大数定律和连续映射。'
+    ].join('\n')
+    const out = normalizeMarkdownSource(input)
+    expect(out).toContain('$$')
+    expect(out).toContain(String.raw`\hat\alpha_1`)
+    expect(out).not.toContain(String.raw`\[`)
+    expect(out).not.toContain(String.raw`\]`)
+    expect(contentLooksLikeMath(out)).toBe(true)
+  })
+
+  it('keeps the formula body intact and never inserts blank lines inside it', () => {
+    const out = normalizeMarkdownSource(String.raw`\[
+a = b.
+
+c = d
+\]`)
+    expect(out).toBe('$$\na = b.\nc = d\n$$')
+  })
+
+  it('converts single-line display and inline delimiters', () => {
+    expect(normalizeMarkdownSource(String.raw`\[x=1\]`)).toBe('$$x=1$$')
+    expect(normalizeMarkdownSource(String.raw`其中 \(\alpha=0.05\) 显著`)).toBe(
+      String.raw`其中 $\alpha=0.05$ 显著`
+    )
+  })
+
+  it('leaves fenced and inline code untouched', () => {
+    const fenced = ['```tex', String.raw`\[x=1\]`, String.raw`\(y\)`, '```'].join('\n')
+    expect(normalizeMarkdownSource(fenced)).toBe(fenced)
+    expect(normalizeMarkdownSource(String.raw`用 ` + '`' + String.raw`\[x\]` + '`' + ' 表示显示公式')).toBe(
+      String.raw`用 ` + '`' + String.raw`\[x\]` + '`' + ' 表示显示公式'
+    )
+  })
+
+  it('keeps an unterminated opener instead of swallowing the rest', () => {
+    const out = normalizeMarkdownSource(String.raw`\[x=1`)
+    expect(out).toContain(String.raw`\[`)
+    expect(out).toContain('x=1')
+  })
+
+  it('wraps bare parenthesised formulas that contain a LaTeX command', () => {
+    expect(normalizeMarkdownSource(String.raw`代入 (Y=\beta_0+\beta_1X) 得`)).toBe(
+      String.raw`代入 $(Y=\beta_0+\beta_1X)$ 得`
+    )
+    expect(normalizeMarkdownSource(String.raw`特别有 (E[\varepsilon\mid X,Z]=0)。于是`)).toBe(
+      String.raw`特别有 $(E[\varepsilon\mid X,Z]=0)$。于是`
+    )
+  })
+
+  it('leaves ordinary parentheses and existing math alone', () => {
+    expect(normalizeMarkdownSource('这是（中文括号）和 (a+b) 的普通用法')).toBe(
+      '这是（中文括号）和 (a+b) 的普通用法'
+    )
+    expect(normalizeMarkdownSource(String.raw`已有 $\frac{(a)}{b}$ 公式`)).toBe(
+      String.raw`已有 $\frac{(a)}{b}$ 公式`
+    )
+    // Non-letter commands (paths, regex) must not trigger wrapping.
+    expect(normalizeMarkdownSource(String.raw`路径 (C:\Users) 与正则 (\.\d+)`)).toBe(
+      String.raw`路径 (C:\Users) 与正则 (\.\d+)`
+    )
   })
 })

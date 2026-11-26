@@ -404,6 +404,60 @@ mod tests {
         }
     }
 
+    /// The full `获取模型 -> 档位出现` path: a DeepSeek-shaped `/models`
+    /// payload must land the vendor gears on the stored model, not just on the
+    /// intermediate capability probe.
+    #[test]
+    fn deepseek_models_payload_populates_stored_thinking_levels() {
+        let payload = serde_json::json!({
+            "object": "list",
+            "data": [
+                {
+                    "id": "deepseek-flash",
+                    "object": "model",
+                    "owned_by": "deepseek",
+                    "effort": {"supported_levels": ["low", "high", "max"], "default_level": "high"}
+                },
+                {
+                    "id": "deepseek-v4-pro",
+                    "object": "model",
+                    "owned_by": "deepseek"
+                }
+            ]
+        });
+        for protocol in [
+            ProviderProtocol::OpenAiChat,
+            ProviderProtocol::OpenAiResponses,
+        ] {
+            let models = parse_models(protocol, &payload).unwrap();
+            let flash = models
+                .iter()
+                .find(|model| model.id == "deepseek-flash")
+                .unwrap();
+            assert_eq!(
+                flash.thinking_levels,
+                vec![
+                    crate::models::ThinkingLevel::Low,
+                    crate::models::ThinkingLevel::High,
+                    crate::models::ThinkingLevel::Max
+                ],
+                "{protocol:?}"
+            );
+            assert_eq!(
+                flash.thinking_capability.as_ref().unwrap().dialect,
+                Some(crate::models::ThinkingDialect::ReasoningEffortMax),
+                "{protocol:?}"
+            );
+            assert!(flash.thinking_capability.as_ref().unwrap().supports_off);
+            // The heuristic still covers a model listed without metadata.
+            let pro = models
+                .iter()
+                .find(|model| model.id == "deepseek-v4-pro")
+                .unwrap();
+            assert_eq!(pro.thinking_levels.len(), 3, "{protocol:?}");
+        }
+    }
+
     #[test]
     fn endpoints_follow_each_protocol() {
         assert_eq!(

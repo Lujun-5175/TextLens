@@ -55,11 +55,75 @@
     "levels": [
       "low",
       "high",
-      "xhigh"
+      "max"
     ],
     "dialect": "reasoningEffortMax",
     "supportsOff": true,
-    "mode": "xhigh",
+    "mode": "max",
+    "fields": {
+      "/reasoning_effort": "max"
+    }
+  },
+  {
+    "modelId": "deepseek-flash",
+    "protocol": "openAiChat",
+    "baseUrl": "https://api.deepseek.com/v1",
+    "levels": [
+      "low",
+      "high",
+      "max"
+    ],
+    "dialect": "reasoningEffortMax",
+    "supportsOff": true,
+    "mode": "off",
+    "fields": {
+      "/reasoning_effort": "none"
+    }
+  },
+  {
+    "modelId": "deepseek-flash",
+    "protocol": "openAiChat",
+    "baseUrl": "https://api.deepseek.com/v1",
+    "levels": [
+      "low",
+      "high",
+      "max"
+    ],
+    "dialect": "reasoningEffortMax",
+    "supportsOff": true,
+    "mode": "low",
+    "fields": {
+      "/reasoning_effort": "low"
+    }
+  },
+  {
+    "modelId": "deepseek-flash",
+    "protocol": "openAiChat",
+    "baseUrl": "https://api.deepseek.com/v1",
+    "levels": [
+      "low",
+      "high",
+      "max"
+    ],
+    "dialect": "reasoningEffortMax",
+    "supportsOff": true,
+    "mode": "high",
+    "fields": {
+      "/reasoning_effort": "high"
+    }
+  },
+  {
+    "modelId": "deepseek-flash",
+    "protocol": "openAiChat",
+    "baseUrl": "https://api.deepseek.com/v1",
+    "levels": [
+      "low",
+      "high",
+      "max"
+    ],
+    "dialect": "reasoningEffortMax",
+    "supportsOff": true,
+    "mode": "max",
     "fields": {
       "/reasoning_effort": "max"
     }
@@ -120,13 +184,82 @@
     "levels": [
       "low",
       "high",
-      "xhigh"
+      "max"
     ],
     "dialect": "reasoningEffortMax",
     "supportsOff": true,
-    "mode": "xhigh",
+    "mode": "max",
     "fields": {
-      "/reasoning/effort": "max"
+      "/reasoning/effort": "max",
+      "/reasoning/summary": null
+    }
+  },
+  {
+    "modelId": "deepseek-flash",
+    "protocol": "openAiResponses",
+    "baseUrl": "https://api.deepseek.com/v1",
+    "levels": [
+      "low",
+      "high",
+      "max"
+    ],
+    "dialect": "reasoningEffortMax",
+    "supportsOff": true,
+    "mode": "off",
+    "fields": {
+      "/reasoning/effort": "none",
+      "/reasoning/summary": null
+    }
+  },
+  {
+    "modelId": "deepseek-flash",
+    "protocol": "openAiResponses",
+    "baseUrl": "https://api.deepseek.com/v1",
+    "levels": [
+      "low",
+      "high",
+      "max"
+    ],
+    "dialect": "reasoningEffortMax",
+    "supportsOff": true,
+    "mode": "low",
+    "fields": {
+      "/reasoning/effort": "low",
+      "/reasoning/summary": null
+    }
+  },
+  {
+    "modelId": "deepseek-flash",
+    "protocol": "openAiResponses",
+    "baseUrl": "https://api.deepseek.com/v1",
+    "levels": [
+      "low",
+      "high",
+      "max"
+    ],
+    "dialect": "reasoningEffortMax",
+    "supportsOff": true,
+    "mode": "high",
+    "fields": {
+      "/reasoning/effort": "high",
+      "/reasoning/summary": null
+    }
+  },
+  {
+    "modelId": "deepseek-flash",
+    "protocol": "openAiResponses",
+    "baseUrl": "https://api.deepseek.com/v1",
+    "levels": [
+      "low",
+      "high",
+      "max"
+    ],
+    "dialect": "reasoningEffortMax",
+    "supportsOff": true,
+    "mode": "max",
+    "fields": {
+      "/reasoning/effort": "max",
+      "/reasoning/summary": null
     }
   },
   {

@@ -23,6 +23,10 @@ const REHYPE_KATEX: NonNullable<React.ComponentProps<typeof ReactMarkdown>['rehy
   {
     output: 'htmlAndMathml',
     strict: 'ignore',
+    // A malformed formula must degrade to visible source, not throw and blank
+    // the whole answer while streaming.
+    throwOnError: false,
+    errorColor: '#f87171',
     trust: false,
     maxSize: 20,
     maxExpand: 1_000

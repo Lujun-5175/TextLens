@@ -142,13 +142,28 @@ pub fn extract_thinking_capability_from_api_item(
     let root_options = item
         .get("reasoning_effort_options")
         .or_else(|| item.get("supported_reasoning_efforts"));
+    // DeepSeek publishes the accepted gear set as `effort.supported_levels`
+    // instead of OpenAI's `supported_parameters`.
+    let effort_options = item
+        .pointer("/effort/supported_levels")
+        .and_then(Value::as_array);
     let has_support_flag = has_explicit_support_flag(item);
     if supported_parameters.is_none()
         && nested_options.is_none()
         && root_options.is_none()
+        && effort_options.is_none()
         && !has_support_flag
     {
         return None;
+    }
+
+    // The vendor list is authoritative when no richer parameter metadata is
+    // present: it is the gear set the endpoint accepts, so do not fall through
+    // to name heuristics.
+    if supported_parameters.is_none() && nested_options.is_none() && root_options.is_none() {
+        if let Some(options) = effort_options {
+            return Some(effort_metadata_capability(options));
+        }
     }
 
     let parameters = supported_parameters
@@ -249,6 +264,48 @@ pub fn extract_thinking_capability_from_api_item(
             supports_off,
         },
     })
+}
+
+/// Build a capability from DeepSeek's `effort.supported_levels` metadata.
+///
+/// The listed gears are exactly the accepted `reasoning_effort` values.  A
+/// reduced set without OpenAI's middle gears keeps the vendor's own mapping
+/// (`low`/`high`/`max`); anything else falls back to the standard mapping.
+///
+/// The vendor excludes `none` from `supported_levels` but documents
+/// `reasoning_effort: "none"` as the explicit off switch, so a listed gear set
+/// always carries an off position.
+fn effort_metadata_capability(options: &[Value]) -> DetectedThinkingCapability {
+    let mut levels = Vec::new();
+    for raw in options.iter().filter_map(Value::as_str) {
+        let normalized = raw.trim().to_ascii_lowercase();
+        if normalized == "none" {
+            continue;
+        }
+        if let Some(level) = parse_level_str(&normalized) {
+            if !levels.contains(&level) {
+                levels.push(level);
+            }
+        }
+    }
+    let keeps_openai_gears = levels.iter().any(|level| {
+        matches!(
+            level,
+            ThinkingLevel::Minimal | ThinkingLevel::Medium | ThinkingLevel::Xhigh
+        )
+    });
+    DetectedThinkingCapability {
+        capability: ThinkingCapability {
+            source: ThinkingCapabilitySource::Explicit,
+            dialect: (!levels.is_empty()).then_some(if keeps_openai_gears {
+                ThinkingDialect::ReasoningEffort
+            } else {
+                ThinkingDialect::ReasoningEffortMax
+            }),
+            supports_off: true,
+        },
+        levels,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -452,6 +509,13 @@ fn detect_openai_family(id: &str) -> Option<ThinkingFamily> {
     }
     if id.contains("deepseek") && (id.contains("r1") || id.contains("reasoner")) {
         return Some(ThinkingFamily::DeepSeekReasoner);
+    }
+    // DeepSeek's official ids carry no version number (`deepseek-flash`), so
+    // they never match `family_version`.  Flash reasons by default and accepts
+    // the low/high/max gear set.  The version guard keeps dated ids such as
+    // `deepseek-v3.2-flash` on their own family.
+    if id.contains("deepseek") && id.contains("flash") && family_version(id, "deepseek").is_none() {
+        return Some(ThinkingFamily::DeepSeekMax);
     }
     if is_reasoning_qwen(id) {
         return Some(ThinkingFamily::Qwen);
@@ -659,11 +723,9 @@ fn standard_levels() -> Vec<ThinkingLevel> {
 }
 
 fn deepseek_v4_levels() -> Vec<ThinkingLevel> {
-    vec![
-        ThinkingLevel::Low,
-        ThinkingLevel::High,
-        ThinkingLevel::Xhigh,
-    ]
+    // DeepSeek V4 accepts exactly none/low/high/max; `none` is the off
+    // position, so the gear list is the three integer steps.
+    vec![ThinkingLevel::Low, ThinkingLevel::High, ThinkingLevel::Max]
 }
 
 fn explicit_support_flag(item: &Value) -> Option<bool> {
@@ -843,10 +905,17 @@ pub fn apply_thinking_to_body(
                 let dialect = capability
                     .dialect
                     .unwrap_or(ThinkingDialect::ReasoningEffort);
-                json!({
+                let mut reasoning = json!({
                     "effort": level_api_str_for(dialect, plan.mode.as_level()?),
-                    "summary": "auto",
-                })
+                });
+                // DeepSeek documents only `effort` for its Responses format, so
+                // an extra `summary` would be an unknown field there.  Keep the
+                // summary request for the OpenAI-style vendors that need it to
+                // surface reasoning text.
+                if dialect != ThinkingDialect::ReasoningEffortMax {
+                    reasoning["summary"] = json!("auto");
+                }
+                reasoning
             };
             body.as_object_mut()?
                 .insert("reasoning".to_owned(), reasoning);
@@ -1368,6 +1437,170 @@ mod tests {
         );
         assert_eq!(plan.mode, ThinkingMode::Low);
         assert!(plan.levels.contains(&ThinkingLevel::Max));
+    }
+
+    /// DeepSeek's `/models` item exposes `effort.supported_levels`, not
+    /// OpenAI's `supported_parameters`.  The listed gears are low/high/max and
+    /// `none` is the documented off switch, so all four settings must survive.
+    #[test]
+    fn thinking_reads_deepseek_effort_supported_levels() {
+        let item = serde_json::json!({
+            "id": "deepseek-flash",
+            "object": "model",
+            "owned_by": "deepseek",
+            "effort": {"supported_levels": ["low", "high", "max"], "default_level": "high"}
+        });
+        let detected = extract_thinking_capability_from_api_item(&item).unwrap();
+        assert_eq!(
+            detected.levels,
+            vec![ThinkingLevel::Low, ThinkingLevel::High, ThinkingLevel::Max]
+        );
+        assert_eq!(
+            detected.capability.dialect,
+            Some(ThinkingDialect::ReasoningEffortMax)
+        );
+        assert_eq!(
+            detected.capability.source,
+            ThinkingCapabilitySource::Explicit
+        );
+        assert!(detected.capability.supports_off);
+    }
+
+    /// `supported_parameters` is richer evidence, so it must win over `effort`.
+    #[test]
+    fn thinking_supported_parameters_outranks_effort_metadata() {
+        let item = serde_json::json!({
+            "id": "vendor-model",
+            "supported_parameters": ["reasoning_effort"],
+            "effort": {"supported_levels": ["low"]}
+        });
+        let detected = extract_thinking_capability_from_api_item(&item).unwrap();
+        assert_eq!(
+            detected.levels,
+            vec![
+                ThinkingLevel::Low,
+                ThinkingLevel::Medium,
+                ThinkingLevel::High
+            ]
+        );
+    }
+
+    /// The official ids carry no version digits, so the name heuristic must
+    /// recognise them without help from `/models` metadata.
+    #[test]
+    fn thinking_deepseek_flash_recognised_without_version_digits() {
+        for protocol in [
+            ProviderProtocol::OpenAiChat,
+            ProviderProtocol::OpenAiResponses,
+        ] {
+            let detected = infer_endpoint_thinking_capability(
+                protocol,
+                "deepseek-flash",
+                "https://api.deepseek.com/v1",
+            )
+            .unwrap();
+            assert_eq!(
+                detected.levels,
+                vec![ThinkingLevel::Low, ThinkingLevel::High, ThinkingLevel::Max]
+            );
+            assert_eq!(
+                detected.capability.dialect,
+                Some(ThinkingDialect::ReasoningEffortMax)
+            );
+            assert!(detected.capability.supports_off);
+        }
+        // `deepseek-chat` stays a non-reasoning model.
+        assert!(
+            infer_protocol_thinking_capability(ProviderProtocol::OpenAiChat, "deepseek-chat")
+                .is_none()
+        );
+        // A dated v3 flash id must keep the v3 toggle dialect, not V4 gears.
+        let dated =
+            infer_protocol_thinking_capability(ProviderProtocol::OpenAiChat, "deepseek-v3.2-flash")
+                .unwrap();
+        assert_eq!(
+            dated.capability.dialect,
+            Some(ThinkingDialect::ThinkingToggle)
+        );
+        assert_eq!(dated.levels, vec![ThinkingLevel::Medium]);
+    }
+
+    /// Asserts the exact payload built for a real request, not just the
+    /// thinking fragment: Chat Completions carries `reasoning_effort` and the
+    /// Responses format carries `reasoning.effort` without OpenAI's `summary`.
+    #[test]
+    fn thinking_deepseek_flash_wire_body_matches_vendor_contract() {
+        use crate::actions::{ChatMessage, ChatRole};
+        use crate::protocols;
+
+        let messages = vec![
+            ChatMessage {
+                role: ChatRole::System,
+                content: "sys".to_owned(),
+            },
+            ChatMessage {
+                role: ChatRole::User,
+                content: "hello".to_owned(),
+            },
+        ];
+        let capability =
+            infer_protocol_thinking_capability(ProviderProtocol::OpenAiChat, "deepseek-flash")
+                .unwrap();
+
+        for (mode, expected) in [
+            (ThinkingMode::Off, "none"),
+            (ThinkingMode::Low, "low"),
+            (ThinkingMode::High, "high"),
+            (ThinkingMode::Max, "max"),
+        ] {
+            let plan = ThinkingRequestPlan {
+                capability: Some(capability.capability.clone()),
+                levels: capability.levels.clone(),
+                mode,
+            };
+
+            let mut chat = protocols::build_base_body(
+                ProviderProtocol::OpenAiChat,
+                "deepseek-flash",
+                &messages,
+            );
+            protocols::apply_thinking(ProviderProtocol::OpenAiChat, &mut chat, &plan).unwrap();
+            assert_eq!(
+                chat,
+                serde_json::json!({
+                    "model": "deepseek-flash",
+                    "stream": true,
+                    "messages": [
+                        {"role": "system", "content": "sys"},
+                        {"role": "user", "content": "hello"}
+                    ],
+                    "reasoning_effort": expected
+                }),
+                "chat {mode:?}"
+            );
+
+            let mut responses = protocols::build_base_body(
+                ProviderProtocol::OpenAiResponses,
+                "deepseek-flash",
+                &messages,
+            );
+            protocols::apply_thinking(ProviderProtocol::OpenAiResponses, &mut responses, &plan)
+                .unwrap();
+            assert_eq!(
+                responses,
+                serde_json::json!({
+                    "model": "deepseek-flash",
+                    "stream": true,
+                    "store": false,
+                    "input": [
+                        {"role": "system", "content": "sys"},
+                        {"role": "user", "content": "hello"}
+                    ],
+                    "reasoning": {"effort": expected}
+                }),
+                "responses {mode:?}"
+            );
+        }
     }
 
     #[test]
