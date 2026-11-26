@@ -290,10 +290,12 @@ pub(crate) fn parse_models(
         } else {
             thinking::infer_protocol_thinking_capability(protocol, id)
         };
-        let (thinking_levels, thinking_capability) = detected
-            .map(|value| (value.levels, Some(value.capability)))
+        let (thinking_levels, thinking_capability, declared_default) = detected
+            .map(|value| (value.levels, Some(value.capability), value.default_level))
             .unwrap_or_default();
-        let thinking_default = default_thinking_level(&thinking_levels);
+        // A vendor-declared default wins over the heuristic preference order.
+        let thinking_default =
+            declared_default.or_else(|| default_thinking_level(&thinking_levels));
         models.push(ProviderModel {
             id: id.to_owned(),
             name: name.to_owned(),
@@ -449,6 +451,12 @@ mod tests {
                 "{protocol:?}"
             );
             assert!(flash.thinking_capability.as_ref().unwrap().supports_off);
+            // The vendor default (`high`) beats the heuristic preference order.
+            assert_eq!(
+                flash.thinking_default,
+                Some(crate::models::ThinkingLevel::High),
+                "{protocol:?}"
+            );
             // The heuristic still covers a model listed without metadata.
             let pro = models
                 .iter()

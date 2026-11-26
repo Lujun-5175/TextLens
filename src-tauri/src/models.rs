@@ -544,6 +544,9 @@ pub enum ThinkingDialect {
     ThinkingToggle,
     OpenRouterReasoning,
     GeminiLevel,
+    // Anthropic-shaped endpoint that takes `output_config.effort` plus a
+    // `thinking.type` toggle instead of a token budget (DeepSeek compatible API).
+    AnthropicOutputConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

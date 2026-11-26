@@ -196,6 +196,74 @@
   },
   {
     "modelId": "deepseek-flash",
+    "protocol": "anthropicMessages",
+    "baseUrl": "https://api.deepseek.com/anthropic",
+    "levels": [
+      "low",
+      "high",
+      "max"
+    ],
+    "dialect": "anthropicOutputConfig",
+    "supportsOff": true,
+    "mode": "off",
+    "fields": {
+      "/thinking/type": "disabled",
+      "/output_config": null
+    }
+  },
+  {
+    "modelId": "deepseek-flash",
+    "protocol": "anthropicMessages",
+    "baseUrl": "https://api.deepseek.com/anthropic",
+    "levels": [
+      "low",
+      "high",
+      "max"
+    ],
+    "dialect": "anthropicOutputConfig",
+    "supportsOff": true,
+    "mode": "low",
+    "fields": {
+      "/thinking/type": "enabled",
+      "/output_config/effort": "low"
+    }
+  },
+  {
+    "modelId": "deepseek-flash",
+    "protocol": "anthropicMessages",
+    "baseUrl": "https://api.deepseek.com/anthropic",
+    "levels": [
+      "low",
+      "high",
+      "max"
+    ],
+    "dialect": "anthropicOutputConfig",
+    "supportsOff": true,
+    "mode": "high",
+    "fields": {
+      "/thinking/type": "enabled",
+      "/output_config/effort": "high"
+    }
+  },
+  {
+    "modelId": "deepseek-flash",
+    "protocol": "anthropicMessages",
+    "baseUrl": "https://api.deepseek.com/anthropic",
+    "levels": [
+      "low",
+      "high",
+      "max"
+    ],
+    "dialect": "anthropicOutputConfig",
+    "supportsOff": true,
+    "mode": "max",
+    "fields": {
+      "/thinking/type": "enabled",
+      "/output_config/effort": "max"
+    }
+  },
+  {
+    "modelId": "deepseek-flash",
     "protocol": "openAiResponses",
     "baseUrl": "https://api.deepseek.com/v1",
     "levels": [

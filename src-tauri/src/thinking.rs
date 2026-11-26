@@ -12,6 +12,8 @@ use crate::openai_protocol::ProviderErrorEnvelope;
 pub struct DetectedThinkingCapability {
     pub levels: Vec<ThinkingLevel>,
     pub capability: ThinkingCapability,
+    /// Vendor-declared default gear from `/models` metadata, when published.
+    pub default_level: Option<ThinkingLevel>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -162,7 +164,10 @@ pub fn extract_thinking_capability_from_api_item(
     // to name heuristics.
     if supported_parameters.is_none() && nested_options.is_none() && root_options.is_none() {
         if let Some(options) = effort_options {
-            return Some(effort_metadata_capability(options));
+            let default_level = item
+                .pointer("/effort/default_level")
+                .and_then(Value::as_str);
+            return Some(effort_metadata_capability(options, default_level));
         }
     }
 
@@ -263,6 +268,7 @@ pub fn extract_thinking_capability_from_api_item(
             dialect,
             supports_off,
         },
+        default_level: None,
     })
 }
 
@@ -275,7 +281,10 @@ pub fn extract_thinking_capability_from_api_item(
 /// The vendor excludes `none` from `supported_levels` but documents
 /// `reasoning_effort: "none"` as the explicit off switch, so a listed gear set
 /// always carries an off position.
-fn effort_metadata_capability(options: &[Value]) -> DetectedThinkingCapability {
+fn effort_metadata_capability(
+    options: &[Value],
+    default_level: Option<&str>,
+) -> DetectedThinkingCapability {
     let mut levels = Vec::new();
     for raw in options.iter().filter_map(Value::as_str) {
         let normalized = raw.trim().to_ascii_lowercase();
@@ -294,6 +303,10 @@ fn effort_metadata_capability(options: &[Value]) -> DetectedThinkingCapability {
             ThinkingLevel::Minimal | ThinkingLevel::Medium | ThinkingLevel::Xhigh
         )
     });
+    // A declared default only counts when this endpoint actually lists it.
+    let default_level = default_level
+        .and_then(parse_level_str)
+        .filter(|level| levels.contains(level));
     DetectedThinkingCapability {
         capability: ThinkingCapability {
             source: ThinkingCapabilitySource::Explicit,
@@ -305,6 +318,7 @@ fn effort_metadata_capability(options: &[Value]) -> DetectedThinkingCapability {
             supports_off: true,
         },
         levels,
+        default_level,
     }
 }
 
@@ -358,6 +372,7 @@ fn detected_from_family(
             dialect,
             supports_off,
         },
+        default_level: None,
     }
 }
 
@@ -573,6 +588,21 @@ pub fn infer_endpoint_thinking_capability(
         return None;
     }
     if protocol == ProviderProtocol::AnthropicMessages {
+        // DeepSeek's Anthropic-compatible endpoint takes `output_config.effort`
+        // plus a `thinking.type` toggle; Claude-style budgets do not apply.
+        if family_version(&id, "deepseek").is_some_and(|(major, _)| major >= 4)
+            || (id.contains("deepseek")
+                && id.contains("flash")
+                && family_version(&id, "deepseek").is_none())
+        {
+            let mut detected = detected_from_family(
+                ThinkingFamily::DeepSeekMax,
+                Some(ThinkingDialect::AnthropicOutputConfig),
+                true,
+            );
+            detected.levels = deepseek_v4_levels();
+            return Some(detected);
+        }
         return is_reasoning_claude(&id)
             .then(|| detected_from_family(ThinkingFamily::Claude, None, true));
     }
@@ -779,7 +809,7 @@ fn level_api_str(level: ThinkingLevel) -> &'static str {
 
 fn level_api_str_for(dialect: ThinkingDialect, level: ThinkingLevel) -> &'static str {
     match dialect {
-        ThinkingDialect::ReasoningEffortMax => match level {
+        ThinkingDialect::ReasoningEffortMax | ThinkingDialect::AnthropicOutputConfig => match level {
             ThinkingLevel::Minimal | ThinkingLevel::Low => "low",
             ThinkingLevel::Medium | ThinkingLevel::High => "high",
             ThinkingLevel::Xhigh | ThinkingLevel::Max => "max",
@@ -807,7 +837,9 @@ pub fn resolve_body_control(plan: &ThinkingRequestPlan) -> Option<ThinkingBodyCo
             return None;
         }
         return Some(match dialect {
-            ThinkingDialect::ReasoningEffort | ThinkingDialect::ReasoningEffortMax => {
+            ThinkingDialect::ReasoningEffort
+            | ThinkingDialect::ReasoningEffortMax
+            | ThinkingDialect::AnthropicOutputConfig => {
                 ThinkingBodyControl::ReasoningEffort("none".to_owned())
             }
             ThinkingDialect::EnableThinking => ThinkingBodyControl::EnableThinking(false),
@@ -821,11 +853,11 @@ pub fn resolve_body_control(plan: &ThinkingRequestPlan) -> Option<ThinkingBodyCo
     }
 
     Some(match dialect {
-        ThinkingDialect::ReasoningEffort | ThinkingDialect::ReasoningEffortMax => {
-            ThinkingBodyControl::ReasoningEffort(
-                level_api_str_for(dialect, mode.as_level()?).to_owned(),
-            )
-        }
+        ThinkingDialect::ReasoningEffort
+        | ThinkingDialect::ReasoningEffortMax
+        | ThinkingDialect::AnthropicOutputConfig => ThinkingBodyControl::ReasoningEffort(
+            level_api_str_for(dialect, mode.as_level()?).to_owned(),
+        ),
         ThinkingDialect::EnableThinking => ThinkingBodyControl::EnableThinking(true),
         ThinkingDialect::ChatTemplateKwargs => ThinkingBodyControl::ChatTemplateKwargs(true),
         ThinkingDialect::ThinkingToggle => ThinkingBodyControl::ThinkingToggle(true),
@@ -922,6 +954,31 @@ pub fn apply_thinking_to_body(
             "reasoning.effort"
         }
         ProviderProtocol::AnthropicMessages => {
+            // Anthropic-compatible vendors that take an effort level plus an
+            // explicit toggle instead of a Claude token budget.
+            if capability.dialect == Some(ThinkingDialect::AnthropicOutputConfig) {
+                let object = body.as_object_mut()?;
+                if plan.mode == ThinkingMode::Off {
+                    // The vendor defaults to thinking on, so "off" must be sent
+                    // rather than omitted.
+                    object.insert("thinking".to_owned(), json!({"type": "disabled"}));
+                    object.remove("output_config");
+                    return Some(AppliedThinkingControl {
+                        field_path: "thinking.type",
+                        source,
+                    });
+                }
+                let effort = level_api_str_for(
+                    ThinkingDialect::AnthropicOutputConfig,
+                    plan.mode.as_level()?,
+                );
+                object.insert("thinking".to_owned(), json!({"type": "enabled"}));
+                object.insert("output_config".to_owned(), json!({"effort": effort}));
+                return Some(AppliedThinkingControl {
+                    field_path: "output_config.effort",
+                    source,
+                });
+            }
             if plan.mode == ThinkingMode::Off {
                 // Omitting the block is Anthropic's way of disabling thinking.
                 return None;
@@ -1464,6 +1521,40 @@ mod tests {
             ThinkingCapabilitySource::Explicit
         );
         assert!(detected.capability.supports_off);
+    }
+
+    /// A vendor-declared default must reach the stored model, and a default the
+    /// endpoint does not actually list must be ignored.
+    #[test]
+    fn thinking_reads_the_declared_default_level() {
+        let listed = serde_json::json!({
+            "id": "deepseek-flash",
+            "effort": {"supported_levels": ["low", "high", "max"], "default_level": "high"}
+        });
+        let detected = extract_thinking_capability_from_api_item(&listed).unwrap();
+        assert_eq!(detected.default_level, Some(ThinkingLevel::High));
+
+        let outside = serde_json::json!({
+            "id": "deepseek-flash",
+            "effort": {"supported_levels": ["low", "high", "max"], "default_level": "medium"}
+        });
+        assert_eq!(
+            extract_thinking_capability_from_api_item(&outside)
+                .unwrap()
+                .default_level,
+            None
+        );
+
+        let absent = serde_json::json!({
+            "id": "deepseek-flash",
+            "effort": {"supported_levels": ["low", "high", "max"]}
+        });
+        assert_eq!(
+            extract_thinking_capability_from_api_item(&absent)
+                .unwrap()
+                .default_level,
+            None
+        );
     }
 
     /// `supported_parameters` is richer evidence, so it must win over `effort`.
