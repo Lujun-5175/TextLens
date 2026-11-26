@@ -5,6 +5,7 @@ import {
   actionStreamEventSchema,
   providerModelSchema,
   publicSettingsSchema,
+  resultHistoryEntrySchema,
   resultReadyAckSchema,
   resultSessionSnapshotSchema,
   selectionPayloadSchema,
@@ -21,6 +22,7 @@ import {
   type ProviderModelsSyncResult,
   type ProviderUpdateInput,
   type PublicSettings,
+  type ResultHistoryEntry,
   type ResultReadyAck,
   type ResultSessionSnapshot,
   type RunActionResult,
@@ -437,6 +439,21 @@ export function installTauriBridge(): void {
     },
     async closeResult(sessionId?: string) {
       await invoke(TAURI_COMMANDS.closeResult, { sessionId: requiredSessionId(sessionId) })
+    },
+    async listResultHistory(limit?: number): Promise<ResultHistoryEntry[]> {
+      const payload = await invoke<unknown>(TAURI_COMMANDS.listResultHistory, {
+        limit: limit ?? null
+      })
+      return resultHistoryEntrySchema.array().parse(payload)
+    },
+    async deleteResultHistoryEntry(id: string): Promise<boolean> {
+      return await invoke<boolean>(TAURI_COMMANDS.deleteResultHistoryEntry, { id })
+    },
+    async copyResultHistoryEntry(id: string): Promise<void> {
+      await invoke(TAURI_COMMANDS.copyResultHistoryEntry, { id })
+    },
+    async clearResultHistory(): Promise<void> {
+      await invoke(TAURI_COMMANDS.clearResultHistory)
     },
     async quitApp() {
       await invoke(TAURI_COMMANDS.quitApp)

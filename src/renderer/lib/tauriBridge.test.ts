@@ -470,4 +470,56 @@ describe('Tauri renderer bridge', () => {
     })
     expect(invokeMock).toHaveBeenCalledWith('list_provider_models', { providerId: 'provider-1' })
   })
+
+  it('parses result history commands and forwards their arguments', async () => {
+    listenMock.mockResolvedValue(() => undefined)
+    invokeMock.mockReset()
+    invokeMock.mockImplementation((command: string) => {
+      if (command === 'list_result_history') {
+        return Promise.resolve([
+          {
+            id: 'entry-1',
+            createdAt: '2026-11-26T08:30:00Z',
+            actionId: 'translate',
+            actionName: '翻译',
+            providerId: 'provider-1',
+            modelId: 'gpt-4o',
+            sourceText: 'source text',
+            content: 'answer',
+            usage: { inputTokens: 3, outputTokens: 5, totalTokens: 8 },
+            truncated: true
+          }
+        ])
+      }
+      if (command === 'delete_result_history_entry') return Promise.resolve(true)
+      return Promise.resolve(undefined)
+    })
+
+    installTauriBridge()
+
+    await expect(window.textLens.listResultHistory?.(20)).resolves.toEqual([
+      {
+        id: 'entry-1',
+        createdAt: '2026-11-26T08:30:00Z',
+        actionId: 'translate',
+        actionName: '翻译',
+        providerId: 'provider-1',
+        modelId: 'gpt-4o',
+        sourceText: 'source text',
+        content: 'answer',
+        usage: { inputTokens: 3, outputTokens: 5, totalTokens: 8 },
+        truncated: true
+      }
+    ])
+    expect(invokeMock).toHaveBeenCalledWith('list_result_history', { limit: 20 })
+
+    await expect(window.textLens.deleteResultHistoryEntry?.('entry-1')).resolves.toBe(true)
+    expect(invokeMock).toHaveBeenCalledWith('delete_result_history_entry', { id: 'entry-1' })
+
+    await window.textLens.copyResultHistoryEntry?.('entry-1')
+    expect(invokeMock).toHaveBeenCalledWith('copy_result_history_entry', { id: 'entry-1' })
+
+    await window.textLens.clearResultHistory?.()
+    expect(invokeMock).toHaveBeenCalledWith('clear_result_history')
+  })
 })

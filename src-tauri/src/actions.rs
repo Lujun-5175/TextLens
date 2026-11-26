@@ -1342,11 +1342,8 @@ impl ActionService {
         }
         let protocol = prepared.session_data.route.provider.protocol;
         let base = build_base_body(prepared);
-        let (controlled, applied) = build_controlled_body(
-            &base,
-            protocol,
-            &prepared.session_data.route.thinking,
-        );
+        let (controlled, applied) =
+            build_controlled_body(&base, protocol, &prepared.session_data.route.thinking);
         let control_status = if applied.is_some() {
             ThinkingControlStatus::Applied
         } else {
@@ -1366,7 +1363,9 @@ impl ActionService {
                 return early;
             }
             match self.perform_attempt(app, prepared, &controlled).await {
-                Ok(success) => return self.complete_generated(prepared, success, 2, control_status),
+                Ok(success) => {
+                    return self.complete_generated(prepared, success, 2, control_status)
+                }
                 Err(failure) => failure,
             }
         } else {
@@ -3215,13 +3214,13 @@ mod tests {
 
     #[test]
     fn only_a_field_named_request_rejection_triggers_the_stream_usage_retry() {
-        let envelope = |code: Option<&str>,
-                        param: Option<&str>,
-                        message: &str| crate::openai_protocol::ProviderErrorEnvelope {
-            code: code.map(ToOwned::to_owned),
-            kind: None,
-            param: param.map(ToOwned::to_owned),
-            message: message.to_owned(),
+        let envelope = |code: Option<&str>, param: Option<&str>, message: &str| {
+            crate::openai_protocol::ProviderErrorEnvelope {
+                code: code.map(ToOwned::to_owned),
+                kind: None,
+                param: param.map(ToOwned::to_owned),
+                message: message.to_owned(),
+            }
         };
         let failure = |status: Option<u16>,
                        provider_error: Option<crate::openai_protocol::ProviderErrorEnvelope>,

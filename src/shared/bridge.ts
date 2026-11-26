@@ -5,6 +5,7 @@ import type {
   ProviderModel,
   ProviderUpdateInput,
   PublicSettings,
+  ResultHistoryEntry,
   ResultReadyAck,
   ResultSessionSnapshot,
   SelectionPayload,
@@ -127,6 +128,14 @@ export interface WindowTextLensApi {
   takeSettingsGuidance?(): Promise<SettingsGuidance | null>
   hideResult?(sessionId?: string): Promise<void>
   closeResult(sessionId?: string): Promise<void>
+  /** Settings window only: newest-first locally stored results. */
+  listResultHistory?(limit?: number): Promise<ResultHistoryEntry[]>
+  /** Settings window only: delete one stored result; false when already gone. */
+  deleteResultHistoryEntry?(id: string): Promise<boolean>
+  /** Settings window only: copy one stored result to the system clipboard. */
+  copyResultHistoryEntry?(id: string): Promise<void>
+  /** Settings window only: delete every stored result. */
+  clearResultHistory?(): Promise<void>
   quitApp?(): Promise<void>
   onSelection(listener: (selection: SelectionPayload) => void): Unsubscribe
   onActionEvent(listener: (event: ActionStreamEvent) => void): Unsubscribe

@@ -809,7 +809,8 @@ fn level_api_str(level: ThinkingLevel) -> &'static str {
 
 fn level_api_str_for(dialect: ThinkingDialect, level: ThinkingLevel) -> &'static str {
     match dialect {
-        ThinkingDialect::ReasoningEffortMax | ThinkingDialect::AnthropicOutputConfig => match level {
+        ThinkingDialect::ReasoningEffortMax | ThinkingDialect::AnthropicOutputConfig => match level
+        {
             ThinkingLevel::Minimal | ThinkingLevel::Low => "low",
             ThinkingLevel::Medium | ThinkingLevel::High => "high",
             ThinkingLevel::Xhigh | ThinkingLevel::Max => "max",

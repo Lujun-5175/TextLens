@@ -30,7 +30,9 @@ import { CSS } from '@dnd-kit/utilities'
 import {
   ArrowLeftRight,
   Check,
+  ChevronDown,
   CircleAlert,
+  Copy,
   Eye,
   EyeOff,
   GripVertical,
@@ -40,6 +42,7 @@ import {
   Pencil,
   Plus,
   RefreshCw,
+  Search,
   ShieldCheck,
   Sparkles,
   Trash2,
@@ -70,6 +73,7 @@ import {
   type PublicSettings,
   type ProviderModel,
   type ProviderProtocol,
+  type ResultHistoryEntry,
   type SettingsGuidance,
   type SupportedLocale,
   type TranslationLanguage
@@ -117,6 +121,7 @@ type SettingsSectionId =
   | 'appearance'
   | 'providers'
   | 'actions'
+  | 'history'
   | 'language'
   | 'capture'
 
@@ -149,6 +154,11 @@ const SETTINGS_SECTIONS: ReadonlyArray<{
     id: 'actions',
     label: '工具栏动作',
     blurb: '决定工具栏显示哪些功能，可拖拽排序；启用的会出现在划词工具栏。'
+  },
+  {
+    id: 'history',
+    label: '历史记录',
+    blurb: '本机保存的最近 200 条 AI 结果，可搜索、复制或删除。'
   },
   {
     id: 'language',
@@ -230,6 +240,27 @@ function actionZoneId(enabled: boolean): string {
 function createId(prefix: string): string {
   if (typeof crypto.randomUUID === 'function') return `${prefix}-${crypto.randomUUID()}`
   return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
+}
+
+/** UTC ISO8601 → `YYYY-MM-DD HH:mm` without locale or timezone surprises. */
+function formatHistoryTimestamp(value: string): string {
+  const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})/.exec(value)
+  return match
+    ? `${match[1]}-${match[2]}-${match[3]} ${match[4]}:${match[5]}`
+    : value
+}
+
+/** First non-empty line of an answer, used as the collapsed summary. */
+function historySummary(content: string): string {
+  const line = content.split(/\r?\n/u).find((candidate) => candidate.trim().length > 0)
+  return line?.trim() || '（空结果）'
+}
+
+function matchesHistoryQuery(entry: ResultHistoryEntry, query: string): boolean {
+  const action = entry.actionName.toLocaleLowerCase()
+  const content = entry.content.toLocaleLowerCase()
+  const source = entry.sourceText.toLocaleLowerCase()
+  return action.includes(query) || content.includes(query) || source.includes(query)
 }
 
 
@@ -697,6 +728,106 @@ export function SettingsApp(): JSX.Element {
       window.removeEventListener('focus', refreshAccessibility)
     }
   }, [resetProviderKeyFields, refreshRuntimeStatus, loadAttempt])
+
+  const [historyEntries, setHistoryEntries] = useState<ResultHistoryEntry[]>([])
+  const [historyStatus, setHistoryStatus] = useState<'idle' | 'loading' | 'ready' | 'error'>('idle')
+  const [historyError, setHistoryError] = useState('')
+  const [historyQuery, setHistoryQuery] = useState('')
+  const [historyExpandedIds, setHistoryExpandedIds] = useState<ReadonlySet<string>>(() => new Set())
+  const [historyClearOpen, setHistoryClearOpen] = useState(false)
+  const [historyBusyId, setHistoryBusyId] = useState<string | null>(null)
+
+  const loadHistory = useCallback(async (): Promise<void> => {
+    if (!window.textLens.listResultHistory) {
+      setHistoryStatus('error')
+      setHistoryError('当前后端尚不支持历史记录')
+      return
+    }
+    setHistoryStatus('loading')
+    setHistoryError('')
+    try {
+      const entries = await window.textLens.listResultHistory()
+      setHistoryEntries(entries)
+      setHistoryStatus('ready')
+    } catch (error) {
+      setHistoryStatus('error')
+      setHistoryError(getErrorMessage(error, '无法读取历史记录'))
+    }
+  }, [])
+
+  // Load when the section becomes active; the entry itself stays mounted while
+  // another section is open, so leaving and returning refreshes the list.
+  useEffect(() => {
+    if (activeSection !== 'history') return
+    void loadHistory()
+  }, [activeSection, loadHistory])
+
+  const filteredHistory = useMemo(() => {
+    const query = historyQuery.trim().toLocaleLowerCase()
+    return query
+      ? historyEntries.filter((entry) => matchesHistoryQuery(entry, query))
+      : historyEntries
+  }, [historyEntries, historyQuery])
+
+  const toggleHistoryEntry = (id: string): void => {
+    setHistoryExpandedIds((current) => {
+      const next = new Set(current)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
+    })
+  }
+
+  const copyHistoryEntry = async (entry: ResultHistoryEntry): Promise<void> => {
+    try {
+      // `copy_text` is result-window-only; the settings window uses the
+      // history-specific command and falls back during a hot reload against an
+      // older backend.
+      if (window.textLens.copyResultHistoryEntry) {
+        await window.textLens.copyResultHistoryEntry(entry.id)
+      } else {
+        await window.textLens.copyText(entry.content)
+      }
+      setBanner({ kind: 'success', text: '已复制历史结果' })
+    } catch (error) {
+      setBanner({ kind: 'error', text: getErrorMessage(error, '无法复制结果') })
+    }
+  }
+
+  const deleteHistoryEntry = async (entry: ResultHistoryEntry): Promise<void> => {
+    const remove = window.textLens.deleteResultHistoryEntry
+    if (!remove) return
+    setHistoryBusyId(entry.id)
+    try {
+      await remove(entry.id)
+      setHistoryEntries((current) => current.filter((item) => item.id !== entry.id))
+      setHistoryExpandedIds((current) => {
+        if (!current.has(entry.id)) return current
+        const next = new Set(current)
+        next.delete(entry.id)
+        return next
+      })
+    } catch (error) {
+      setBanner({ kind: 'error', text: getErrorMessage(error, '无法删除历史记录') })
+    } finally {
+      setHistoryBusyId(null)
+    }
+  }
+
+  const clearHistory = async (): Promise<void> => {
+    const clear = window.textLens.clearResultHistory
+    setHistoryClearOpen(false)
+    if (!clear) return
+    try {
+      await clear()
+      setHistoryEntries([])
+      setHistoryExpandedIds(new Set())
+      setHistoryQuery('')
+      setBanner({ kind: 'success', text: '历史记录已清空' })
+    } catch (error) {
+      setBanner({ kind: 'error', text: getErrorMessage(error, '无法清空历史记录') })
+    }
+  }
 
   const changeDraft = useCallback((updater: (current: PublicSettings) => PublicSettings): void => {
     draftRevisionRef.current += 1
@@ -1883,6 +2014,129 @@ export function SettingsApp(): JSX.Element {
       </section>
           )}
 
+          {activeSectionId === 'history' && (
+      <section className="settings-section settings-section--enter" aria-labelledby="history-title">
+        <div className="section-heading">
+          <div>
+            <h2 id="history-title">{activeMeta.label}</h2>
+            <p>{activeMeta.blurb}</p>
+          </div>
+          <div className="history-toolbar">
+            <button
+              className="button"
+              type="button"
+              disabled={historyStatus === 'loading'}
+              onClick={() => void loadHistory()}
+            >
+              <RefreshCw size={15} className={historyStatus === 'loading' ? 'settings-spin' : undefined} />
+              刷新
+            </button>
+            <button
+              className="button button--danger"
+              type="button"
+              disabled={historyEntries.length === 0}
+              onClick={() => setHistoryClearOpen(true)}
+            >
+              清空全部
+            </button>
+          </div>
+        </div>
+        <div className="settings-tip" role="note">
+          <span className="settings-tip__label">隐私</span>
+          <p>结果只保存在本机，不会上传；可在下方随时删除或清空。</p>
+        </div>
+        <div className="settings-card history-panel">
+          <div className="history-search">
+            <Search size={15} aria-hidden="true" />
+            <input
+              className="control"
+              type="search"
+              value={historyQuery}
+              aria-label="搜索历史记录"
+              placeholder="搜索动作名、原文或结果内容"
+              onChange={(event) => setHistoryQuery(event.target.value)}
+            />
+          </div>
+          {historyStatus === 'error' && (
+            <p className="field-error history-status" role="alert">{historyError}</p>
+          )}
+          {(historyStatus === 'idle' || historyStatus === 'loading') && historyEntries.length === 0 && (
+            <p className="history-status">正在读取历史记录…</p>
+          )}
+          {historyStatus === 'ready' && historyEntries.length === 0 && (
+            <p className="history-status">还没有记录。完成一次 AI 动作后会出现在这里。</p>
+          )}
+          {historyEntries.length > 0 && filteredHistory.length === 0 && (
+            <p className="history-status">没有匹配的记录。</p>
+          )}
+          {filteredHistory.length > 0 && (
+            <ul className="history-list">
+              {filteredHistory.map((entry) => {
+                const expanded = historyExpandedIds.has(entry.id)
+                return (
+                  <li className="history-item" key={entry.id}>
+                    <div className="history-item__header">
+                      <button
+                        className="history-item__toggle"
+                        type="button"
+                        aria-expanded={expanded}
+                        onClick={() => toggleHistoryEntry(entry.id)}
+                      >
+                        <span className="history-item__meta">
+                          <time dateTime={entry.createdAt}>{formatHistoryTimestamp(entry.createdAt)}</time>
+                          <strong>{entry.actionName || '未命名动作'}</strong>
+                          <span className="history-item__model">{entry.modelId || '默认模型'}</span>
+                          <ChevronDown
+                            className={`history-item__chevron ${expanded ? 'is-expanded' : ''}`}
+                            size={14}
+                            aria-hidden="true"
+                          />
+                        </span>
+                        <span className="history-item__summary">{historySummary(entry.content)}</span>
+                      </button>
+                      <div className="history-item__actions">
+                        <button
+                          className="icon-button"
+                          type="button"
+                          aria-label={`复制记录：${entry.actionName || '未命名动作'}`}
+                          onClick={() => void copyHistoryEntry(entry)}
+                        >
+                          <Copy size={15} aria-hidden="true" />
+                        </button>
+                        <button
+                          className="icon-button"
+                          type="button"
+                          aria-label={`删除记录：${entry.actionName || '未命名动作'}`}
+                          disabled={historyBusyId === entry.id}
+                          onClick={() => void deleteHistoryEntry(entry)}
+                        >
+                          <Trash2 size={15} aria-hidden="true" />
+                        </button>
+                      </div>
+                    </div>
+                    {expanded && (
+                      <div className="history-item__detail">
+                        <pre className="history-item__content">{entry.content}</pre>
+                        {entry.truncated && (
+                          <p className="history-item__truncated">内容过长，已截断保存。</p>
+                        )}
+                        {entry.sourceText && (
+                          <div className="history-item__source">
+                            <span>原文</span>
+                            <p>{entry.sourceText}</p>
+                          </div>
+                        )}
+                      </div>
+                    )}
+                  </li>
+                )
+              })}
+            </ul>
+          )}
+        </div>
+      </section>
+          )}
+
           {activeSectionId === 'language' && (
       <section className="settings-section settings-section--enter" aria-labelledby="language-title">
         <div className="section-heading">
@@ -2299,6 +2553,16 @@ export function SettingsApp(): JSX.Element {
             void quitNow()
           }}
           onSave={() => void saveAndQuit()}
+        />
+      )}
+      {historyClearOpen && (
+        <DeleteConfirmationDialog
+          title="清空全部历史记录？"
+          description="将删除本机保存的全部 AI 结果，此操作无法撤销。设置和其它数据不受影响。"
+          confirmLabel="清空全部"
+          closeLabel="关闭清空确认"
+          onCancel={() => setHistoryClearOpen(false)}
+          onConfirm={() => void clearHistory()}
         />
       )}
       {modelPicker && (

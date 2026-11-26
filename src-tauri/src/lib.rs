@@ -7,6 +7,7 @@ pub mod models;
 mod openai_protocol;
 mod openai_transport;
 mod protocols;
+mod result_history;
 pub mod runtime;
 pub mod selection;
 pub mod settings;
@@ -165,6 +166,10 @@ pub fn run() {
             runtime::open_external,
             runtime::hide_result,
             runtime::close_result,
+            result_history::list_result_history,
+            result_history::delete_result_history_entry,
+            result_history::copy_result_history_entry,
+            result_history::clear_result_history,
         ])
         .build(tauri::generate_context!())
         .expect("failed to build TextLens")

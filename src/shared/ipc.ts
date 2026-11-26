@@ -40,6 +40,10 @@ export const TAURI_COMMANDS = {
   takeSettingsGuidance: 'take_settings_guidance',
   hideResult: 'hide_result',
   closeResult: 'close_result',
+  listResultHistory: 'list_result_history',
+  deleteResultHistoryEntry: 'delete_result_history_entry',
+  copyResultHistoryEntry: 'copy_result_history_entry',
+  clearResultHistory: 'clear_result_history',
   quitApp: 'quit_app'
 } as const
 

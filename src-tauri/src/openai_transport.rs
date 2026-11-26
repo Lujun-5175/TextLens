@@ -1560,10 +1560,7 @@ data: {"type":"response.incomplete","response":{"status":"incomplete","incomplet
         )
         .await
         .unwrap();
-        assert_eq!(
-            success.usage.map(|usage| usage.total_tokens),
-            Some(15)
-        );
+        assert_eq!(success.usage.map(|usage| usage.total_tokens), Some(15));
 
         // A usage-only stream still has no answer, so it must fail as empty
         // instead of surfacing token numbers without any generated content.

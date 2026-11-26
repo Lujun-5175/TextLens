@@ -74,10 +74,7 @@ fn apply_windows(enabled: bool, executable: &str) -> Result<(), String> {
     if !enabled && status == ERROR_FILE_NOT_FOUND {
         return Ok(());
     }
-    Err(format!(
-        "无法更新开机启动项（错误码 {}）",
-        status.0
-    ))
+    Err(format!("无法更新开机启动项（错误码 {}）", status.0))
 }
 
 #[cfg(test)]

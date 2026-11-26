@@ -740,6 +740,27 @@ export const tokenUsageSchema = z
   .strict()
 export type TokenUsage = z.infer<typeof tokenUsageSchema>
 
+/**
+ * One locally stored, plaintext result. `content` and `sourceText` may be
+ * truncated by the native side; `truncated` marks that case. `usage` is only
+ * present when the provider reported token counts.
+ */
+export const resultHistoryEntrySchema = z
+  .object({
+    id: z.string().trim().min(1).max(128),
+    createdAt: z.string().trim().min(1).max(64),
+    actionId: z.string().trim().min(1).max(128),
+    actionName: z.string().max(256),
+    providerId: z.string().max(128),
+    modelId: z.string().max(256),
+    sourceText: z.string(),
+    content: z.string(),
+    usage: tokenUsageSchema.optional(),
+    truncated: z.boolean().optional()
+  })
+  .strict()
+export type ResultHistoryEntry = z.infer<typeof resultHistoryEntrySchema>
+
 export const transcriptTurnSchema = z.object({
   id: z.string().min(1).max(256),
   role: z.enum(['user', 'assistant']),

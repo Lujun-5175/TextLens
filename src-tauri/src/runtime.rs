@@ -568,6 +568,30 @@ struct ResultSessionMeta {
     pinned: bool,
     /// Only a successfully revealed action owns the host-clear lease.
     action_taken_over: bool,
+    /// Request whose completed answer was already appended to the local
+    /// result history. A retry/continue introduces a new request id and earns
+    /// its own entry; repeated ready handshakes for the same request do not.
+    history_request_id: Option<String>,
+}
+
+impl ResultSessionMeta {
+    /// Claims the single history slot for a completed answer. Failed or
+    /// cancelled snapshots and empty answers never claim it.
+    fn claim_history_record(
+        &mut self,
+        status: ActionSnapshotStatus,
+        request_id: &str,
+        content: &str,
+    ) -> bool {
+        if status != ActionSnapshotStatus::Completed || content.trim().is_empty() {
+            return false;
+        }
+        if self.history_request_id.as_deref() == Some(request_id) {
+            return false;
+        }
+        self.history_request_id = Some(request_id.to_owned());
+        true
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1343,10 +1367,9 @@ impl RuntimeState {
                         .lock()
                         .capture_current_async_with_shortcut_key(shortcut_key);
                     match reply {
-                        Ok(reply) => reply.recv_timeout(Duration::from_secs(5)).map_or_else(
-                            |_| Err(crate::selection::SelectionError::Internal),
-                            |result| result,
-                        ),
+                        Ok(reply) => reply
+                            .recv_timeout(Duration::from_secs(5))
+                            .unwrap_or_else(|_| Err(crate::selection::SelectionError::Internal)),
                         Err(error) => Err(error),
                     }
                 };
@@ -1810,6 +1833,7 @@ impl RuntimeState {
                 action_id: action_id.to_owned(),
                 pinned: result.default_pinned,
                 action_taken_over: false,
+                history_request_id: None,
             },
         );
         let (reveal_sender, reveal_receiver) = oneshot::channel();
@@ -2767,7 +2791,11 @@ pub fn settings_ready(window: WebviewWindow, state: State<'_, RuntimeState>) -> 
 
 /// Lets the settings renderer tell the tray whether closing would lose edits.
 #[tauri::command]
-pub fn set_settings_dirty(window: WebviewWindow, state: State<'_, RuntimeState>, dirty: bool) -> Result<(), String> {
+pub fn set_settings_dirty(
+    window: WebviewWindow,
+    state: State<'_, RuntimeState>,
+    dirty: bool,
+) -> Result<(), String> {
     ensure_settings_caller(&window)?;
     state.settings_dirty.store(dirty, Ordering::Release);
     Ok(())
@@ -3475,10 +3503,68 @@ pub fn begin_result_ready(
         .actions
         .begin_ready(&session_id, window.label())
         .map_err(|error| error.to_string())?;
+    record_completed_history(&app, &state, &session_id, &begin);
     let width = state
         .windows
         .toolbar_max_width(&app, selection_toolbar_anchor(&meta.selection.payload).0);
     Ok(compose_result_ready_snapshot(meta, begin, width))
+}
+
+/// Appends a finished answer to the local history exactly once per request.
+///
+/// The renderer re-runs the ready handshake after the terminal event to read
+/// the usage stored at completion, so every completed snapshot passes through
+/// `begin_result_ready`. `claim_history_record` keeps repeated handshakes and
+/// recovery retries idempotent. Failures and cancellations never claim.
+/// `record_completed` swallows write errors, so the result window is unaffected.
+fn record_completed_history(
+    app: &AppHandle,
+    state: &RuntimeState,
+    session_id: &str,
+    begin: &ActionBeginReady,
+) {
+    let (claimed, source_text) = {
+        let mut sessions = state.result_sessions.lock();
+        match sessions.get_mut(session_id) {
+            Some(meta) => (
+                meta.claim_history_record(
+                    begin.snapshot.status,
+                    &begin.snapshot.request_id,
+                    &begin.snapshot.content,
+                ),
+                meta.selection.payload.text.clone(),
+            ),
+            None => (false, String::new()),
+        }
+    };
+    if !claimed {
+        return;
+    }
+    let action_id = begin.snapshot.action_id.clone();
+    let action_name = state
+        .settings
+        .get_settings()
+        .actions
+        .iter()
+        .find(|action| action.id == action_id)
+        .map(|action| action.name.clone())
+        .unwrap_or_default();
+    let (provider_id, model_id) = begin.route.as_ref().map_or_else(
+        || (String::new(), String::new()),
+        |route| (route.provider_id.clone(), route.model_id.clone()),
+    );
+    crate::result_history::record_completed(
+        app,
+        crate::result_history::NewResultHistoryEntry {
+            action_id,
+            action_name,
+            provider_id,
+            model_id,
+            source_text,
+            content: begin.snapshot.content.clone(),
+            usage: begin.usage,
+        },
+    );
 }
 
 #[tauri::command]
@@ -3914,7 +4000,7 @@ fn ensure_known_caller(window: &WebviewWindow) -> Result<(), String> {
     }
 }
 
-fn ensure_settings_caller(window: &WebviewWindow) -> Result<(), String> {
+pub(crate) fn ensure_settings_caller(window: &WebviewWindow) -> Result<(), String> {
     (window.label() == SETTINGS_LABEL)
         .then_some(())
         .ok_or_else(|| "该操作只能从设置窗口执行".to_owned())
@@ -4497,7 +4583,45 @@ mod tests {
             action_id: "translate".to_owned(),
             pinned: false,
             action_taken_over: false,
+            history_request_id: None,
         }
+    }
+
+    #[test]
+    fn completed_result_claims_history_exactly_once_per_request() {
+        let mut meta = result_meta();
+
+        assert!(meta.claim_history_record(ActionSnapshotStatus::Completed, "request-1", "answer"));
+        // The renderer re-handshakes after the terminal event for usage.
+        assert!(!meta.claim_history_record(ActionSnapshotStatus::Completed, "request-1", "answer"));
+        // A retry/continue produces a new request and deserves its own entry.
+        assert!(meta.claim_history_record(
+            ActionSnapshotStatus::Completed,
+            "request-2",
+            "new answer"
+        ));
+        assert!(!meta.claim_history_record(
+            ActionSnapshotStatus::Completed,
+            "request-2",
+            "new answer"
+        ));
+        assert_eq!(meta.history_request_id.as_deref(), Some("request-2"));
+    }
+
+    #[test]
+    fn unfinished_or_empty_results_never_enter_history() {
+        let mut meta = result_meta();
+
+        assert!(!meta.claim_history_record(ActionSnapshotStatus::Running, "request-1", "partial"));
+        assert!(!meta.claim_history_record(
+            ActionSnapshotStatus::Cancelled,
+            "request-1",
+            "partial"
+        ));
+        assert!(!meta.claim_history_record(ActionSnapshotStatus::Error, "request-1", "partial"));
+        assert!(!meta.claim_history_record(ActionSnapshotStatus::Completed, "request-1", "   "));
+        assert!(!meta.claim_history_record(ActionSnapshotStatus::Completed, "request-1", ""));
+        assert_eq!(meta.history_request_id, None);
     }
 
     #[test]
