@@ -1,3 +1,4 @@
+import type { BallSettings, BallSettingsUpdate } from './ball'
 import type {
   ActionStreamEvent,
   Point,
@@ -102,6 +103,18 @@ export interface WindowTextLensApi {
     searchEngineId?: string
   ): Promise<RunActionResult>
   hideToolbar(selectionId?: string): Promise<void>
+  /** Floating orb only: open an Ask window that starts without a selection. */
+  openAskFromBall?(): Promise<RunActionResult>
+  /** Floating orb only: remember where the user dragged it, in screen pixels. */
+  moveBall?(x: number, y: number): Promise<void>
+  /** Floating orb only: cycle the orb between its small, medium and large sizes. */
+  cycleBallSize?(): Promise<void>
+  /** Settings window only: the orb's own preferences (size, visibility, action). */
+  getBallSettings?(): Promise<BallSettings>
+  /** Settings window only: apply orb preferences immediately. */
+  updateBallSettings?(update: BallSettingsUpdate): Promise<BallSettings>
+  /** Settings window only: move the orb back to its default corner. */
+  resetBallPosition?(): Promise<void>
   reportToolbarSize(size: ToolbarSize, selectionId?: string): Promise<void>
   beginResultReady(sessionId: string): Promise<ResultSessionSnapshot>
   ackResultReady(ack: ResultReadyAck): Promise<boolean>

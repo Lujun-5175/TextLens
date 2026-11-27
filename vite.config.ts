@@ -34,7 +34,8 @@ export default defineConfig({
         toolbar: fromRoot('src/renderer/toolbar/index.html'),
         result: fromRoot('src/renderer/result/index.html'),
         settings: fromRoot('src/renderer/settings/index.html'),
-        startup: fromRoot('src/renderer/startup/index.html')
+        startup: fromRoot('src/renderer/startup/index.html'),
+        ball: fromRoot('src/renderer/ball/index.html')
       }
     }
   }

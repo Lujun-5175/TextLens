@@ -115,7 +115,6 @@ export const DEFAULT_APPEARANCE_SETTINGS = {
 export const THEME_OPTIONS = [
   { id: 'warm', name: '暖白' },
   { id: 'classic', name: '经典' },
-  { id: 'sand', name: '米杏' },
   { id: 'sage', name: '苔绿' },
   { id: 'ocean', name: '海雾' }
 ] as const

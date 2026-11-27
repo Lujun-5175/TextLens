@@ -137,6 +137,10 @@ struct FrozenActionRequest {
     source_text: String,
     cursor: Option<Point>,
     target_language: Option<TranslationLanguage>,
+    /// Set only for an Ask session opened without a selection (floating orb).
+    /// Such a session has no source text by design, so the follow-up
+    /// preparation validator must not treat the empty text as a bug.
+    allow_empty_source: bool,
 }
 
 impl From<&ExecuteActionRequest> for FrozenActionRequest {
@@ -147,6 +151,7 @@ impl From<&ExecuteActionRequest> for FrozenActionRequest {
             source_text: request.text.clone(),
             cursor: request.cursor.clone(),
             target_language: request.target_language,
+            allow_empty_source: false,
         }
     }
 }
@@ -783,10 +788,39 @@ impl ActionService {
     /// Seeds selection context and waits for the first `continue_with_question`.
     pub fn open_ask<R: Runtime + 'static>(
         &self,
-        _app: &AppHandle<R>,
+        app: &AppHandle<R>,
         request: ExecuteActionRequest,
     ) -> Result<String, ActionServiceError> {
-        validate_request_shape(&request)?;
+        self.open_ask_with(app, request, false)
+    }
+
+    /// Open an Ask session with no source text, for the floating orb.
+    ///
+    /// Everything after the first question is identical to a selection-seeded
+    /// session: `continue_with_question` still uses the same provider, model and
+    /// thinking configuration.
+    pub fn open_ask_blank<R: Runtime + 'static>(
+        &self,
+        app: &AppHandle<R>,
+        request: ExecuteActionRequest,
+    ) -> Result<String, ActionServiceError> {
+        self.open_ask_with(app, request, true)
+    }
+
+    fn open_ask_with<R: Runtime + 'static>(
+        &self,
+        _app: &AppHandle<R>,
+        request: ExecuteActionRequest,
+        allow_empty_text: bool,
+    ) -> Result<String, ActionServiceError> {
+        validate_request_identity(&request)?;
+        // The toolbar's Ask action always carries a selection. Only the orb may
+        // open a session without one, and even then the length cap still
+        // applies so a crafted request cannot seed an oversized transcript.
+        if !allow_empty_text && request.text.trim().is_empty() {
+            return Err(ActionServiceError::Validation("选中文本为空".to_owned()));
+        }
+        validate_request_text(&request.text)?;
         let settings = self.inner.settings.get_settings();
         let action = prepared_action(&settings, &request.action_id)?;
         if action.kind != ActionKind::Ask {
@@ -809,8 +843,18 @@ impl ActionService {
             .get_api_key(&route.provider.id)?
             .filter(|value| !value.trim().is_empty())
             .ok_or_else(|| ActionServiceError::Validation("请先为服务商保存 API Key".to_owned()))?;
-        let ask_system = build_ask_seed_system(action, &request.text, &settings)?;
+        let ask_system = if allow_empty_text {
+            build_blank_ask_seed_system(action)?
+        } else {
+            build_ask_seed_system(action, &request.text, &settings)?
+        };
         let request_id = Uuid::new_v4().to_string();
+        // A blank Ask session must stay valid for every follow-up even though
+        // it has no source text; the flag travels with the frozen request so
+        // the preparation validator can tell it apart from a real empty
+        // selection, which is always a bug.
+        let mut frozen_request = FrozenActionRequest::from(&request);
+        frozen_request.allow_empty_source = allow_empty_text;
         let mut state = self.inner.state.lock();
         let ticket = state
             .sessions
@@ -825,7 +869,7 @@ impl ActionService {
             ActionSessionContext {
                 session_generation: ticket.session_generation,
                 request_generation: ticket.request_generation,
-                frozen_request: FrozenActionRequest::from(&request),
+                frozen_request,
                 route,
                 last_messages: Vec::new(),
                 committed_messages: Vec::new(),
@@ -1821,7 +1865,7 @@ impl ActionService {
     }
 }
 
-fn validate_request_shape(request: &ExecuteActionRequest) -> Result<(), ActionServiceError> {
+fn validate_request_identity(request: &ExecuteActionRequest) -> Result<(), ActionServiceError> {
     if !valid_routing_id(&request.session_id, 128)
         || !valid_routing_id(&request.action_id, 64)
         || !valid_window_label(&request.window_label)
@@ -1830,15 +1874,24 @@ fn validate_request_shape(request: &ExecuteActionRequest) -> Result<(), ActionSe
             "动作会话参数无效".to_owned(),
         ));
     }
-    if request.text.trim().is_empty() {
-        return Err(ActionServiceError::Validation("选中文本为空".to_owned()));
-    }
-    if request.text.chars().count() > AI_TEXT_LIMIT {
+    Ok(())
+}
+
+fn validate_request_text(text: &str) -> Result<(), ActionServiceError> {
+    if text.chars().count() > AI_TEXT_LIMIT {
         return Err(ActionServiceError::Validation(format!(
             "所选文本超过 {AI_TEXT_LIMIT} 个字符的上限"
         )));
     }
     Ok(())
+}
+
+fn validate_request_shape(request: &ExecuteActionRequest) -> Result<(), ActionServiceError> {
+    validate_request_identity(request)?;
+    if request.text.trim().is_empty() {
+        return Err(ActionServiceError::Validation("选中文本为空".to_owned()));
+    }
+    validate_request_text(&request.text)
 }
 
 fn validate_follow_up_question(question: &str) -> Result<(), ActionServiceError> {
@@ -2140,7 +2193,8 @@ fn transcript_for_messages(
 fn validate_prepared_session_data(data: &PreparedSessionData) -> Result<(), ActionServiceError> {
     if !valid_window_label(&data.frozen_request.window_label)
         || !valid_routing_id(&data.frozen_request.action_id, 64)
-        || data.frozen_request.source_text.trim().is_empty()
+        || (!data.frozen_request.allow_empty_source
+            && data.frozen_request.source_text.trim().is_empty())
         || !valid_routing_id(&data.route.provider.id, 128)
         || !valid_model_id(&data.route.model)
     {
@@ -2262,11 +2316,29 @@ fn build_ask_seed_system(
     text: &str,
     _settings: &AppSettings,
 ) -> Result<String, ActionServiceError> {
-    if text.chars().count() > AI_TEXT_LIMIT {
-        return Err(ActionServiceError::Validation(format!(
-            "所选文本超过 {AI_TEXT_LIMIT} 个字符的上限"
-        )));
-    }
+    expand_ask_seed(action, text, "")
+}
+
+/// Appended to the user's own Ask prompt for an orb-opened session.
+///
+/// The default prompt tells the model to answer "结合该上下文" and to say so
+/// when the context is insufficient. With an empty `<selection>` that would
+/// make every first answer start with "you didn't select any text", so the
+/// later instruction explicitly overrides it without discarding the persona
+/// and rules the user configured.
+const BLANK_ASK_NOTE: &str =
+    "注意：本轮用户没有划词选区，<selection> 为空。请直接回答用户的问题，不要要求用户补充选中文本。";
+
+fn build_blank_ask_seed_system(action: &ActionDefinition) -> Result<String, ActionServiceError> {
+    expand_ask_seed(action, "", BLANK_ASK_NOTE)
+}
+
+fn expand_ask_seed(
+    action: &ActionDefinition,
+    text: &str,
+    note: &str,
+) -> Result<String, ActionServiceError> {
+    validate_request_text(text)?;
     let prompt = action
         .prompt()
         .ok_or_else(|| ActionServiceError::Validation("AI 动作缺少提示词".to_owned()))?;
@@ -2275,7 +2347,11 @@ fn build_ask_seed_system(
             "AI 动作提示词必须包含 {TEXT_PLACEHOLDER}"
         )));
     }
-    let system = prompt.replace(TEXT_PLACEHOLDER, text);
+    let mut system = prompt.replace(TEXT_PLACEHOLDER, text);
+    if !note.is_empty() {
+        system.push('\n');
+        system.push_str(note);
+    }
     if system.chars().count() > AI_PROMPT_LIMIT {
         return Err(ActionServiceError::Validation(format!(
             "展开后的提示词超过 {AI_PROMPT_LIMIT} 个字符的上限"
@@ -3954,6 +4030,54 @@ mod tests {
         );
     }
 
+    #[test]
+    fn blank_ask_seed_keeps_the_persona_but_drops_the_selection_context() {
+        let settings = AppSettings::default();
+        let action = settings
+            .actions
+            .iter()
+            .find(|action| action.kind == ActionKind::Ask)
+            .expect("default ask action");
+
+        let seeded = build_ask_seed_system(action, "选中的句子", &settings).unwrap();
+        assert!(seeded.contains("选中的句子"));
+
+        let blank = build_blank_ask_seed_system(action).unwrap();
+        assert!(!blank.contains(TEXT_PLACEHOLDER));
+        assert!(!blank.contains("选中的句子"));
+        // The persona/rules survive; only the context block is empty.
+        assert!(blank.contains("<selection>"));
+        assert!(blank.contains(BLANK_ASK_NOTE));
+    }
+
+    #[test]
+    fn blank_ask_still_rejects_text_over_the_limit() {
+        let request = ExecuteActionRequest {
+            session_id: "blank-ask".to_owned(),
+            window_label: "result/blank-ask".to_owned(),
+            action_id: "ask-ai".to_owned(),
+            text: "x".repeat(AI_TEXT_LIMIT + 1),
+            cursor: None,
+            target_language: None,
+        };
+        // Identity and length are still enforced even though emptiness is not.
+        validate_request_identity(&request).unwrap();
+        assert!(validate_request_text(&request.text).is_err());
+    }
+
+    #[test]
+    fn the_toolbar_ask_path_still_refuses_an_empty_selection() {
+        let request = ExecuteActionRequest {
+            session_id: "toolbar-ask".to_owned(),
+            window_label: "result/toolbar-ask".to_owned(),
+            action_id: "ask-ai".to_owned(),
+            text: "   ".to_owned(),
+            cursor: None,
+            target_language: None,
+        };
+        assert!(validate_request_shape(&request).is_err());
+    }
+
     #[derive(Default)]
     struct CountingPreparationSecrets {
         value: Mutex<Option<String>>,
@@ -4119,6 +4243,76 @@ mod tests {
             FrozenActionRequest::from(&request),
             fixture_route("fixture-model"),
         )
+    }
+
+    #[test]
+    fn a_blank_ask_session_can_send_its_first_question() {
+        let mut settings =
+            configured_settings("provider-fixture", "fixture-model", ThinkingMode::Off);
+        let ask = settings
+            .actions
+            .iter_mut()
+            .find(|action| action.kind == ActionKind::Ask)
+            .unwrap();
+        ask.enabled = true;
+        ask.provider_id = Some("provider-fixture".to_owned());
+        ask.model_id = Some("fixture-model".to_owned());
+        let ask_id = ask.id.clone();
+        let seed_system = build_blank_ask_seed_system(
+            settings
+                .actions
+                .iter()
+                .find(|action| action.id == ask_id)
+                .unwrap(),
+        )
+        .unwrap();
+
+        let mut request = initial_request();
+        request.action_id = ask_id;
+        request.text = String::new();
+        let mut frozen = FrozenActionRequest::from(&request);
+        frozen.allow_empty_source = true;
+        let seed = FrozenPreparationSeed::Continue {
+            request: frozen,
+            route: fixture_route("fixture-model"),
+            committed_messages: Vec::new(),
+            question: "Explain opportunity cost".to_owned(),
+            ask_system: Some(seed_system),
+        };
+
+        // This is the exact path the orb's first question takes. Before the
+        // blank-source flag existed, preparation rejected it as an invalid
+        // session because the frozen source text was empty.
+        let resolved =
+            resolve_request_config(&seed, &settings, &request_ticket("blank-ask")).unwrap();
+        assert_eq!(resolved.session_data.last_messages.len(), 2);
+        assert_eq!(
+            resolved.session_data.last_messages[0].role,
+            ChatRole::System
+        );
+        assert!(resolved.session_data.last_messages[0]
+            .content
+            .contains(BLANK_ASK_NOTE));
+        assert_eq!(
+            resolved.session_data.last_messages[1].content,
+            "Explain opportunity cost"
+        );
+    }
+
+    #[test]
+    fn an_empty_selection_without_the_blank_flag_is_still_rejected() {
+        let (_settings, mut request, route) = ask_fixture();
+        request.source_text = String::new();
+        let data = PreparedSessionData {
+            frozen_request: request,
+            route,
+            last_messages: vec![
+                ChatMessage::system("seed".to_owned()),
+                ChatMessage::user("question".to_owned()),
+            ],
+            committed_messages: Vec::new(),
+        };
+        assert!(validate_prepared_session_data(&data).is_err());
     }
 
     #[test]

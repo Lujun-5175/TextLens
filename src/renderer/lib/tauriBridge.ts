@@ -15,6 +15,8 @@ import {
   TAURI_COMMANDS,
   TAURI_EVENTS,
   type AccessibilityStatus,
+  type BallSettings,
+  type BallSettingsUpdate,
   type ActionStreamEvent,
   type ConnectionTestResult,
   type Point,
@@ -157,6 +159,22 @@ function parseSyncResult(value: unknown): ProviderModelsSyncResult {
     ok: false,
     message: typeof record.message === 'string' ? record.message : '同步模型失败',
     ...(typeof record.status === 'number' ? { status: record.status } : {})
+  }
+}
+
+function parseBallSettings(value: unknown): BallSettings {
+  const record = value && typeof value === 'object' ? value as Record<string, unknown> : {}
+  const size = typeof record.size === 'number' && Number.isFinite(record.size)
+    ? record.size
+    : 56
+  const askActionId = typeof record.askActionId === 'string' && record.askActionId.trim()
+    ? record.askActionId
+    : null
+  return {
+    visible: record.visible === true,
+    size,
+    hideInFullscreen: record.hideInFullscreen === true,
+    askActionId
   }
 }
 
@@ -359,6 +377,24 @@ export function installTauriBridge(): void {
     },
     async hideToolbar(selectionId?: string) {
       await invoke(TAURI_COMMANDS.hideToolbar, { selectionId: selectionId ?? null })
+    },
+    async openAskFromBall() {
+      return parseRunActionResult(await invoke(TAURI_COMMANDS.openAskFromBall))
+    },
+    async moveBall(x: number, y: number) {
+      await invoke(TAURI_COMMANDS.moveBall, { x: Math.round(x), y: Math.round(y) })
+    },
+    async cycleBallSize() {
+      await invoke(TAURI_COMMANDS.cycleBallSize)
+    },
+    async getBallSettings() {
+      return parseBallSettings(await invoke(TAURI_COMMANDS.getBallSettings))
+    },
+    async updateBallSettings(update: BallSettingsUpdate) {
+      return parseBallSettings(await invoke(TAURI_COMMANDS.updateBallSettings, { update }))
+    },
+    async resetBallPosition() {
+      await invoke(TAURI_COMMANDS.resetBallPosition)
     },
     async reportToolbarSize(size: ToolbarSize, selectionId?: string) {
       await invoke(TAURI_COMMANDS.reportToolbarSize, { size, selectionId: selectionId ?? null })

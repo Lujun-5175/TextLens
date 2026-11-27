@@ -11,13 +11,23 @@ import {
 } from '../../shared'
 import type { ResultSessionBootstrap } from './resultSessionBootstrap'
 
-const { startDragging, startResizeDragging } = vi.hoisted(() => ({
-  startDragging: vi.fn(),
-  startResizeDragging: vi.fn()
-}))
+const { startDragging, startResizeDragging, minimizeWindow, toggleMaximize, isMaximized } =
+  vi.hoisted(() => ({
+    startDragging: vi.fn(),
+    startResizeDragging: vi.fn(),
+    minimizeWindow: vi.fn(),
+    toggleMaximize: vi.fn(),
+    isMaximized: vi.fn()
+  }))
 
 vi.mock('@tauri-apps/api/window', () => ({
-  getCurrentWindow: () => ({ startDragging, startResizeDragging })
+  getCurrentWindow: () => ({
+    startDragging,
+    startResizeDragging,
+    minimize: minimizeWindow,
+    toggleMaximize,
+    isMaximized
+  })
 }))
 
 function resultSnapshot(
@@ -200,6 +210,12 @@ beforeEach(() => {
   vi.resetModules()
   startDragging.mockReset()
   startDragging.mockResolvedValue(undefined)
+  minimizeWindow.mockReset()
+  minimizeWindow.mockResolvedValue(undefined)
+  toggleMaximize.mockReset()
+  toggleMaximize.mockResolvedValue(undefined)
+  isMaximized.mockReset()
+  isMaximized.mockResolvedValue(false)
   startResizeDragging.mockReset()
   startResizeDragging.mockResolvedValue(undefined)
 })
@@ -371,7 +387,7 @@ describe('ResultApp window interactions', () => {
     }))
     const retry = screen.getByRole('button', { name: '重试' })
     expect(retry).toBeDisabled()
-    expect(retry).toHaveAttribute('title', '使用相同选区重新生成')
+    expect(retry).toHaveAttribute('title', '重新发送上一次请求')
 
     act(() => emitSettings(settingsWithFontSize(20)))
 
@@ -496,6 +512,24 @@ describe('ResultApp window interactions', () => {
     warn.mockRestore()
   })
 
+  it('minimizes and maximizes through the native window controls', async () => {
+    const { container } = await renderResult()
+
+    fireEvent.click(screen.getByRole('button', { name: '最小化结果窗口' }))
+    await waitFor(() => expect(minimizeWindow).toHaveBeenCalledTimes(1))
+
+    // After the toggle the window reports itself maximized, so the control
+    // becomes "restore" and the frame drops its rounded corners.
+    isMaximized.mockResolvedValue(true)
+    fireEvent.click(screen.getByRole('button', { name: '最大化结果窗口' }))
+    await waitFor(() => expect(toggleMaximize).toHaveBeenCalledTimes(1))
+
+    expect(await screen.findByRole('button', { name: '还原结果窗口' })).toBeInTheDocument()
+    await waitFor(() =>
+      expect(container.querySelector('.result-window')).toHaveAttribute('data-maximized', 'true')
+    )
+  })
+
   it('shows aligned compact translation controls and pin/close actions on Windows', async () => {
     const userAgent = vi
       .spyOn(window.navigator, 'userAgent', 'get')
@@ -511,6 +545,8 @@ describe('ResultApp window interactions', () => {
       const buttons = [...actions.querySelectorAll('button')]
       expect(buttons.map((button) => button.getAttribute('aria-label'))).toEqual([
         '置顶结果窗口',
+        '最小化结果窗口',
+        '最大化结果窗口',
         '关闭结果窗口'
       ])
       expect(screen.queryByRole('button', { name: '关闭' })).not.toBeInTheDocument()
@@ -544,12 +580,14 @@ describe('ResultApp window interactions', () => {
     expect(screen.getByRole('button', { name: '关闭结果窗口' })).toBeInTheDocument()
     expect(container.querySelector('.result-count')).not.toBeInTheDocument()
     expect(footer).not.toHaveTextContent(/\d[\d,]*\s*字/u)
-    expect(footer.querySelector('.result-followup')).toBeInTheDocument()
+    expect(footer.querySelector('.result-composer')).toBeInTheDocument()
     expect(screen.getByRole('textbox', { name: '继续提问' })).toHaveAttribute(
       'placeholder',
-      '输入继续提问'
+      '继续提问…'
     )
-    expect(footer.firstElementChild).toHaveClass('result-followup')
+    expect(footer.querySelector('.result-footer-row')?.firstElementChild).toHaveClass(
+      'result-composer'
+    )
     // Retry, copy and insert-back: all footer controls share one style.
     expect([...footerActions.children]).toHaveLength(3)
     for (const control of footerActions.children) {
@@ -603,13 +641,15 @@ describe('ResultApp window interactions', () => {
     expect(screen.getByRole('combobox', { name: '翻译目标语言' })).toHaveValue('fr-FR')
   })
 
-  it('shows the close button only in manual dismiss mode', async () => {
+  it('closes from the header and keeps no footer close button', async () => {
     const manualSettings = settingsWithFontSize()
     manualSettings.result = { ...manualSettings.result, dismissMode: 'manual' }
     const { api, container } = await renderResult(completedSession, manualSettings)
 
-    const close = screen.getByRole('button', { name: '关闭' })
-    expect(container.querySelector('.result-actions')).toContainElement(close)
+    // The footer no longer duplicates the header ✕.
+    expect(screen.queryByRole('button', { name: '关闭' })).not.toBeInTheDocument()
+    const close = screen.getByRole('button', { name: '关闭结果窗口' })
+    expect(container.querySelector('.result-header')).toContainElement(close)
     fireEvent.click(close)
 
     await waitFor(() => expect(api.closeResult).toHaveBeenCalledWith('session-1'))
@@ -676,22 +716,18 @@ describe('ResultApp window interactions', () => {
     expect(await screen.findByRole('button', { name: '已复制' })).toBeInTheDocument()
   })
 
-  it('expands the follow-up input and submits with Enter using the current session', async () => {
-    const { continueAction, container } = await renderResult(askCompletedSession)
+  it('submits with Enter from the ask composer using the current session', async () => {
+    const { continueAction } = await renderResult(askCompletedSession)
     const input = screen.getByRole('textbox', { name: '继续提问' })
-    expect(input).toHaveAttribute('placeholder', '输入问题，基于选中文本提问')
+    expect(input).toHaveAttribute('placeholder', '基于选中文本提问…')
 
-    const expand = screen.getByRole('button', { name: '放大继续提问输入框' })
-    fireEvent.click(expand)
-    expect(screen.getByRole('button', { name: '收起继续提问输入框' })).toHaveAttribute(
-      'aria-expanded',
-      'true'
-    )
-    expect(container.querySelector('.result-window')).toHaveClass(
-      'result-window--followup-expanded'
-    )
+    // Ask uses a chat composer that grows with its content, so the manual
+    // expand control belongs to non-ask sessions only.
+    expect(screen.queryByRole('button', { name: '放大继续提问输入框' })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '发送问题' })).toBeDisabled()
 
     fireEvent.change(input, { target: { value: '  解释第二句话  ' } })
+    expect(screen.getByRole('button', { name: '发送问题' })).not.toBeDisabled()
     fireEvent.keyDown(input, { key: 'Enter', shiftKey: true })
     expect(continueAction).not.toHaveBeenCalled()
     fireEvent.keyDown(input, { key: 'Enter' })
@@ -788,7 +824,7 @@ describe('ResultApp window interactions', () => {
 
     const input = screen.getByRole('textbox', { name: '继续提问' })
     expect(input).not.toBeDisabled()
-    expect(input).toHaveAttribute('placeholder', '输入问题，基于选中文本提问')
+    expect(input).toHaveAttribute('placeholder', '基于选中文本提问…')
 
     fireEvent.change(input, { target: { value: '这段话什么意思？' } })
     fireEvent.keyDown(input, { key: 'Enter' })
@@ -836,6 +872,51 @@ describe('ResultApp window interactions', () => {
       expect(screen.getByText('这是解释。')).toBeInTheDocument()
     })
     expect(screen.queryByText('已载入选中文本。请在下方输入问题。')).not.toBeInTheDocument()
+  })
+
+  it('treats an orb-opened ask session as a plain conversation without source text', async () => {
+    const askSettings = settingsWithFontSize()
+    const blankSession = resultSnapshot({
+      actionId: 'ask-ai',
+      status: 'completed',
+      content: '',
+      contentScalarCount: 0,
+      selection: {
+        selectionId: 'blank-ask-session',
+        text: '',
+        sourceApp: { name: 'TextLens', bundleId: null },
+        anchor: { kind: 'cursor', x: 40, y: 900 },
+        direction: 'unknown',
+        isFullscreen: false
+      }
+    })
+    const { continueAction, container } = await renderResult(blankSession, askSettings)
+
+    // An orb-opened session opens on a welcome with ready-made questions
+    // instead of a single grey sentence.
+    expect(screen.getByText('有什么可以帮你的？')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '用三句话解释「机会成本」' })).toBeInTheDocument()
+    // No selection means nothing to fold away, so the original-text toggle
+    // must not appear at all.
+    expect(screen.queryByRole('button', { name: '隐藏原文' })).not.toBeInTheDocument()
+    expect(container.querySelector('.result-original')).not.toBeInTheDocument()
+    // There is no source application to paste back into either.
+    expect(screen.queryByRole('button', { name: '插入原文' })).not.toBeInTheDocument()
+
+    const input = screen.getByRole('textbox', { name: '继续提问' })
+    expect(input).not.toBeDisabled()
+    expect(input).toHaveAttribute('placeholder', '问点什么…')
+
+    // A suggestion fills the composer rather than sending immediately: the
+    // user should be able to adjust it before asking.
+    fireEvent.click(screen.getByRole('button', { name: '用三句话解释「机会成本」' }))
+    await waitFor(() => expect(input).toHaveValue('用三句话解释「机会成本」'))
+
+    fireEvent.change(input, { target: { value: '解释一下机会成本' } })
+    fireEvent.keyDown(input, { key: 'Enter' })
+    await waitFor(() => {
+      expect(continueAction).toHaveBeenCalledWith('session-1', '解释一下机会成本')
+    })
   })
 
   it('shows the selected provider and model in non-translation result headers', async () => {

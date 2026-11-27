@@ -1,3 +1,5 @@
+import katex from 'katex'
+
 /**
  * Lightweight Markdown source cleanup for model/translation output.
  *
@@ -40,7 +42,9 @@ function expandCollapsedBulletList(line: string): string {
 
 type LineKind = 'blank' | 'list' | 'table' | 'heading' | 'quote' | 'hr' | 'fence' | 'math' | 'prose'
 
-const INLINE_CODE = /(`+)[^`]*?\1/gu
+// Only 1-2 backticks delimit inline code here. A run of 3+ is a fence marker
+// and must stay visible to the fence repair in expandInlineFences.
+const INLINE_CODE = /(`{1,2})[^`]*?\1/gu
 const LATEX_INLINE = /\\\(([^\n]*?)\\\)/gu
 const LATEX_COMMAND = /\\[a-z]{2,}/u
 const BARE_PAREN = /\(([^()\n]{1,200})\)/gu
@@ -49,7 +53,12 @@ const BARE_PAREN = /\(([^()\n]{1,200})\)/gu
 function inlineCodeSpans(line: string): Array<[number, number]> {
   const spans: Array<[number, number]> = []
   for (const match of line.matchAll(INLINE_CODE)) {
-    spans.push([match.index, match.index + match[0].length])
+    const start = match.index
+    const end = start + match[0].length
+    // A match that touches another backtick is the tail of a longer run (a
+    // fence marker), not an inline code span.
+    if (line[start - 1] === '`' || line[end] === '`') continue
+    spans.push([start, end])
   }
   return spans
 }
@@ -183,9 +192,18 @@ function rewriteInlineLine(line: string): string {
 function rewriteInlineMath(line: string): string {
   if (!line.includes('\\(')) return line
   return mapOutsideInlineCode(line, (segment) =>
-    segment.replace(LATEX_INLINE, (_all, body: string) => {
+    segment.replace(LATEX_INLINE, (all, body: string) => {
       const trimmed = body.trim()
-      return trimmed.length > 0 ? `$${trimmed}$` : '$$'
+      // An empty `\(\)` is noise, not a formula; keep the source rather than
+      // emitting a bare `$$` pair in the middle of a sentence.
+      if (trimmed.length === 0) return all
+      // `\(...\)` that already contains `$` mixes two delimiter styles. Wrapping
+      // it would nest dollars, let remark-math pair them across the paragraph,
+      // and one broken formula then swallows the rest of the answer as raw TeX.
+      if (trimmed.includes('$')) return all
+      // Never turn source we cannot typeset into math: it would only become a
+      // red error. Leaving the original delimiters shows it as text.
+      return parsesAsMath(trimmed, false) ? `$${trimmed}$` : all
     })
   )
 }
@@ -202,11 +220,15 @@ export function wrapBareParenMath(line: string): string {
   if (!line.includes('\\')) return line
   return mapOutsideInlineCode(line, (segment) =>
     mapOutsideDollarMath(segment, (text) =>
-      text.replace(BARE_PAREN, (all, body: string) =>
+      text.replace(BARE_PAREN, (all, body: string, offset: number) => {
         // Keep the parentheses inside the formula: `(a+b)` is content, not
         // grouping for the delimiters.
-        LATEX_COMMAND.test(body) && !body.includes('$') ? `$${all}$` : all
-      )
+        if (body.includes('$')) return all
+        // Adjacent dollars would merge into `$$` (display math) mid-sentence.
+        if (text[offset - 1] === '$' || text[offset + all.length] === '$') return all
+        if (!LATEX_COMMAND.test(body)) return all
+        return parsesAsMath(all, false) ? `$${all}$` : all
+      })
     )
   )
 }
@@ -251,6 +273,208 @@ export function escapeCurrencyDollars(line: string): string {
   })
 }
 
+/**
+ * Whether KaTeX can actually typeset this span.
+ *
+ * The markdown layer cannot tell math from prose: remark-math pairs dollars by
+ * counting, so a stray `$` claims the next one and KaTeX prints the span
+ * between them as red source. Rather than guess from length or script, ask the
+ * renderer's own parser — with the same options it will use later — and keep a
+ * span only if it parses.
+ */
+function parsesAsMath(body: string, display: boolean): boolean {
+  if (body.trim().length === 0) return false
+  // Inline code inside math is always a mistake; it never parses as intended.
+  if (body.includes('`')) return false
+  // Streaming re-normalizes the whole answer on every token; without this the
+  // already-complete formulas would be parsed again on each batch.
+  const key = `${display ? 'd' : 'i'}:${body}`
+  const cached = mathParseCache.get(key)
+  if (cached !== undefined) return cached
+  const result = tryParseMath(body, display)
+  if (mathParseCache.size >= MATH_PARSE_CACHE_LIMIT) mathParseCache.clear()
+  mathParseCache.set(key, result)
+  return result
+}
+
+/** Bounded memo for `parsesAsMath`; clearing wholesale is enough. */
+const mathParseCache = new Map<string, boolean>()
+const MATH_PARSE_CACHE_LIMIT = 500
+
+function tryParseMath(body: string, display: boolean): boolean {
+  try {
+    katex.renderToString(body, {
+      displayMode: display,
+      output: 'html',
+      throwOnError: true,
+      strict: 'ignore',
+      // Trust governs what may run later, not what is valid LaTeX: the
+      // renderer enforces `trust: false` on its own pass.
+      trust: true,
+      maxSize: 20,
+      maxExpand: 1_000
+    })
+    return true
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Escapes `$` runs KaTeX cannot parse, and every unpaired run, so a stray
+ * dollar cannot capture the rest of the answer. Inline code, already-escaped
+ * dollars and real formulas are left alone.
+ */
+export function balanceDollarDelimiters(line: string): string {
+  if (!line.includes('$')) return line
+  const codeSpans = inlineCodeSpans(line)
+  const runs: Array<{ start: number; length: number }> = []
+  for (const match of line.matchAll(/\$+/gu)) {
+    const start = match.index ?? 0
+    const length = match[0].length
+    if (codeSpans.some(([from, to]) => start >= from && start < to)) continue
+    if (start > 0 && line[start - 1] === '\\') continue
+    runs.push({ start, length })
+  }
+  if (runs.length === 0) return line
+
+  const escape = new Set<number>()
+  let index = 0
+  while (index < runs.length) {
+    const open = runs[index]!
+    let match = -1
+    for (let next = index + 1; next < runs.length; next += 1) {
+      if (runs[next]!.length === open.length) {
+        match = next
+        break
+      }
+    }
+    if (match === -1) {
+      escape.add(index)
+      index += 1
+      continue
+    }
+    const close = runs[match]!
+    if (parsesAsMath(line.slice(open.start + open.length, close.start), open.length === 2)) {
+      index = match + 1
+    } else {
+      // Escape both halves of the rejected pair. Escaping only the opener would
+      // let the closer pair with the next `$` in the line and invent a formula
+      // out of the prose between them.
+      escape.add(index)
+      escape.add(match)
+      index = match + 1
+    }
+  }
+  if (escape.size === 0) return line
+
+  let out = ''
+  let cursor = 0
+  for (let position = 0; position < runs.length; position += 1) {
+    if (!escape.has(position)) continue
+    const run = runs[position]!
+    out += `${line.slice(cursor, run.start)}\\${'$'.repeat(run.length)}`
+    cursor = run.start + run.length
+  }
+  return out + line.slice(cursor)
+}
+
+const INLINE_FENCE = /(`{3,}|~{3,})/gu
+
+/**
+ * Rewrites a complete fence written inline — `文字： ```python … ``` ` — into a
+ * real block.
+ *
+ * CommonMark only opens a fence at the start of a line. Left alone, the
+ * *closing* marker opens one instead, and every line after it is swallowed into
+ * a code block. Only a marker whose closer is on the same line is expanded, so
+ * an incidental run of backticks in prose keeps its inline meaning.
+ */
+export function expandInlineFences(lines: readonly string[]): string[] {
+  const out: string[] = []
+  let fenceChar: string | null = null
+  let fenceLength = 0
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index]!
+    if (fenceChar !== null) {
+      out.push(line)
+      if (isMatchingFenceClose(line, fenceChar, fenceLength)) fenceChar = null
+      continue
+    }
+    const opener = findInlineFenceOpener(line)
+    if (!opener) {
+      out.push(line)
+      continue
+    }
+    const sameLine = expandInlineFence(line, opener)
+    if (sameLine) {
+      out.push(...sameLine)
+      continue
+    }
+    // The opener sits mid-line but closes somewhere below. Move it to its own
+    // line so the parser sees a fence; without a closer below, splitting would
+    // turn a stray run of backticks into a block that swallows the rest.
+    if (!hasClosingFenceBelow(lines, index + 1, opener.marker)) {
+      out.push(line)
+      continue
+    }
+    const before = line.slice(0, opener.start).trimEnd()
+    const rest = line.slice(opener.start + opener.length)
+    const language = rest.match(/^[A-Za-z0-9_+.#-]*/u)?.[0] ?? ''
+    const body = rest.slice(language.length)
+    out.push(before, `${opener.marker}${language}${body}`)
+  }
+  return out
+}
+
+function findInlineFenceOpener(
+  line: string
+): { start: number; length: number; marker: string } | null {
+  const codeSpans = inlineCodeSpans(line)
+  for (const match of line.matchAll(INLINE_FENCE)) {
+    const start = match.index ?? 0
+    if (codeSpans.some(([from, to]) => start >= from && start < to)) continue
+    // Only a marker that follows text is misplaced; a leading one is fine.
+    if (line.slice(0, start).trim().length === 0) return null
+    return { start, length: match[0].length, marker: match[0] }
+  }
+  return null
+}
+
+function hasClosingFenceBelow(
+  lines: readonly string[],
+  from: number,
+  marker: string
+): boolean {
+  const char = marker[0]!
+  for (let index = from; index < lines.length; index += 1) {
+    const close = lines[index]!.match(/^[ 	]{0,3}(`{3,}|~{3,})[ 	]*$/u)
+    if (close && close[1]![0] === char && close[1]!.length >= marker.length) return true
+  }
+  return false
+}
+
+function expandInlineFence(
+  line: string,
+  open: { start: number; length: number; marker: string }
+): string[] | null {
+  const before = line.slice(0, open.start).trimEnd()
+  const rest = line.slice(open.start + open.length)
+  // The language token ends at the first whitespace; anything after it on the
+  // same line is the first line of code.
+  const language = rest.match(/^[A-Za-z0-9_+.#-]*/u)?.[0] ?? ''
+  const body = rest.slice(language.length)
+  const closer = body.indexOf(open.marker)
+  if (closer === -1) return null
+  const code = body.slice(0, closer).replace(/^[ \t]+/u, '').trimEnd()
+  const after = body.slice(closer + open.length).trim()
+  const result = [before, `${open.marker}${language}`]
+  for (const codeLine of code.split('\n')) result.push(codeLine)
+  result.push(open.marker)
+  if (after.length > 0) result.push(after)
+  return result
+}
+
 export function normalizeMarkdownSource(source: string): string {
   if (!source) return source
 
@@ -261,7 +485,7 @@ export function normalizeMarkdownSource(source: string): string {
     .split('\n')
     .map(escapeCurrencyDollars)
     .join('\n')
-  const lines = text.split('\n')
+  const lines = expandInlineFences(text.split('\n'))
   const out: string[] = []
   let fenceChar: string | null = null
   let fenceLength = 0
@@ -338,7 +562,7 @@ export function normalizeMarkdownSource(source: string): string {
       for (const item of expanded.split('\n')) emitLine(item, 'list')
       continue
     }
-    const line = convertListMarkers(raw)
+    const line = balanceDollarDelimiters(convertListMarkers(raw))
     const kind = priorKind === 'list' && /^[ \t]{2,}\S/u.test(line)
       ? 'list'
       : classifyLine(line)

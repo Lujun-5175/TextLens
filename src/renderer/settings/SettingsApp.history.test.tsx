@@ -83,9 +83,8 @@ describe('SettingsApp result history', () => {
     await openHistorySection()
 
     expect(screen.getByText(PRIVACY_NOTE)).toBeInTheDocument()
-    expect(
-      await screen.findByText('还没有记录。完成一次 AI 动作后会出现在这里。')
-    ).toBeInTheDocument()
+    expect(await screen.findByText('还没有记录')).toBeInTheDocument()
+    expect(screen.getByText('完成一次 AI 动作后会出现在这里。')).toBeInTheDocument()
   })
 
   it('lists entries newest-first with time, action, model and a first-line summary', async () => {
@@ -147,7 +146,7 @@ describe('SettingsApp result history', () => {
     expect(screen.queryByText('总结')).not.toBeInTheDocument()
 
     fireEvent.change(search, { target: { value: 'zzz-no-match' } })
-    expect(screen.getByText('没有匹配的记录。')).toBeInTheDocument()
+    expect(screen.getByText('没有匹配的记录')).toBeInTheDocument()
   })
 
   it('expands and collapses the full answer', async () => {
@@ -199,7 +198,7 @@ describe('SettingsApp result history', () => {
     await waitFor(() =>
       expect(bridge.deleteResultHistoryEntry).toHaveBeenCalledWith('entry-2')
     )
-    expect(await screen.findByText('还没有记录。完成一次 AI 动作后会出现在这里。')).toBeInTheDocument()
+    expect(await screen.findByText('还没有记录')).toBeInTheDocument()
     expect(screen.queryByText('第一行结论')).not.toBeInTheDocument()
   })
 
@@ -224,7 +223,7 @@ describe('SettingsApp result history', () => {
     fireEvent.click(within(confirmDialog).getByRole('button', { name: '清空全部' }))
 
     await waitFor(() => expect(bridge.clearResultHistory).toHaveBeenCalledOnce())
-    expect(await screen.findByText('还没有记录。完成一次 AI 动作后会出现在这里。')).toBeInTheDocument()
+    expect(await screen.findByText('还没有记录')).toBeInTheDocument()
     expect(screen.queryByText('第一行结论')).not.toBeInTheDocument()
   })
 
@@ -236,8 +235,6 @@ describe('SettingsApp result history', () => {
     await openHistorySection()
 
     expect(await screen.findByRole('alert')).toHaveTextContent('results.jsonl 被占用')
-    expect(
-      screen.queryByText('还没有记录。完成一次 AI 动作后会出现在这里。')
-    ).not.toBeInTheDocument()
+    expect(screen.queryByText('还没有记录')).not.toBeInTheDocument()
   })
 })

@@ -326,6 +326,11 @@ pub enum Theme {
     Warm,
     #[serde(rename = "classic")]
     Classic,
+    /// Retired from the picker (the palette read as muddy next to the others).
+    ///
+    /// The variant stays so an existing `settings.json` that still says "sand"
+    /// keeps deserializing; `normalize_and_validate` folds it back to `Warm`
+    /// instead of failing the whole file, which used to mean a startup panic.
     #[serde(rename = "sand")]
     Sand,
     #[serde(rename = "sage")]
@@ -1304,6 +1309,12 @@ impl AppSettings {
     pub fn normalize_and_validate(mut self) -> Result<Self, String> {
         self.version = SETTINGS_VERSION;
         self.capture_shortcut = self.capture_shortcut.trim().to_owned();
+        // The "sand" palette is no longer offered; anyone still wearing it
+        // lands on the default theme on the next launch instead of a theme the
+        // picker cannot show.
+        if self.appearance.theme == Theme::Sand {
+            self.appearance.theme = Theme::Warm;
+        }
 
         if self.capture_shortcut.len() > 128 || !valid_shortcut(&self.capture_shortcut) {
             return Err("捕获快捷键格式无效".to_owned());
@@ -1695,6 +1706,20 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn a_retired_sand_theme_falls_back_to_the_default_palette() {
+        // The palette was removed from the picker. An existing settings file
+        // that still says "sand" must keep parsing and land on the default
+        // theme, not fail the load (a rejected file used to panic at startup).
+        let mut settings = AppSettings::default();
+        settings.appearance.theme = Theme::Sand;
+        let normalized = settings.normalize_and_validate().unwrap();
+        assert_eq!(normalized.appearance.theme, Theme::Warm);
+
+        let parsed: Theme = serde_json::from_str("\"sand\"").unwrap();
+        assert_eq!(parsed, Theme::Sand);
+    }
 
     #[test]
     fn execute_action_request_accepts_fractional_cursor_coordinates() {

@@ -86,6 +86,7 @@ import { getErrorMessage } from '../lib/errors'
 import { applyTheme } from '../lib/theme'
 import { CustomActionDialog, type ActionEditorValue } from './CustomActionDialog'
 import { ProviderPresetDialog } from './ProviderPresetDialog'
+import { BallPanel } from './BallPanel'
 import { RequestLogPanel } from './RequestLogPanel'
 import { mergeProviderModelsOnPick } from './providerModels'
 import {
@@ -120,6 +121,7 @@ type SettingsSectionId =
   | 'general'
   | 'permissions'
   | 'appearance'
+  | 'ball'
   | 'providers'
   | 'actions'
   | 'history'
@@ -146,6 +148,11 @@ const SETTINGS_SECTIONS: ReadonlyArray<{
     id: 'appearance',
     label: '外观',
     blurb: '主题、工具栏显示方式，以及结果窗口的字号与透明度。'
+  },
+  {
+    id: 'ball',
+    label: '悬浮球',
+    blurb: '大小、显隐、全屏时是否隐藏，以及它打开的 AI 动作。'
   },
   {
     id: 'providers',
@@ -178,6 +185,24 @@ const SETTINGS_SECTIONS: ReadonlyArray<{
     blurb: '为个别程序选择抓取方式，并限制划词助手在哪些应用中生效。'
   }
 ]
+
+/**
+ * Words users search for that the section labels do not contain. Searching
+ * "翻译方向" or "API Key" had no home before: both live under a section whose
+ * name shares none of those characters.
+ */
+const SECTION_SEARCH_KEYWORDS: Readonly<Record<SettingsSectionId, string[]>> = {
+  general: ['启动', '关闭', '托盘', '自动启动', '登入', '划词开关', '跟随鼠标', '置顶', '透明'],
+  permissions: ['辅助功能', '授权', '快捷键', '检测', '诊断', '权限'],
+  appearance: ['主题', '字号', '字体', '大小', '透明度', '颜色', '暗色', '亮色'],
+  ball: ['悬浮球', '小球', '圆形按钮', '球', '尺寸', '全屏', '隐藏'],
+  providers: ['api key', '密钥', '服务商', '模型', 'base url', '接口', '连接测试', 'deepseek', 'openai'],
+  actions: ['动作', '工具条', '工具栏', '提示词', 'prompt', '问ai', '翻译', '总结', '解释', '润色', '顺序'],
+  history: ['历史', '记录', '复制', '删除', '搜索', '结果'],
+  requests: ['请求', '日志', 'token', '用量', '失败', '审计'],
+  language: ['语言', '翻译方向', '反向翻译', '中英', 'locale'],
+  capture: ['捕获', '过滤', '黑名单', '白名单', '应用', 'pdf', 'ctrl+c', '选区']
+}
 
 const SETTINGS_ACTIVE_SECTION_STORAGE_KEY = 'textlens.settings.active-section'
 
@@ -426,6 +451,7 @@ export function SettingsApp(): JSX.Element {
   const [quitConfirmationOpen, setQuitConfirmationOpen] = useState(false)
   const [draggingId, setDraggingId] = useState<string | null>(null)
   const [activeSection, setActiveSection] = useState<SettingsSectionId>(restoredSettingsSection)
+  const [navQuery, setNavQuery] = useState('')
   const activeSectionRef = useRef(activeSection)
   activeSectionRef.current = activeSection
   useLayoutEffect(() => {
@@ -1580,12 +1606,22 @@ export function SettingsApp(): JSX.Element {
   const busy = operation !== null
   const permission = accessibilityPresentation(accessibility)
   const selectionAvailable = accessibility?.available ?? accessibility?.trusted ?? false
-  const visibleSections = SETTINGS_SECTIONS
+  const navNeedle = navQuery.trim().toLowerCase()
+  const visibleSections = SETTINGS_SECTIONS.filter((section) => {
+    if (!navNeedle) return true
+    const haystack = [section.label, section.blurb, ...SECTION_SEARCH_KEYWORDS[section.id]]
+      .join(' ')
+      .toLowerCase()
+    return haystack.includes(navNeedle)
+  })
   const activeSectionId = visibleSections.some((section) => section.id === activeSection)
     ? activeSection
-    : visibleSections[0]!.id
-  const activeMeta = visibleSections.find((section) => section.id === activeSectionId)
-    ?? visibleSections[0]!
+    // No match means "nothing to jump to", not "there is no section": falling
+    // back to the first match keeps the pane where the user was while the nav
+    // shows the empty message.
+    : visibleSections[0]?.id ?? activeSection
+  const activeMeta = SETTINGS_SECTIONS.find((section) => section.id === activeSectionId)
+    ?? SETTINGS_SECTIONS[0]!
 
   return (
     <main className="settings-page settings-page--shell">
@@ -1597,7 +1633,26 @@ export function SettingsApp(): JSX.Element {
             <p>划词后快速复制、搜索或交给 AI。</p>
           </div>
         </header>
+        <div className="settings-nav-search">
+          <Search size={14} aria-hidden="true" />
+          <input
+            type="search"
+            aria-label="搜索设置"
+            placeholder="搜索设置…"
+            value={navQuery}
+            onChange={(event) => setNavQuery(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === 'Enter' && visibleSections.length > 0) {
+                setActiveSection(visibleSections[0]!.id)
+              }
+              if (event.key === 'Escape') setNavQuery('')
+            }}
+          />
+        </div>
         <nav className="settings-nav" aria-label="设置分区">
+          {visibleSections.length === 0 && (
+            <p className="settings-nav-empty">没有匹配的设置页</p>
+          )}
           {visibleSections.map((section) => (
             <button
               key={section.id}
@@ -1778,7 +1833,7 @@ export function SettingsApp(): JSX.Element {
                     extra={draft.result.lastSize ? <button className="button button--quiet" type="button" disabled={busy} onClick={() => void resetResultSize()}>重置尺寸</button> : undefined} />
                   <SettingSwitch title="默认置顶" description="新打开的结果窗口保持在其他窗口上方；也可在窗口标题栏临时切换。"
                     checked={draft.result.defaultPinned} onChange={(defaultPinned) => changeDraft((current) => ({ ...current, result: { ...current.result, defaultPinned } }))} />
-                  <div className="setting-row"><div><strong>关闭方式</strong><p>仅未置顶窗口执行；置顶窗口始终忽略自动关闭。</p></div>
+                  <div className="setting-row"><div><strong>关闭方式</strong><p>「手动」时窗口只在你点关闭时消失，即使没有置顶；自动关闭只作用于未置顶窗口。</p></div>
                     <select className="control result-mode-control" aria-label="关闭方式" value={draft.result.dismissMode}
                       onChange={(event) => changeDraft((current) => ({ ...current, result: { ...current.result, dismissMode: event.target.value as PublicSettings['result']['dismissMode'] } }))}>
                       <option value="blur">失去焦点时关闭（推荐）</option><option value="pointer-leave">鼠标移出后关闭</option><option value="manual">手动关闭</option>
@@ -1997,9 +2052,13 @@ export function SettingsApp(): JSX.Element {
             </article>
           ))}
           {draft.providers.length === 0 && (
-            <div className="settings-card empty-card empty-card--guided">
-              <strong>尚未配置服务商</strong>
-              <p>本地「复制」「搜索」仍可使用。需要翻译、总结等 AI 功能时，点右上角「添加服务商」开始。</p>
+            <div className="settings-card">
+              <div className="empty-state">
+                <p className="empty-state__title">尚未配置服务商</p>
+                <p className="empty-state__hint">
+                  本地「复制」「搜索」仍可使用。需要翻译、总结等 AI 功能时，点右上角「添加服务商」开始。
+                </p>
+              </div>
             </div>
           )}
         </div>
@@ -2033,15 +2092,42 @@ export function SettingsApp(): JSX.Element {
           onDragCancel={() => setDraggingId(null)}
           onDragEnd={handleDragEnd}
         >
-          <div className="action-zones">
-            <ActionZone title="显示在工具栏" count={`${enabledActions.length} / ${MAX_ENABLED_ACTIONS}`} actions={enabledActions}
-              enabled draggingId={draggingId} fieldError={fieldError}
-              onEdit={setEditor} onDelete={removeAction} onToggle={(action) => moveToZone(action.id, false, disabledActions.length)} />
-            <ActionZone title="未显示" count={`${disabledActions.length}`} actions={disabledActions}
-              enabled={false} draggingId={draggingId} fieldError={fieldError}
-              onEdit={setEditor} onDelete={removeAction} onToggle={(action) => moveToZone(action.id, true, enabledActions.length)} />
-          </div>
+          {(draft?.actions.length ?? 0) === 0 ? (
+            <div className="settings-card">
+              <div className="empty-state">
+                <p className="empty-state__title">还没有动作</p>
+                <p className="empty-state__hint">点右上角「添加动作」新建一个，就能在工具栏上使用。</p>
+              </div>
+            </div>
+          ) : (
+            <div className="action-zones">
+              <ActionZone title="显示在工具栏" count={`${enabledActions.length} / ${MAX_ENABLED_ACTIONS}`} actions={enabledActions}
+                enabled draggingId={draggingId} fieldError={fieldError}
+                onEdit={setEditor} onDelete={removeAction} onToggle={(action) => moveToZone(action.id, false, disabledActions.length)} />
+              <ActionZone title="未显示" count={`${disabledActions.length}`} actions={disabledActions}
+                enabled={false} draggingId={draggingId} fieldError={fieldError}
+                onEdit={setEditor} onDelete={removeAction} onToggle={(action) => moveToZone(action.id, true, enabledActions.length)} />
+            </div>
+          )}
         </DndContext>
+      </section>
+          )}
+
+          {activeSectionId === 'ball' && (
+      <section className="settings-section settings-section--enter" aria-labelledby="ball-title">
+        <div className="section-heading">
+          <div>
+            <h2 id="ball-title">{activeMeta.label}</h2>
+            <p>{activeMeta.blurb}</p>
+          </div>
+          <span className="settings-tip__label">改动即时生效</span>
+        </div>
+        <BallPanel
+          askActions={draft.actions
+            .filter((action) => action.kind === 'ask')
+            .map((action) => ({ id: action.id, name: action.name, enabled: action.enabled }))}
+          onConfigureActions={() => setActiveSection('actions')}
+        />
       </section>
           )}
 
@@ -2064,25 +2150,6 @@ export function SettingsApp(): JSX.Element {
             <h2 id="history-title">{activeMeta.label}</h2>
             <p>{activeMeta.blurb}</p>
           </div>
-          <div className="history-toolbar">
-            <button
-              className="button"
-              type="button"
-              disabled={historyStatus === 'loading'}
-              onClick={() => void loadHistory()}
-            >
-              <RefreshCw size={15} className={historyStatus === 'loading' ? 'settings-spin' : undefined} />
-              刷新
-            </button>
-            <button
-              className="button button--danger"
-              type="button"
-              disabled={historyEntries.length === 0}
-              onClick={() => setHistoryClearOpen(true)}
-            >
-              清空全部
-            </button>
-          </div>
         </div>
         <div className="settings-tip" role="note">
           <span className="settings-tip__label">隐私</span>
@@ -2099,6 +2166,28 @@ export function SettingsApp(): JSX.Element {
               placeholder="搜索动作名、原文或结果内容"
               onChange={(event) => setHistoryQuery(event.target.value)}
             />
+            {/* List actions stay with the list, not in the page title: the
+                request log keeps its refresh and clear in the same place, so
+                switching sections no longer moves them across the window. */}
+            <div className="history-toolbar">
+              <button
+                className="button"
+                type="button"
+                disabled={historyStatus === 'loading'}
+                onClick={() => void loadHistory()}
+              >
+                <RefreshCw size={15} className={historyStatus === 'loading' ? 'settings-spin' : undefined} />
+                刷新
+              </button>
+              <button
+                className="button button--danger"
+                type="button"
+                disabled={historyEntries.length === 0}
+                onClick={() => setHistoryClearOpen(true)}
+              >
+                清空全部
+              </button>
+            </div>
           </div>
           {historyStatus === 'error' && (
             <p className="field-error history-status" role="alert">{historyError}</p>
@@ -2107,10 +2196,16 @@ export function SettingsApp(): JSX.Element {
             <p className="history-status">正在读取历史记录…</p>
           )}
           {historyStatus === 'ready' && historyEntries.length === 0 && (
-            <p className="history-status">还没有记录。完成一次 AI 动作后会出现在这里。</p>
+            <div className="empty-state">
+              <p className="empty-state__title">还没有记录</p>
+              <p className="empty-state__hint">完成一次 AI 动作后会出现在这里。</p>
+            </div>
           )}
           {historyEntries.length > 0 && filteredHistory.length === 0 && (
-            <p className="history-status">没有匹配的记录。</p>
+            <div className="empty-state">
+              <p className="empty-state__title">没有匹配的记录</p>
+              <p className="empty-state__hint">换个关键词再试，或清空搜索框。</p>
+            </div>
           )}
           {filteredHistory.length > 0 && (
             <ul className="history-list">
@@ -2297,7 +2392,7 @@ export function SettingsApp(): JSX.Element {
               aria-valuetext={`${draft.result.fontSize} 像素`}
               onChange={(event) => changeDraft((current) => ({ ...current, result: { ...current.result, fontSize: Number(event.target.value) } }))} />
               <span>{draft.result.fontSize} px</span></div></div>
-          <div className="setting-row setting-row--stackable">
+          <div className="setting-row setting-row--stackable setting-row--theme">
             <div><strong>界面主题</strong><p>工具栏、结果框与设置窗口同时换装；预览按当前系统明暗外观渲染。</p></div>
             <div
               className="theme-options"

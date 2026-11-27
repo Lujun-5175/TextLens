@@ -12,6 +12,17 @@ import { SettingsApp } from './SettingsApp'
 installTauriBridge()
 applyTheme(storedTheme())
 
+// WebView2 zooms the whole page on Ctrl+wheel. In a settings window that is
+// never wanted, and the result (everything oversized, right-hand controls cut
+// off by the window edge) reads as a layout bug rather than a zoom level.
+window.addEventListener(
+  'wheel',
+  (event) => {
+    if (event.ctrlKey) event.preventDefault()
+  },
+  { passive: false }
+)
+
 const root = document.getElementById('root')
 
 if (!root) {

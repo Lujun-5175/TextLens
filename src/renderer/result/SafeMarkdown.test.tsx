@@ -225,6 +225,46 @@ describe('SafeMarkdown', () => {
       .toHaveLength(2)
   })
 
+  it('keeps a malformed formula from swallowing the rest of the answer', () => {
+    // From a real answer: the model wrapped an expression that already
+    // contained `$` in `\(...\)`. remark-math then paired dollars across the
+    // paragraph and KaTeX printed everything after it — including a code
+    // fence — as one red blob.
+    const formula = String.raw`\(-\sum_t\left$(m_{it}v_t' + v_t m_{it}'\right)$ +(n-1)\sum_t v_t v_t'\) 代码只保留了第一项。`
+    const content = [
+      '于是严格展开是',
+      '',
+      formula,
+      '',
+      '```python',
+      'print(1)',
+      '```',
+      '',
+      '**2. 下一节**'
+    ].join('\n')
+    const { container } = render(
+      <SafeMarkdown content={content} onOpenExternal={() => undefined} />
+    )
+
+    expect(container.querySelectorAll('.katex-error')).toHaveLength(0)
+    expect(container.querySelector('pre')?.textContent).toContain('print(1)')
+    expect(screen.getByText('2. 下一节')).toBeInTheDocument()
+    expect(screen.getByText(/代码只保留了第一项/)).toBeInTheDocument()
+  })
+
+  it('turns a fence that starts mid-sentence into a real code block', () => {
+    // Models sometimes open the fence right after prose. CommonMark then reads
+    // the *closing* marker as the opener and swallows everything below it.
+    const content = ['说明： ```python', 'print(1)', '```', '', '后文'].join('\n')
+    const { container } = render(
+      <SafeMarkdown content={content} onOpenExternal={() => undefined} />
+    )
+
+    expect(container.querySelector('pre')?.textContent).toContain('print(1)')
+    expect(screen.getByText('后文')).toBeInTheDocument()
+    expect(screen.getByText('说明：')).toBeInTheDocument()
+  })
+
   it('keeps untrusted formula commands from creating links or remote resources', () => {
     const { container } = render(
       <SafeMarkdown

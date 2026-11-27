@@ -1,5 +1,6 @@
 pub mod actions;
 mod autostart;
+pub mod ball;
 mod clipboard;
 mod language_detection;
 mod local_secrets;
@@ -91,6 +92,12 @@ pub fn run() {
                 .ok_or("无法取得划词事件通道")?;
 
             app.manage(RuntimeState::new(settings, actions, monitor));
+            // The orb's own state file keeps it out of the versioned settings
+            // schema; a corrupt or missing file degrades to "visible, default
+            // corner" instead of failing startup. Manage it before the tray so
+            // the menu's checkmark reflects the real state at first paint.
+            let ball_path = ball::state_path(app.handle())?;
+            app.manage(ball::BallStore::load(ball_path));
             let handle = app.handle().clone();
             handle
                 .state::<RuntimeState>()
@@ -98,6 +105,16 @@ pub fn run() {
                 .ensure_toolbar(&handle)?;
             runtime::spawn_selection_loop(handle.clone(), receiver)?;
             runtime::setup_tray(&handle)?;
+            {
+                let store = handle.state::<ball::BallStore>();
+                if let Err(error) = ball::apply(&handle, &store) {
+                    eprintln!("[ball] stage=startup error_class=window: {error}");
+                }
+            }
+            // Restore the last settings-window size after the window exists
+            // but before the user can open it.
+            runtime::restore_settings_window_size(&handle);
+            ball::spawn_fullscreen_watcher(handle.clone());
 
             let state = handle.state::<RuntimeState>();
             state.reconcile_capture(&handle);
@@ -155,6 +172,12 @@ pub fn run() {
             runtime::present_toolbar,
             runtime::recover_toolbar,
             runtime::run_action,
+            runtime::open_ask_from_ball,
+            runtime::move_ball,
+            runtime::cycle_ball_size,
+            runtime::get_ball_settings,
+            runtime::update_ball_settings,
+            runtime::reset_ball_position,
             runtime::hide_toolbar,
             runtime::report_toolbar_size,
             runtime::begin_result_ready,

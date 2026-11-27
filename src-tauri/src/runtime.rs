@@ -14,7 +14,7 @@ use std::{
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use tauri::{
-    menu::{CheckMenuItemBuilder, MenuBuilder, MenuItemBuilder},
+    menu::{CheckMenuItemBuilder, MenuBuilder, MenuItemBuilder, SubmenuBuilder},
     tray::TrayIconBuilder,
     AppHandle, Emitter, Manager, State, WebviewWindow, WindowEvent,
 };
@@ -92,6 +92,10 @@ pub struct SettingsGuidance {
 const RESULT_LABEL_PREFIX: &str = "selection-result-";
 const TRAY_ID: &str = "textlens-tray";
 const TRAY_TOGGLE_ID: &str = "textlens-toggle";
+const TRAY_BALL_ID: &str = "textlens-ball";
+const TRAY_BALL_SMALL_ID: &str = "textlens-ball-small";
+const TRAY_BALL_MEDIUM_ID: &str = "textlens-ball-medium";
+const TRAY_BALL_LARGE_ID: &str = "textlens-ball-large";
 const TRAY_PERMISSION_ID: &str = "textlens-permission";
 const TRAY_SETTINGS_ID: &str = "textlens-settings";
 const TRAY_QUIT_ID: &str = "textlens-quit";
@@ -496,6 +500,53 @@ fn take_selection_for_closed_result(
     }
 }
 
+/// Synthetic selection for an orb-opened Ask session.
+///
+/// Result sessions carry the selection they came from, so a session without
+/// one still needs a stand-in. Every field that could identify a real window
+/// or app is empty, the id can never equal a live selection id, and
+/// `SelectionMethod` is inert here because the renderer snapshot does not
+/// serialize it.
+fn blank_ask_selection(cursor: WindowPoint) -> CurrentSelection {
+    let timestamp_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0);
+    CurrentSelection {
+        id: format!("blank-ask-{}", Uuid::new_v4()),
+        payload: SelectionPayload {
+            text: String::new(),
+            source_app: SourceApplication {
+                bundle_id: String::new(),
+                name: "TextLens".to_owned(),
+            },
+            bounds: None,
+            start_top: None,
+            start_bottom: None,
+            end_top: None,
+            end_bottom: None,
+            mouse: SelectionMouse {
+                start: None,
+                end: None,
+                current: SelectionPoint {
+                    x: cursor.x,
+                    y: cursor.y,
+                },
+            },
+            direction: SelectionDirection::Unknown,
+            is_fullscreen: false,
+            method: SelectionMethod::Accessibility,
+            trigger: SelectionTrigger::Manual,
+            timestamp_ms,
+            sequence: 0,
+            windows_selection_evidence: None,
+            source_window: None,
+        },
+        source_result_session_id: None,
+        host_clear_generation: 0,
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum SelectionDismissal {
     Stale,
@@ -566,6 +617,9 @@ struct ResultSessionMeta {
     selection: CurrentSelection,
     action_id: String,
     pinned: bool,
+    /// How this window closes. `Manual` must also survive an unrelated
+    /// selection elsewhere: the user chose "only close when I say so".
+    dismiss_mode: crate::windows::DismissMode,
     /// Only a successfully revealed action owns the host-clear lease.
     action_taken_over: bool,
     /// Request whose completed answer was already appended to the local
@@ -612,6 +666,9 @@ enum ResultSessionStart {
     Execute,
     /// Open a completed empty session and wait for the first question (Ask).
     OpenAsk,
+    /// Same as `OpenAsk`, but the session was opened without any selection
+    /// text (floating orb) and must not claim or clear a live toolbar selection.
+    OpenBlankAsk,
 }
 
 fn compose_result_ready_snapshot(
@@ -809,6 +866,9 @@ pub struct RuntimeState {
     close_results_scheduled: AtomicBool,
     result_creation: Mutex<()>,
     result_sessions: Mutex<HashMap<String, ResultSessionMeta>>,
+    /// Session ids opened from the floating orb. The orb hides itself while
+    /// one of these is alive, and comes back when the last one closes.
+    ball_sessions: Mutex<HashSet<String>>,
     result_reveals: Mutex<HashMap<String, ResultRevealHandshake>>,
     /// Generation for shortcut-triggered captures. A capture may outlive the
     /// plugin callback, so only the newest request may publish or hide UI.
@@ -853,6 +913,7 @@ impl RuntimeState {
             close_results_scheduled: AtomicBool::new(false),
             result_creation: Mutex::new(()),
             result_sessions: Mutex::new(HashMap::new()),
+            ball_sessions: Mutex::new(HashSet::new()),
             result_reveals: Mutex::new(HashMap::new()),
             shortcut_capture_generation: AtomicU64::new(0),
             shortcut_switch: Mutex::new(()),
@@ -1731,6 +1792,29 @@ impl RuntimeState {
         )
     }
 
+    /// Opens an Ask window for the floating orb: no selection, no source app.
+    ///
+    /// The fabricated selection id never matches `current_selection`, so none
+    /// of the selection-ownership paths (host clear, toolbar dismissal, paste
+    /// back) can reach a real selection from this session.
+    fn create_blank_ask_result_session(
+        &self,
+        app: &AppHandle,
+        action_id: &str,
+        action_name: &str,
+        cursor: WindowPoint,
+    ) -> Result<(String, String, ResultRevealReceiver), String> {
+        let selection = blank_ask_selection(cursor);
+        self.create_result_session_with(
+            app,
+            action_id,
+            action_name,
+            selection,
+            cursor,
+            ResultSessionStart::OpenBlankAsk,
+        )
+    }
+
     fn create_result_session_with(
         &self,
         app: &AppHandle,
@@ -1790,6 +1874,10 @@ impl RuntimeState {
                 .actions
                 .open_ask(app, request)
                 .map_err(|error| error.to_string())?,
+            ResultSessionStart::OpenBlankAsk => self
+                .actions
+                .open_ask_blank(app, request)
+                .map_err(|error| error.to_string())?,
         };
 
         self.close_unpinned_results(app);
@@ -1819,6 +1907,7 @@ impl RuntimeState {
                 height: RESULT_DEFAULT_HEIGHT,
             }
         };
+        let result_dismiss_mode = dismiss_mode(result.dismiss_mode);
         let options = ResultWindowOptions {
             size: WindowSize {
                 width: size.width,
@@ -1827,7 +1916,7 @@ impl RuntimeState {
             cursor,
             follow_cursor: result.follow_cursor,
             pinned: result.default_pinned,
-            dismiss_mode: dismiss_mode(result.dismiss_mode),
+            dismiss_mode: result_dismiss_mode,
             dismiss_delay_ms: u64::from(result.dismiss_delay_ms),
             opacity: result.opacity,
             remember_size: result.remember_size,
@@ -1844,6 +1933,7 @@ impl RuntimeState {
                 selection,
                 action_id: action_id.to_owned(),
                 pinned: result.default_pinned,
+                dismiss_mode: result_dismiss_mode,
                 action_taken_over: false,
                 history_request_id: None,
                 request_log_id: None,
@@ -1879,7 +1969,8 @@ impl RuntimeState {
             .lock()
             .iter()
             .filter_map(|(session_id, meta)| {
-                should_close_for_external_selection(meta.pinned).then(|| session_id.clone())
+                should_close_for_external_selection(meta.pinned, meta.dismiss_mode)
+                    .then(|| session_id.clone())
             })
             .collect()
     }
@@ -1892,7 +1983,9 @@ impl RuntimeState {
                 .result_sessions
                 .lock()
                 .get(&session_id)
-                .is_some_and(|meta| should_close_for_external_selection(meta.pinned));
+                .is_some_and(|meta| {
+                    should_close_for_external_selection(meta.pinned, meta.dismiss_mode)
+                });
             if !still_unpinned {
                 continue;
             }
@@ -1981,6 +2074,13 @@ impl RuntimeState {
                 self.schedule_selection_host_clear(app, &meta.selection);
             }
         }
+        // The orb hid itself when it opened this conversation; bring it back
+        // once the last orb-launched conversation is gone.
+        if self.ball_sessions.lock().remove(session_id) {
+            if let Some(store) = app.try_state::<crate::ball::BallStore>() {
+                crate::ball::resume(app, &store, crate::ball::BallSuppression::Conversation);
+            }
+        }
     }
 
     pub fn handle_window_event(&self, app: &AppHandle, label: &str, event: &WindowEvent) {
@@ -1999,6 +2099,15 @@ impl RuntimeState {
             return;
         }
         if label == SETTINGS_LABEL {
+            // Remember the size the user left the window at. Settings is the
+            // one long-lived workspace window, and resetting it to the config
+            // default on every launch throws away a resize they just made.
+            if matches!(
+                event,
+                WindowEvent::CloseRequested { .. } | WindowEvent::Destroyed
+            ) {
+                remember_settings_window_size(app);
+            }
             match event {
                 WindowEvent::CloseRequested { api, .. } => {
                     if self.shutting_down.load(Ordering::Acquire) {
@@ -2455,6 +2564,33 @@ fn build_tray_menu(
     let toggle = CheckMenuItemBuilder::with_id(TRAY_TOGGLE_ID, "启用划词")
         .checked(settings.enabled)
         .build(app)?;
+    let ball_visible = app
+        .try_state::<crate::ball::BallStore>()
+        .is_none_or(|store| store.snapshot().visible);
+    let ball = CheckMenuItemBuilder::with_id(TRAY_BALL_ID, "显示悬浮球")
+        .checked(ball_visible)
+        .build(app)?;
+    // Sizes are radio-ish check items: exactly one reflects the stored
+    // diameter, and picking any of them resizes the orb immediately.
+    let ball_size = app
+        .try_state::<crate::ball::BallStore>()
+        .map(|store| store.snapshot().diameter())
+        .unwrap_or(crate::ball::BALL_MEDIUM_SIZE);
+    let near = |value: f64| (ball_size - value).abs() < 0.5;
+    let ball_small = CheckMenuItemBuilder::with_id(TRAY_BALL_SMALL_ID, "小")
+        .checked(near(crate::ball::BALL_SMALL_SIZE))
+        .build(app)?;
+    let ball_medium = CheckMenuItemBuilder::with_id(TRAY_BALL_MEDIUM_ID, "中")
+        .checked(near(crate::ball::BALL_MEDIUM_SIZE))
+        .build(app)?;
+    let ball_large = CheckMenuItemBuilder::with_id(TRAY_BALL_LARGE_ID, "大")
+        .checked(near(crate::ball::BALL_LARGE_SIZE))
+        .build(app)?;
+    let ball_size_menu = SubmenuBuilder::new(app, "悬浮球大小")
+        .item(&ball_small)
+        .item(&ball_medium)
+        .item(&ball_large)
+        .build()?;
     #[cfg(not(target_os = "windows"))]
     let accessibility = app.state::<RuntimeState>().accessibility_status();
     #[cfg(not(target_os = "windows"))]
@@ -2473,7 +2609,10 @@ fn build_tray_menu(
         .enabled(false)
         .build(app)?;
     let quit = MenuItemBuilder::with_id(TRAY_QUIT_ID, "退出 TextLens").build(app)?;
-    let menu = MenuBuilder::new(app).item(&toggle);
+    let menu = MenuBuilder::new(app)
+        .item(&toggle)
+        .item(&ball)
+        .item(&ball_size_menu);
     #[cfg(not(target_os = "windows"))]
     let menu = menu.item(&permission);
     menu.separator()
@@ -2529,6 +2668,36 @@ fn handle_tray_menu_event(app: &AppHandle, event: tauri::menu::MenuEvent) {
                 ..Default::default()
             }) {
                 state.after_settings_changed(app, &public);
+            }
+        }
+        TRAY_BALL_ID => {
+            let Some(store) = app.try_state::<crate::ball::BallStore>() else {
+                return;
+            };
+            let visible = !store.snapshot().visible;
+            if let Err(message) = crate::ball::set_visible(app, &store, visible) {
+                eprintln!("[ball] stage=toggle error_class=window: {message}");
+                return;
+            }
+            if let Ok(public) = app.state::<RuntimeState>().settings.get_public_settings() {
+                refresh_tray(app, &public);
+            }
+        }
+        TRAY_BALL_SMALL_ID | TRAY_BALL_MEDIUM_ID | TRAY_BALL_LARGE_ID => {
+            let Some(store) = app.try_state::<crate::ball::BallStore>() else {
+                return;
+            };
+            let size = match event.id().as_ref() {
+                TRAY_BALL_SMALL_ID => crate::ball::BALL_SMALL_SIZE,
+                TRAY_BALL_LARGE_ID => crate::ball::BALL_LARGE_SIZE,
+                _ => crate::ball::BALL_MEDIUM_SIZE,
+            };
+            if let Err(message) = crate::ball::set_size(app, &store, size) {
+                eprintln!("[ball] stage=resize error_class=window: {message}");
+                return;
+            }
+            if let Ok(public) = app.state::<RuntimeState>().settings.get_public_settings() {
+                refresh_tray(app, &public);
             }
         }
         TRAY_PERMISSION_ID => {
@@ -3430,6 +3599,231 @@ pub async fn run_action(
     Ok(result)
 }
 
+/// Opens a blank Ask window from the floating orb.
+///
+/// This is the orb's only action. It never touches `current_selection` and
+/// never reads the clipboard: the user asked for a *new* conversation, so the
+/// result window starts empty and waits for the first question.
+#[tauri::command]
+pub async fn open_ask_from_ball(
+    app: AppHandle,
+    window: WebviewWindow,
+    state: State<'_, RuntimeState>,
+) -> Result<RunActionResult, String> {
+    if window.label() != crate::ball::BALL_LABEL {
+        return Ok(RunActionResult::rejected("悬浮球调用无效"));
+    }
+    if state.shutting_down.load(Ordering::Acquire) {
+        return Ok(RunActionResult::rejected("TextLens 正在退出"));
+    }
+    let settings = state.settings.get_settings();
+    let preferred = app
+        .try_state::<crate::ball::BallStore>()
+        .and_then(|store| store.snapshot().ask_action_id);
+    let Some(action) = ball_ask_action(&settings, preferred.as_deref()) else {
+        return Ok(RunActionResult::rejected(
+            "悬浮球使用的问AI动作不可用，请在设置 → 悬浮球中重新选择",
+        ));
+    };
+    let cursor = ball_anchor(&app);
+    match state.create_blank_ask_result_session(&app, &action.id, &action.name, cursor) {
+        Ok((session_id, request_id, reveal_receiver)) => {
+            match wait_for_result_reveal_with_timeout(reveal_receiver, RESULT_REVEAL_TIMEOUT).await
+            {
+                Ok(()) => {
+                    // The orb is the launcher: hide it while its conversation is
+                    // on screen and let `cleanup_result_session` bring it back.
+                    state.ball_sessions.lock().insert(session_id.clone());
+                    if let Some(store) = app.try_state::<crate::ball::BallStore>() {
+                        crate::ball::suppress(
+                            &app,
+                            &store,
+                            crate::ball::BallSuppression::Conversation,
+                        );
+                    }
+                    Ok(RunActionResult::accepted(
+                        Some(session_id),
+                        Some(request_id),
+                    ))
+                }
+                Err(message) => {
+                    state.abort_result_reveal(&app, &session_id);
+                    Ok(RunActionResult::rejected(message))
+                }
+            }
+        }
+        Err(message) => Ok(RunActionResult::rejected(message)),
+    }
+}
+
+/// Persists where the user dragged the orb. The position is native (physical
+/// pixels on Windows) because that is what `outer_position` reports and what
+/// the restore path consumes.
+#[tauri::command]
+pub fn move_ball(
+    window: WebviewWindow,
+    store: State<'_, crate::ball::BallStore>,
+    x: i32,
+    y: i32,
+) -> Result<(), String> {
+    if window.label() != crate::ball::BALL_LABEL {
+        return Err("悬浮球调用无效".to_owned());
+    }
+    store.set_position(x, y);
+    Ok(())
+}
+
+/// Right-click shortcut for the tray's size submenu: 小 → 中 → 大 → 小.
+#[tauri::command]
+pub fn cycle_ball_size(
+    app: AppHandle,
+    window: WebviewWindow,
+    store: State<'_, crate::ball::BallStore>,
+) -> Result<(), String> {
+    if window.label() != crate::ball::BALL_LABEL {
+        return Err("悬浮球调用无效".to_owned());
+    }
+    let current = store.snapshot().diameter();
+    let next = if (current - crate::ball::BALL_SMALL_SIZE).abs() < 0.5 {
+        crate::ball::BALL_MEDIUM_SIZE
+    } else if (current - crate::ball::BALL_MEDIUM_SIZE).abs() < 0.5 {
+        crate::ball::BALL_LARGE_SIZE
+    } else {
+        crate::ball::BALL_SMALL_SIZE
+    };
+    crate::ball::set_size(&app, &store, next)?;
+    if let Ok(public) = app.state::<RuntimeState>().settings.get_public_settings() {
+        refresh_tray(&app, &public);
+    }
+    Ok(())
+}
+
+/// Picks the Ask action the orb opens.
+///
+/// A configured id wins only while that action still exists and is an enabled
+/// Ask action; a stale id falls back to the first enabled Ask action instead of
+/// leaving the orb dead. Only "no usable Ask action at all" is an error, and
+/// the caller turns that into a message pointing at the orb's settings page.
+fn ball_ask_action(
+    settings: &crate::models::AppSettings,
+    preferred: Option<&str>,
+) -> Option<crate::models::ActionDefinition> {
+    let usable =
+        |action: &crate::models::ActionDefinition| action.kind == ActionKind::Ask && action.enabled;
+    if let Some(id) = preferred {
+        if let Some(action) = settings.actions.iter().find(|action| action.id == id) {
+            if usable(action) {
+                return Some(action.clone());
+            }
+        }
+    }
+    settings
+        .actions
+        .iter()
+        .find(|action| usable(action))
+        .cloned()
+}
+
+fn ensure_ball_settings_caller(window: &WebviewWindow) -> Result<(), String> {
+    let label = window.label();
+    (label == crate::ball::BALL_LABEL || label == SETTINGS_LABEL)
+        .then_some(())
+        .ok_or_else(|| "该操作只能从设置窗口或悬浮球执行".to_owned())
+}
+
+#[tauri::command]
+pub fn get_ball_settings(
+    window: WebviewWindow,
+    store: State<'_, crate::ball::BallStore>,
+) -> Result<crate::ball::BallSettings, String> {
+    ensure_ball_settings_caller(&window)?;
+    Ok(store.settings())
+}
+
+/// Applies the orb section of the settings page immediately.
+///
+/// Unlike the rest of the settings file, orb preferences take effect at once:
+/// the point of the size control is seeing the orb change while you drag it.
+#[tauri::command]
+pub fn update_ball_settings(
+    app: AppHandle,
+    window: WebviewWindow,
+    state: State<'_, RuntimeState>,
+    store: State<'_, crate::ball::BallStore>,
+    update: crate::ball::BallSettingsUpdate,
+) -> Result<crate::ball::BallSettings, String> {
+    ensure_ball_settings_caller(&window)?;
+    if let Some(action_id) = update.ask_action_id.as_deref() {
+        let trimmed = action_id.trim();
+        if !trimmed.is_empty() {
+            let settings = state.settings.get_settings();
+            let is_ask = settings
+                .actions
+                .iter()
+                .any(|action| action.id == trimmed && action.kind == ActionKind::Ask);
+            if !is_ask {
+                return Err("该动作尚未保存或不是问AI动作，请先在「工具栏动作」里保存".to_owned());
+            }
+        }
+    }
+    if let Some(visible) = update.visible {
+        store.set_visible(visible);
+    }
+    if let Some(size) = update.size {
+        store.set_size(size);
+    }
+    if let Some(hide) = update.hide_in_fullscreen {
+        store.set_hide_in_fullscreen(hide);
+        if !hide {
+            // The rule was switched off while the orb was hidden by it.
+            store.resume(crate::ball::BallSuppression::Fullscreen);
+        }
+    }
+    if let Some(action_id) = update.ask_action_id {
+        store.set_ask_action(Some(action_id));
+    }
+    crate::ball::apply(&app, &store).map_err(|error| format!("无法应用悬浮球设置：{error}"))?;
+    if let Ok(public) = state.settings.get_public_settings() {
+        refresh_tray(&app, &public);
+    }
+    Ok(store.settings())
+}
+
+/// Forgets the dragged position so the orb returns to the default corner.
+#[tauri::command]
+pub fn reset_ball_position(
+    app: AppHandle,
+    window: WebviewWindow,
+    store: State<'_, crate::ball::BallStore>,
+) -> Result<(), String> {
+    ensure_ball_settings_caller(&window)?;
+    store.reset_position();
+    crate::ball::apply(&app, &store).map_err(|error| format!("无法重置悬浮球位置：{error}"))
+}
+
+/// Where a new result window should appear for an orb-opened session: just
+/// below the orb, so the answer is not hidden behind the button that asked.
+fn ball_anchor(app: &AppHandle) -> WindowPoint {
+    let diameter = app
+        .try_state::<crate::ball::BallStore>()
+        .map(|store| store.snapshot().diameter())
+        .unwrap_or(crate::ball::BALL_LOGICAL_SIZE);
+    if let Some(window) = app.get_webview_window(crate::ball::BALL_LABEL) {
+        if let Ok(position) = window.outer_position() {
+            return WindowPoint {
+                x: f64::from(position.x) + diameter / 2.0,
+                y: f64::from(position.y) + diameter,
+            };
+        }
+    }
+    app.cursor_position()
+        .map(|point| WindowPoint {
+            x: point.x,
+            y: point.y,
+        })
+        .unwrap_or(WindowPoint { x: 0.0, y: 0.0 })
+}
+
 #[tauri::command]
 pub fn hide_toolbar(
     app: AppHandle,
@@ -4055,7 +4449,7 @@ pub fn continue_action(
 
 /// Recent request metadata for the audit panel, newest first.
 #[tauri::command]
-pub async fn list_request_log(
+pub(crate) async fn list_request_log(
     app: AppHandle,
     window: WebviewWindow,
     limit: Option<usize>,
@@ -4422,8 +4816,11 @@ fn application_is_allowed(
     }
 }
 
-fn should_close_for_external_selection(pinned: bool) -> bool {
-    !pinned
+fn should_close_for_external_selection(pinned: bool, mode: crate::windows::DismissMode) -> bool {
+    // Manual means manual: an unrelated selection elsewhere must not close a
+    // window the user is reading. Before this, "关闭方式 = 手动" still lost the
+    // window the moment they selected text in any other application.
+    !pinned && mode != crate::windows::DismissMode::Manual
 }
 
 fn selection_source_matches_result(
@@ -4571,6 +4968,128 @@ fn infer_domain_or_ip_url(value: &str) -> Option<Url> {
             (valid_domain || localhost_with_port).then_some(url)
         }
     }
+}
+
+/// Sidecar file for the settings window geometry, next to `settings.json`.
+const SETTINGS_WINDOW_STATE_FILE: &str = "settings-window.json";
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SettingsWindowGeometry {
+    /// Logical (scale-independent) pixels, like the size written in the
+    /// window config.
+    width: u32,
+    height: u32,
+}
+
+fn settings_window_state_path(app: &AppHandle) -> Option<std::path::PathBuf> {
+    app.path()
+        .app_config_dir()
+        .ok()
+        .map(|dir| dir.join(SETTINGS_WINDOW_STATE_FILE))
+}
+
+/// Persists the current inner size so the next launch opens at the same one.
+fn remember_settings_window_size(app: &AppHandle) {
+    let Some(window) = app.get_webview_window(SETTINGS_LABEL) else {
+        return;
+    };
+    // A maximized window reports the screen's size, which would be saved as the
+    // "preferred" size and reopened huge and undraggable on the next launch.
+    // Keeping the last normal size is what every desktop app does.
+    if window.is_maximized().unwrap_or(false) {
+        return;
+    }
+    let Some(path) = settings_window_state_path(app) else {
+        return;
+    };
+    // Inner size, not outer: restore goes through `set_size`, which winit applies
+    // as `set_inner_size`. Saving the outer size and restoring it as an inner one
+    // would grow the window by its title bar and borders on every launch.
+    let Ok(size) = window.inner_size() else {
+        return;
+    };
+    // Logical pixels, so the window keeps its apparent size when the display
+    // scaling changes — the usual case when a laptop is docked to an external
+    // monitor. Storing physical pixels would shrink it at 200% and inflate it
+    // at 100%.
+    let scale = window.scale_factor().unwrap_or(1.0);
+    if scale <= 0.0 {
+        return;
+    }
+    let width = (size.width as f64 / scale).round() as u32;
+    let height = (size.height as f64 / scale).round() as u32;
+    // A hidden window can report a zero size while the WebView tears down.
+    if width < 200 || height < 200 {
+        return;
+    }
+    let state = SettingsWindowGeometry { width, height };
+    if let Ok(body) = serde_json::to_vec(&state) {
+        let temporary = path.with_extension("json.tmp");
+        if std::fs::write(&temporary, body).is_ok() {
+            let _ = crate::settings::atomic_file::replace_file(&temporary, &path);
+        }
+    }
+}
+
+/// Fits a remembered logical size onto the display it will open on.
+///
+/// The saved size can come from a larger monitor (docked laptop, external 4K),
+/// so a fixed ceiling is not enough: the window has to fit the display it is
+/// about to appear on, with room left for the title bar and the taskbar. On a
+/// display too small for even the minimum, the minimum wins — a window the user
+/// can drag is better than one clipped to a sliver.
+fn clamp_settings_window_size(width: u32, height: u32, monitor: Option<(u32, u32)>) -> (u32, u32) {
+    const MIN_WIDTH: u32 = 720;
+    const MIN_HEIGHT: u32 = 620;
+    // Title bar plus taskbar: a window that exactly fills the screen cannot be
+    // moved, and its bottom row sits under the taskbar.
+    const CHROME_WIDTH: u32 = 80;
+    const CHROME_HEIGHT: u32 = 120;
+    let (max_width, max_height) = match monitor {
+        Some((monitor_width, monitor_height)) => (
+            monitor_width.saturating_sub(CHROME_WIDTH).max(MIN_WIDTH),
+            monitor_height.saturating_sub(CHROME_HEIGHT).max(MIN_HEIGHT),
+        ),
+        // No monitor to ask (headless, or the platform refused): fall back to
+        // the static ceiling instead of trusting whatever was saved.
+        None => (2400, 1600),
+    };
+    (
+        width.clamp(MIN_WIDTH, max_width),
+        height.clamp(MIN_HEIGHT, max_height),
+    )
+}
+
+/// Applies a remembered size once, before the window is first shown.
+pub fn restore_settings_window_size(app: &AppHandle) {
+    let Some(path) = settings_window_state_path(app) else {
+        return;
+    };
+    let Ok(bytes) = std::fs::read(&path) else {
+        return;
+    };
+    let Ok(state) = serde_json::from_slice::<SettingsWindowGeometry>(&bytes) else {
+        return;
+    };
+    let Some(window) = app.get_webview_window(SETTINGS_LABEL) else {
+        return;
+    };
+    let scale = window.scale_factor().unwrap_or(1.0);
+    if scale <= 0.0 {
+        return;
+    }
+    // The clamp compares like with like: the saved size is logical, so the
+    // monitor's physical pixels are converted to the window's own scale.
+    let monitor = app.primary_monitor().ok().flatten().map(|monitor| {
+        let size = monitor.size();
+        let monitor_scale = monitor.scale_factor();
+        (
+            (size.width as f64 / monitor_scale).round() as u32,
+            (size.height as f64 / monitor_scale).round() as u32,
+        )
+    });
+    let (width, height) = clamp_settings_window_size(state.width, state.height, monitor);
+    let _ = window.set_size(tauri::LogicalSize::new(f64::from(width), f64::from(height)));
 }
 
 #[cfg(test)]
@@ -4798,10 +5317,29 @@ mod tests {
             },
             action_id: "translate".to_owned(),
             pinned: false,
+            dismiss_mode: crate::windows::DismissMode::Manual,
             action_taken_over: false,
             history_request_id: None,
             request_log_id: None,
         }
+    }
+
+    #[test]
+    fn a_blank_ask_selection_owns_nothing_and_carries_no_text() {
+        let selection = blank_ask_selection(WindowPoint { x: 12.0, y: 34.0 });
+        assert!(selection.id.starts_with("blank-ask-"));
+        assert!(selection.payload.text.is_empty());
+        assert_eq!(selection.payload.source_window, None);
+        assert!(selection.payload.source_app.bundle_id.is_empty());
+        assert_eq!(selection.source_result_session_id, None);
+        assert_eq!(selection.payload.mouse.current.x, 12.0);
+        assert_eq!(selection.payload.mouse.current.y, 34.0);
+        // Two orb clicks must never share an identity: the id is what all
+        // selection-ownership checks compare.
+        assert_ne!(
+            selection.id,
+            blank_ask_selection(WindowPoint { x: 0.0, y: 0.0 }).id
+        );
     }
 
     #[test]
@@ -5514,9 +6052,26 @@ mod tests {
     }
 
     #[test]
-    fn external_selection_closes_only_unpinned_results() {
-        assert!(should_close_for_external_selection(false));
-        assert!(!should_close_for_external_selection(true));
+    fn external_selection_closes_only_unpinned_automatic_results() {
+        use crate::windows::DismissMode;
+        assert!(should_close_for_external_selection(
+            false,
+            DismissMode::Blur
+        ));
+        assert!(!should_close_for_external_selection(
+            true,
+            DismissMode::Blur
+        ));
+        // "关闭方式 = 手动" is a promise: selecting text in another
+        // application must not take the window away.
+        assert!(!should_close_for_external_selection(
+            false,
+            DismissMode::Manual
+        ));
+        assert!(!should_close_for_external_selection(
+            true,
+            DismissMode::Manual
+        ));
     }
 
     #[test]
@@ -6199,5 +6754,38 @@ mod tests {
             windows_physical_cursor(Some(renderer_dip), None, None),
             None
         );
+    }
+
+    #[test]
+    fn remembered_settings_size_shrinks_to_the_display_it_reopens_on() {
+        // Screenshot a 2560x1440 desktop, then launch on a 1920x1080 laptop.
+        assert_eq!(
+            clamp_settings_window_size(2560, 1440, Some((1920, 1080))),
+            (1840, 960)
+        );
+        // A window that already fits keeps its size, and one that is too tall
+        // for a 1366x768 display loses only the excess.
+        assert_eq!(
+            clamp_settings_window_size(1000, 700, Some((3840, 2160))),
+            (1000, 700)
+        );
+        assert_eq!(
+            clamp_settings_window_size(1000, 700, Some((1366, 768))),
+            (1000, 648)
+        );
+    }
+
+    #[test]
+    fn remembered_settings_size_never_goes_below_the_minimum() {
+        // A display narrower than the minimum cannot be satisfied; the minimum
+        // still wins so the window stays usable.
+        assert_eq!(
+            clamp_settings_window_size(1000, 900, Some((800, 600))),
+            (720, 620)
+        );
+        // Without a monitor (headless, or the platform refused) the static
+        // ceiling applies rather than trusting a saved 5000px window.
+        assert_eq!(clamp_settings_window_size(500, 300, None), (720, 620));
+        assert_eq!(clamp_settings_window_size(5000, 4000, None), (2400, 1600));
     }
 }

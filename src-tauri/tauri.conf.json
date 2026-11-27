@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "TextLens",
-  "version": "0.5.6",
+  "version": "0.9.15",
   "identifier": "com.local.textlens",
   "build": {
     "beforeBuildCommand": "pnpm build:web",
@@ -14,10 +14,10 @@
         "label": "settings",
         "title": "TextLens 设置",
         "url": "settings/index.html",
-        "width": 760,
-        "height": 780,
-        "minWidth": 660,
-        "minHeight": 600,
+        "width": 1000,
+        "height": 800,
+        "minWidth": 720,
+        "minHeight": 620,
         "visible": false,
         "center": true,
         "resizable": true,

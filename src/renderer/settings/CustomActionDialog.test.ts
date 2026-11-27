@@ -4,6 +4,12 @@ import { fireEvent, render, screen } from '@testing-library/react'
 import { DEFAULT_ACTION_PROMPTS, type ActionDefinition } from '../../shared'
 import { CustomActionDialog, promptAfterKindChange } from './CustomActionDialog'
 
+// Rendering this dialog costs ~3s in jsdom (icon grid + model picker), and every
+// assertion below is synchronous, so the 5s default can only trip on CPU
+// starvation from the test files running in parallel. Give this file room rather
+// than treating a loaded machine as a product failure.
+vi.setConfig({ testTimeout: 20_000 })
+
 describe('promptAfterKindChange', () => {
   it('uses the matching default prompt when a new action changes AI type', () => {
     expect(

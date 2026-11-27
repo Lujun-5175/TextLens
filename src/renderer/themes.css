@@ -68,34 +68,6 @@
     --highlight: rgba(255, 255, 255, 0.65);
   }
 
-  [data-theme='sand'],
-  :root[data-theme='sand'] {
-    --bg: #f2e9d8;
-    --surface: rgba(252, 247, 236, 0.95);
-    --surface-solid: #fcf7ec;
-    --surface-muted: #ede3cd;
-    --surface-inset: #e3d6b9;
-    --text: #2b251a;
-    --text-secondary: #6f6650;
-    --text-tertiary: #a29881;
-    --border: rgba(96, 80, 50, 0.16);
-    --border-strong: rgba(96, 80, 50, 0.26);
-    --accent: #2e7a6d;
-    --accent-hover: #25645a;
-    --accent-soft: rgba(46, 122, 109, 0.12);
-    --on-accent: #ffffff;
-    --danger: #b04a35;
-    --danger-soft: rgba(176, 74, 53, 0.12);
-    --success: #4a7a3a;
-    --success-soft: rgba(74, 122, 58, 0.12);
-    --warning: #96620f;
-    --warning-soft: rgba(150, 98, 15, 0.13);
-    --shadow-sm: 0 2px 10px rgba(96, 74, 40, 0.12);
-    --shadow-md: 0 8px 24px rgba(96, 74, 40, 0.15);
-    --shadow-lg: 0 18px 50px rgba(96, 74, 40, 0.2);
-    --highlight: rgba(255, 253, 246, 0.6);
-  }
-
   [data-theme='sage'],
   :root[data-theme='sage'] {
     --bg: #edf1e8;
@@ -183,34 +155,6 @@
     --shadow-lg: 0 18px 54px rgba(0, 0, 0, 0.38);
     --highlight: rgba(255, 255, 255, 0.045);
     --scrim: rgba(0, 0, 0, 0.46);
-  }
-
-  [data-theme='sand'],
-  :root[data-theme='sand'] {
-    --bg: #201b12;
-    --surface: rgba(41, 35, 24, 0.94);
-    --surface-solid: #29231a;
-    --surface-muted: #322b1e;
-    --surface-inset: #171208;
-    --text: #f3eee2;
-    --text-secondary: #c2b8a0;
-    --text-tertiary: #8d8571;
-    --border: rgba(255, 240, 214, 0.12);
-    --border-strong: rgba(255, 240, 214, 0.22);
-    --accent: #d9a25f;
-    --accent-hover: #e4b578;
-    --accent-soft: rgba(217, 162, 95, 0.16);
-    --on-accent: #201b12;
-    --danger: #ff9d8a;
-    --danger-soft: rgba(255, 157, 138, 0.14);
-    --success: #a4d08e;
-    --success-soft: rgba(164, 208, 142, 0.14);
-    --warning: #e8bd6d;
-    --warning-soft: rgba(232, 189, 109, 0.15);
-    --shadow-sm: 0 2px 12px rgba(0, 0, 0, 0.28);
-    --shadow-md: 0 8px 26px rgba(0, 0, 0, 0.34);
-    --shadow-lg: 0 18px 54px rgba(0, 0, 0, 0.42);
-    --highlight: rgba(255, 235, 200, 0.05);
   }
 
   [data-theme='sage'],

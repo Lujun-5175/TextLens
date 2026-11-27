@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import { convertListMarkers, normalizeMarkdownSource } from './markdownNormalize'
+import { convertListMarkers, expandInlineFences, normalizeMarkdownSource } from './markdownNormalize'
 import { contentLooksLikeMath } from './markdownPolicy'
 
 describe('convertListMarkers', () => {
@@ -101,6 +101,38 @@ describe('normalizeMarkdownSource', () => {
   })
 })
 
+describe('inline fences', () => {
+  it('moves a fence that starts mid-line onto its own line', () => {
+    expect(expandInlineFences(['说明： ```python', 'print(1)', '```', '后文'])).toEqual([
+      '说明：',
+      '```python',
+      'print(1)',
+      '```',
+      '后文'
+    ])
+  })
+
+  it('expands a fence that opens and closes on one line', () => {
+    expect(expandInlineFences(['说明： ```ts const a = 1 ``` 后文'])).toEqual([
+      '说明：',
+      '```ts',
+      'const a = 1',
+      '```',
+      '后文'
+    ])
+  })
+
+  it('leaves a fence at the start of a line alone', () => {
+    const lines = ['```python', 'print(1)', '```']
+    expect(expandInlineFences(lines)).toEqual(lines)
+  })
+
+  it('leaves a stray run of backticks alone when nothing closes it', () => {
+    const lines = ['用 ``` 包住代码']
+    expect(expandInlineFences(lines)).toEqual(lines)
+  })
+})
+
 describe('LaTeX delimiters', () => {
   it('turns a multi-line bracket formula into a display block', () => {
     const input = [
@@ -140,6 +172,42 @@ c = d
     expect(normalizeMarkdownSource(fenced)).toBe(fenced)
     expect(normalizeMarkdownSource(String.raw`用 ` + '`' + String.raw`\[x\]` + '`' + ' 表示显示公式')).toBe(
       String.raw`用 ` + '`' + String.raw`\[x\]` + '`' + ' 表示显示公式'
+    )
+  })
+
+  it('escapes the dollars inside a span that mixes both delimiter styles', () => {
+    // The model wrote `\(...\)` around an expression that already contained
+    // `$`. Those dollars must not be allowed to pair with anything: doing so
+    // let one broken formula swallow the rest of the answer.
+    const input = String.raw`\(-\sum_t\left$(m_{it}'\right)$ + x\)`
+    const out = normalizeMarkdownSource(input)
+    expect(out).toContain(String.raw`\(-\sum_t\left`)
+    expect(out).toContain(String.raw`\$(m_{it}'\right)\$`)
+    expect(out).toContain(' + x')
+  })
+
+  it('escapes a dangling dollar so no span can reach the next block', () => {
+    // remark-math pairs dollars by counting, so an odd one lets a formula
+    // absorb whatever follows — including headings and code fences. Escaping
+    // the leftover keeps pairing local; what the model meant by the other
+    // dollars is none of our business, and KaTeX decides whether they parse.
+    const out = normalizeMarkdownSource('前文 $ 这段不是公式 $N=80$ 和 $K=8$。')
+    const unescaped = out.replace(/\\\$/gu, '').match(/\$/gu)?.length ?? 0
+    expect(unescaped % 2).toBe(0)
+    expect(out.endsWith('8\\$。')).toBe(true)
+  })
+
+  it('does not wrap a LaTeX span KaTeX rejects', () => {
+    // `\frac{1}` is missing its second argument, so it can only ever render as
+    // an error. Leaving the source alone shows TeX, not a red blob.
+    const broken = String.raw`坏公式 \(\frac{1}\) 保留原文`
+    expect(normalizeMarkdownSource(broken)).toBe(broken)
+    expect(normalizeMarkdownSource(String.raw`好公式 \(x^2\)`)).toBe('好公式 $x^2$')
+  })
+
+  it('keeps a clean inline formula untouched', () => {
+    expect(normalizeMarkdownSource('在 $N=80$ 时误差约 $1.5\\times10^{-4}$。')).toBe(
+      '在 $N=80$ 时误差约 $1.5\\times10^{-4}$。'
     )
   })
 

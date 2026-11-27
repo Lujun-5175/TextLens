@@ -20,9 +20,9 @@ import {
   CircleAlert,
   Copy,
   CornerDownLeft,
+  ArrowUp,
   LoaderCircle,
-  Maximize2,
-  Minimize2,
+  Minus,
   Pin,
   RefreshCw,
   Settings2,
@@ -81,6 +81,19 @@ const RESULT_RESIZE_DIRECTIONS = [
 ] as const
 
 type ResultResizeDirection = (typeof RESULT_RESIZE_DIRECTIONS)[number]
+
+/**
+ * First-run suggestions for an orb-opened conversation.
+ *
+ * They are complete questions on purpose: a blank ask window with one grey
+ * sentence gives the user nothing to react to, and a prompt that needs their
+ * own text would only produce a half-written question.
+ */
+const ASK_EXAMPLE_PROMPTS = [
+  '用三句话解释「机会成本」',
+  '把这段话说得更简洁：我觉得这个方案在很多方面都还有一些可以改进的地方',
+  '帮我列一个三天的期末复习计划'
+] as const
 
 /**
  * Collapse WebKit/AppKit native popup menus (e.g. `<select>`) before the
@@ -535,6 +548,7 @@ function ResultSessionApp({
 
   const [session, setSession] = useState<ResultSessionSnapshot | null>(null)
   const [pinned, setPinned] = useState(false)
+  const [maximized, setMaximized] = useState(false)
   const [showOriginal, setShowOriginal] = useState(false)
   const [turns, setTurns] = useState<TranscriptTurn[]>([])
   const [translationTarget, setTranslationTarget] = useState<TranslationLanguage | null>(null)
@@ -551,7 +565,6 @@ function ResultSessionApp({
   const previousStatusRef = useRef<ResultState['status'] | null>(null)
   const [copyComplete, setCopyComplete] = useState(false)
   const [followUpQuestion, setFollowUpQuestion] = useState('')
-  const [followUpExpanded, setFollowUpExpanded] = useState(false)
   const [followUpSubmitting, setFollowUpSubmitting] = useState(false)
   const [revealCommitted, setRevealCommitted] = useState(false)
   const [bootstrapMessage, setBootstrapMessage] = useState('')
@@ -578,6 +591,7 @@ function ResultSessionApp({
   const bootstrapRetryInFlight = useRef(false)
   const disposedRef = useRef(false)
   const followUpComposing = useRef(false)
+  const followUpRef = useRef<HTMLTextAreaElement | null>(null)
   const askOriginalDefaulted = useRef(false)
   const pendingFollowUp = useRef<{ question: string; requestId: string | null } | null>(null)
   const askStreamRenderRef = useRef<{
@@ -595,6 +609,9 @@ function ResultSessionApp({
   // response is actively streaming.
   const isAiAction = action !== undefined && isAiActionDefinition(action)
   const showFollowUp = isAiAction && status !== 'streaming'
+  // The ask composer stays on screen while an answer streams: that is where
+  // the stop control lives, and hiding the field makes the window feel dead.
+  const askComposerVisible = isAsk && isAiAction && (showFollowUp || status === 'streaming')
   const followUpDisabled =
     followUpSubmitting || preparingRequestId !== null ||
     status === 'streaming' ||
@@ -726,6 +743,54 @@ function ResultSessionApp({
     dismissNativeOverlays()
     await window.textLens.closeResult(sessionId)
   }, [sessionId])
+
+  // The result window is a normal desktop window: it can be minimized and
+  // maximized like any other, instead of forcing "always on top" as the only
+  // way to keep it while working elsewhere.
+  const minimizeWindow = useCallback(async (): Promise<void> => {
+    try {
+      await getCurrentWindow().minimize()
+    } catch (error) {
+      setCommandMessage(getErrorMessage(error, '无法最小化结果窗口'))
+    }
+  }, [])
+
+  const toggleMaximizeWindow = useCallback(async (): Promise<void> => {
+    const current = getCurrentWindow()
+    try {
+      await current.toggleMaximize()
+      setMaximized(await current.isMaximized())
+    } catch (error) {
+      setCommandMessage(getErrorMessage(error, '无法切换最大化'))
+    }
+  }, [])
+
+  // A restored or OS-maximized window must show the restore glyph, not the
+  // maximize one. Older test harnesses expose only the drag APIs, so every
+  // probe here is optional rather than required.
+  useEffect(() => {
+    const current = getCurrentWindow()
+    if (typeof current.isMaximized !== 'function') return undefined
+    let disposed = false
+    const sync = (): void => {
+      void current.isMaximized()
+        .then((value) => {
+          if (!disposed) setMaximized(value)
+        })
+        .catch(() => undefined)
+    }
+    sync()
+    // Win+Up, Aero Snap and a double-click on the native frame maximize
+    // without going through our button, so follow the window instead of
+    // assuming our own clicks are the only way in.
+    const unlisten = typeof current.onResized === 'function'
+      ? current.onResized(sync)
+      : Promise.resolve(() => undefined)
+    return () => {
+      disposed = true
+      void unlisten.then((stop) => stop())
+    }
+  }, [])
 
   const cancel = useCallback(async (): Promise<void> => {
     setCommandMessage('')
@@ -1054,6 +1119,29 @@ function ResultSessionApp({
     }
   }, [preparingRequestId, preparationFailure, requestId])
 
+  // An Ask window that is still waiting for its first question has no other
+  // control to click, so it opens with the caret already in the input. This is
+  // the floating orb's path: click the orb, type immediately.
+  useEffect(() => {
+    if (!isAsk || turns.length > 0 || followUpDisabled) return
+    const element = followUpRef.current
+    if (!element) return
+    const frame = window.requestAnimationFrame(() => {
+      followUpRef.current?.focus()
+    })
+    return () => window.cancelAnimationFrame(frame)
+  }, [isAsk, turns.length, followUpDisabled])
+
+  // Grow the composer with its content up to a few lines, then scroll.
+  // Suggestion chips and restored drafts both change the value without a
+  // keystroke, so this follows the value rather than the input event.
+  useEffect(() => {
+    const element = followUpRef.current
+    if (!element) return
+    element.style.height = 'auto'
+    element.style.height = `${Math.min(element.scrollHeight, 132)}px`
+  }, [isAsk, followUpQuestion, followUpDisabled])
+
   useEffect(() => {
     if (!preparationFailure) return
     setCommandMessage(preparationFailure.message)
@@ -1330,6 +1418,10 @@ function ResultSessionApp({
   }
 
   const selection = session?.selection
+  // Orb-opened Ask sessions carry an empty selection payload: there is no
+  // source text to fold away, and the prompts must not promise context the
+  // model was never given.
+  const hasSourceText = (selection?.text.trim().length ?? 0) > 0
   const translationRoute = useMemo(() => {
     if (action?.kind !== 'translate' || !selection || !settings) return null
     const detected = detectTranslationLanguage(selection.text)
@@ -1370,11 +1462,10 @@ function ResultSessionApp({
 
   return (
     <main
-      className={`result-window ${windowsRenderer ? 'result-window--windows' : ''} ${
-        showFollowUp && followUpExpanded ? 'result-window--followup-expanded' : ''
-      }`}
+      className={`result-window ${windowsRenderer ? 'result-window--windows' : ''}`}
       style={style}
       data-reveal-state={bootstrapMessage ? 'error' : revealCommitted ? 'visible' : 'preparing'}
+      data-maximized={maximized ? 'true' : undefined}
       onPointerEnter={pointerEnter}
       onPointerLeave={pointerLeave}
       onPointerDown={handleResultPointerDown}
@@ -1389,7 +1480,14 @@ function ResultSessionApp({
           onPointerDown={(event) => startWindowResize(event, direction)}
         />
       ))}
-      <header className="result-header" onPointerDown={startWindowDrag}>
+      <header
+        className="result-header"
+        onPointerDown={startWindowDrag}
+        onDoubleClick={(event) => {
+          if (isInteractiveElement(event.target)) return
+          void toggleMaximizeWindow()
+        }}
+      >
         <div className="result-heading">
           <span className="result-heading__icon">
             <ActionIcon name={action?.icon ?? 'sparkles'} size={16} />
@@ -1552,6 +1650,24 @@ function ResultSessionApp({
             title={pinned ? '取消置顶' : '置顶'} onClick={() => void togglePin()}>
             <Pin size={16} className={pinned ? 'result-pin__icon--active' : ''} />
           </button>
+          <button
+            className="icon-button result-minimize"
+            type="button"
+            aria-label="最小化结果窗口"
+            title="最小化"
+            onClick={() => void minimizeWindow()}
+          >
+            <Minus size={15} aria-hidden="true" />
+          </button>
+          <button
+            className="icon-button result-maximize"
+            type="button"
+            aria-label={maximized ? '还原结果窗口' : '最大化结果窗口'}
+            title={maximized ? '还原' : '最大化'}
+            onClick={() => void toggleMaximizeWindow()}
+          >
+            {maximized ? <Copy size={13} aria-hidden="true" /> : <Square size={13} aria-hidden="true" />}
+          </button>
           <button className="icon-button result-close" type="button" aria-label="关闭结果窗口"
             title="关闭" onClick={() => runDetached(closeWindow(), {
               scope: 'result',
@@ -1572,7 +1688,7 @@ function ResultSessionApp({
       >
         {({ hasContent, hasThinking }) => (
           <>
-          {selection && (
+          {selection && hasSourceText && (
             <section className="result-original">
               <button type="button" onClick={() => setShowOriginal((current) => !current)} aria-expanded={showOriginal}>
                 <span>{showOriginal ? '隐藏原文' : '显示原文'}</span>
@@ -1586,10 +1702,35 @@ function ResultSessionApp({
             <>
               <AskStreamBridge enabled={isAsk} onStream={handleAskStream} />
               {turns.length === 0 && status !== 'streaming' && status !== 'error' && (
-                <div className="result-placeholder">
-                  <span>已载入选中文本。请在下方输入问题。</span>
-                </div>
+                hasSourceText ? (
+                  <div className="result-placeholder">
+                    <span>已载入选中文本。请在下方输入问题。</span>
+                  </div>
+                ) : (
+                  <div className="ask-welcome">
+                    <div className="ask-welcome__title">有什么可以帮你的？</div>
+                    <p className="ask-welcome__hint">
+                      直接输入问题，回车发送。也可先试试这些：
+                    </p>
+                    <div className="ask-welcome__examples">
+                      {ASK_EXAMPLE_PROMPTS.map((prompt) => (
+                        <button
+                          key={prompt}
+                          type="button"
+                          className="ask-welcome__example"
+                          onClick={() => {
+                            setFollowUpQuestion(prompt)
+                            followUpRef.current?.focus()
+                          }}
+                        >
+                          {prompt}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                )
               )}
+              <div className="ask-thread">
               {turns.map((turn, index) => {
                 const isLatestAssistant =
                   turn.role === 'assistant' && index === turns.length - 1
@@ -1599,7 +1740,6 @@ function ResultSessionApp({
                     className={`result-turn result-turn--${turn.role}`}
                     data-role={turn.role}
                   >
-                    <div className="result-turn__label">{turn.role === 'user' ? '你' : 'AI'}</div>
                     {turn.role === 'user' ? (
                       <div className="result-turn__content">{turn.content}</div>
                     ) : (
@@ -1631,6 +1771,7 @@ function ResultSessionApp({
                   </div>
                 )
               })}
+              </div>
             </>
           ) : (
             <>
@@ -1682,90 +1823,103 @@ function ResultSessionApp({
       )}
       {commandMessage && <div className="result-command-error" role="alert">{commandMessage}</div>}
 
-      <footer className={`result-footer ${showFollowUp ? '' : 'result-footer--actions-only'}`}>
-        {showFollowUp && <div className={`result-followup ${followUpExpanded ? 'result-followup--expanded' : ''}`}>
-          <textarea
-            aria-label="继续提问"
-            placeholder={isAsk ? '输入问题，基于选中文本提问' : '输入继续提问'}
-            title="Enter 发送，Shift+Enter 换行"
-            rows={followUpExpanded ? 4 : 1}
-            maxLength={20_000}
-            value={followUpQuestion}
-            disabled={followUpDisabled}
-            onChange={(event) => setFollowUpQuestion(event.target.value)}
-            onCompositionStart={() => { followUpComposing.current = true }}
-            onCompositionEnd={() => { followUpComposing.current = false }}
-            onKeyDown={(event) => {
-              if (
-                event.key === 'Enter' &&
-                !event.shiftKey &&
-                !event.nativeEvent.isComposing &&
-                !followUpComposing.current
-              ) {
-                event.preventDefault()
-                void submitFollowUp()
-              }
-            }}
-          />
-          <button
-            className="result-followup-expand"
-            type="button"
-            aria-label={followUpExpanded ? '收起继续提问输入框' : '放大继续提问输入框'}
-            aria-expanded={followUpExpanded}
-            title={followUpExpanded ? '收起输入框' : '放大输入框'}
-            onClick={() => setFollowUpExpanded((current) => !current)}
-          >
-            {followUpExpanded ? <Minimize2 size={13} /> : <Maximize2 size={13} />}
-          </button>
-        </div>}
-        <div className="result-actions">
-          {settings?.result.dismissMode === 'manual' && (
-            <button className="result-footer-button" type="button" onClick={() => runDetached(closeWindow(), {
-              scope: 'result',
-              operation: 'close',
-              onError: (error) => setCommandMessage(getErrorMessage(error, '无法关闭结果窗口'))
-            })}>
-              <X size={15} />关闭
-            </button>
+      <footer
+        className={`result-footer ${isAsk ? 'result-footer--ask' : ''} ${
+          askComposerVisible || showFollowUp ? '' : 'result-footer--actions-only'
+        }`}
+      >
+        <div className="result-footer-row">
+          {(isAsk ? askComposerVisible : showFollowUp) && (
+            // Every AI result window shares one footer: a composer with a send
+            // button, then the same icon+label actions in the same order.
+            <div className="result-composer" data-disabled={followUpDisabled || undefined}>
+              <textarea
+                aria-label="继续提问"
+                ref={followUpRef}
+                className="result-composer__input"
+                placeholder={
+                  isAsk
+                    ? hasSourceText
+                      ? '基于选中文本提问…'
+                      : '问点什么…'
+                    : '继续提问…'
+                }
+                title="Enter 发送，Shift+Enter 换行"
+                rows={1}
+                maxLength={20_000}
+                value={followUpQuestion}
+                disabled={followUpDisabled}
+                onChange={(event) => setFollowUpQuestion(event.target.value)}
+                onCompositionStart={() => { followUpComposing.current = true }}
+                onCompositionEnd={() => { followUpComposing.current = false }}
+                onKeyDown={(event) => {
+                  if (
+                    event.key === 'Enter' &&
+                    !event.shiftKey &&
+                    !event.nativeEvent.isComposing &&
+                    !followUpComposing.current
+                  ) {
+                    event.preventDefault()
+                    void submitFollowUp()
+                  }
+                }}
+              />
+              <button
+                className="result-composer__send"
+                type="button"
+                aria-label="发送问题"
+                title={followUpQuestion.trim() ? '发送（Enter）' : '先输入问题'}
+                disabled={!followUpQuestion.trim() || followUpDisabled}
+                onClick={() => void submitFollowUp()}
+              >
+                <ArrowUp size={15} />
+              </button>
+            </div>
           )}
-          {status === 'streaming' ? (
-            <button
-              className="result-footer-button result-footer-button--stop"
-              type="button"
-              onClick={() => void cancel()}
-              title="停止本次生成"
-            >
-              <Square size={13} fill="currentColor" />
-              停止
-            </button>
-          ) : (
-            <button
-              className="result-footer-button"
-              type="button"
-              disabled={retrying || followUpSubmitting || preparingRequestId !== null || !requestId || (status === 'error' && !retryable && !settingsChangedSinceError)}
-              onClick={() => void retry()}
-              title={settingsChangedSinceError ? '设置已更改，可重新发起' : '使用相同选区重新生成'}
-            >
-              <RefreshCw size={14} />
-              重试
-            </button>
-          )}
-          <ResultCopyButton
-            isAsk={isAsk}
-            hasTurns={hasTurns}
-            copyComplete={copyComplete}
-            onCopy={() => void copy()}
-          />
-          <button
-            className="result-footer-button"
-            type="button"
-            disabled={retrying || followUpSubmitting || preparingRequestId !== null || !requestId || status === 'streaming'}
-            onClick={() => void reinsert()}
-            title="把结果粘贴回选中文字所在的应用（会覆盖剪贴板）"
-          >
-            <CornerDownLeft size={14} />
-            插入原文
-          </button>
+          {/* No 关闭 here for any window: the header ✕ is the single close
+              affordance. 插入原文 only exists when there is a source app. */}
+          <div className="result-actions">
+            {status === 'streaming' ? (
+              <button
+                className="result-footer-button result-footer-button--stop"
+                type="button"
+                onClick={() => void cancel()}
+                title="停止本次生成"
+              >
+                <Square size={13} fill="currentColor" />
+                停止
+              </button>
+            ) : (
+              <button
+                className="result-footer-button"
+                type="button"
+                disabled={retrying || followUpSubmitting || preparingRequestId !== null || !requestId || (status === 'error' && !retryable && !settingsChangedSinceError)}
+                onClick={() => void retry()}
+                title={settingsChangedSinceError ? '设置已更改，可重新发起' : '重新发送上一次请求'}
+              >
+                <RefreshCw size={14} />
+                重试
+              </button>
+            )}
+            <ResultCopyButton
+              isAsk={isAsk}
+              hasTurns={hasTurns}
+              copyComplete={copyComplete}
+              onCopy={() => void copy()}
+            />
+            {hasSourceText && (
+              <button
+                className="result-footer-button"
+                type="button"
+                disabled={retrying || followUpSubmitting || preparingRequestId !== null || !requestId || status === 'streaming'}
+                onClick={() => void reinsert()}
+                title="把结果粘贴回选中文字所在的应用（会覆盖剪贴板）"
+              >
+                <CornerDownLeft size={14} />
+                插入原文
+              </button>
+            )}
+          </div>
         </div>
       </footer>
     </main>

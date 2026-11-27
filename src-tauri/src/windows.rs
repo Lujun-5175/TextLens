@@ -1340,10 +1340,13 @@ impl WindowCoordinator {
         .decorations(false)
         .transparent(true)
         .resizable(true)
-        .minimizable(false)
+        .minimizable(true)
         .fullscreen(false)
         .always_on_top(options.pinned)
-        .skip_taskbar(true)
+        // A result window is a workspace the user returns to: it belongs in
+        // the taskbar so it can be found again after switching away, and so
+        // minimizing it is not a one-way trip.
+        .skip_taskbar(false)
         .accept_first_mouse(true)
         .focusable(true)
         .focused(false)
@@ -2394,6 +2397,99 @@ fn physical_dimension(value: f64) -> u32 {
     value.ceil().clamp(1.0, u32::MAX as f64) as u32
 }
 
+/// Gap between the floating orb and the work-area edge, in logical pixels.
+const BALL_SCREEN_MARGIN: f64 = 20.0;
+
+/// Bottom-left corner of a work area: the resting place for the floating orb
+/// and the spot least likely to cover the selection toolbar or a result.
+fn ball_position_in_area(size: WindowSize, area: WorkArea, coordinate_scale: f64) -> Point {
+    let margin = BALL_SCREEN_MARGIN * normalized_scale(coordinate_scale);
+    Point {
+        x: area.x + margin,
+        y: (area.y + area.height - margin - size.height).max(area.y + margin),
+    }
+}
+
+/// Whether a persisted orb position still lands on a connected display.
+///
+/// A stored coordinate outlives monitor hot-plugging, so restoring it blindly
+/// can strand the ball off-screen with no way to click or drag it back.
+fn ball_position_is_reachable(
+    point: Point,
+    size: WindowSize,
+    displays: &[MonitorGeometry],
+) -> bool {
+    if !point.x.is_finite() || !point.y.is_finite() {
+        return false;
+    }
+    displays.iter().any(|display| {
+        let area = display.bounds;
+        point.x >= area.x - 1.0
+            && point.y >= area.y - 1.0
+            && point.x + size.width <= area.x + area.width + 1.0
+            && point.y + size.height <= area.y + area.height + 1.0
+    })
+}
+
+/// Positions the floating orb before it is shown.
+///
+/// `stored` is the last persisted native position (physical pixels on Windows,
+/// logical on macOS). It is honoured only while it still lands on a connected
+/// display; otherwise the orb falls back to the bottom-left of the display
+/// under `anchor`, which keeps it reachable after a monitor change.
+pub(crate) fn place_ball_window(
+    window: &WebviewWindow,
+    anchor: Point,
+    stored: Option<Point>,
+    logical_size: WindowSize,
+) -> tauri::Result<()> {
+    let geometries = window
+        .available_monitors()?
+        .iter()
+        .map(monitor_geometry)
+        .collect::<Vec<_>>();
+    let stored_is_usable = stored.filter(|point| {
+        let scale = monitor_index_for_point(&geometries, *point)
+            .map(|index| geometries[index].coordinate_scale)
+            .unwrap_or_else(|| current_window_coordinate_scale(window));
+        let coordinate_size = logical_size_to_coordinates(logical_size, scale);
+        ball_position_is_reachable(*point, coordinate_size, &geometries)
+    });
+    // Size and fallback position follow the display that will own the orb: the
+    // stored position when it is still valid, otherwise the pointer's display.
+    let reference = stored_is_usable.unwrap_or(anchor);
+    let geometry = monitor_index_for_point(&geometries, reference).map(|index| geometries[index]);
+    let scale = geometry
+        .map(|value| value.coordinate_scale)
+        .unwrap_or_else(|| current_window_coordinate_scale(window));
+    let coordinate_size = logical_size_to_coordinates(logical_size, scale);
+    let position = stored_is_usable.unwrap_or_else(|| match geometry {
+        Some(value) => ball_position_in_area(coordinate_size, value.work_area, scale),
+        None => Point {
+            x: BALL_SCREEN_MARGIN * scale,
+            y: BALL_SCREEN_MARGIN * scale,
+        },
+    });
+    apply_window_layout(
+        window,
+        WindowLayout {
+            position,
+            coordinate_size,
+        },
+    )
+}
+
+/// Shows the orb above ordinary windows without taking focus from the app the
+/// user is reading.
+pub(crate) fn show_overlay_window(window: &WebviewWindow) -> tauri::Result<()> {
+    order_front_without_focus(window)
+}
+
+/// Applies the non-activating overlay style shared by the toolbar and the orb.
+pub(crate) fn configure_overlay_window(window: &WebviewWindow) -> tauri::Result<()> {
+    configure_toolbar_native(window)
+}
+
 fn cursor_is_outside(app: &AppHandle, label: &str) -> bool {
     let Some(window) = app.get_webview_window(label) else {
         return true;
@@ -2951,7 +3047,10 @@ fn configure_result_native_raw(window: &WebviewWindow, pinned: bool) -> tauri::R
     let hwnd = window
         .hwnd()
         .map_err(|error| result_window_step_error("native HWND access", error))?;
-    set_windows_extended_style(hwnd, WS_EX_TOOLWINDOW.0, WS_EX_APPWINDOW.0)?;
+    // A result window is a workspace, not a transient tool window: give it a
+    // taskbar button and an Alt-Tab entry so minimizing or switching away is
+    // reversible. (WS_EX_TOOLWINDOW here used to hide it from both.)
+    set_windows_extended_style(hwnd, WS_EX_APPWINDOW.0, WS_EX_TOOLWINDOW.0)?;
     configure_windows_result_corners(hwnd);
     let insert_after = if pinned { HWND_TOPMOST } else { HWND_NOTOPMOST };
     unsafe {
@@ -5125,5 +5224,97 @@ mod tests {
         assert_eq!(state.toolbar_recovery_pending_selection_id, None);
         assert!(!state.reserve_toolbar_recovery("selection-a"));
         assert!(state.reserve_toolbar_recovery("selection-b"));
+    }
+
+    fn ball_work_area(x: f64, y: f64, width: f64, height: f64) -> WorkArea {
+        WorkArea {
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+
+    #[test]
+    fn the_orb_rests_at_the_bottom_left_corner_scaled_to_the_display() {
+        let size = WindowSize {
+            width: 56.0,
+            height: 56.0,
+        };
+        let area = ball_work_area(0.0, 0.0, 2560.0, 1400.0);
+
+        // 200% display: every offset doubles, including the 20 DIP margin.
+        // `size` is already in coordinate space, matching what the caller
+        // passes after `logical_size_to_coordinates`.
+        let scaled = WindowSize {
+            width: 112.0,
+            height: 112.0,
+        };
+        let point = ball_position_in_area(scaled, area, 2.0);
+        assert_eq!(point.x, 40.0);
+        assert_eq!(point.y, 1400.0 - 40.0 - 112.0);
+
+        // A work area on a negative-origin secondary display keeps its origin.
+        let offset =
+            ball_position_in_area(size, ball_work_area(-1920.0, -200.0, 1920.0, 1080.0), 1.0);
+        assert_eq!(offset.x, -1900.0);
+        assert_eq!(offset.y, -200.0 + 1080.0 - 20.0 - 56.0);
+    }
+
+    #[test]
+    fn the_orb_stays_reachable_on_displays_smaller_than_its_margins() {
+        let size = WindowSize {
+            width: 56.0,
+            height: 56.0,
+        };
+        // Degenerate work area: never push the orb above or left of the origin.
+        let point = ball_position_in_area(size, ball_work_area(0.0, 0.0, 40.0, 40.0), 1.0);
+        assert!(point.x >= 0.0);
+        assert!(point.y >= 0.0);
+    }
+
+    #[test]
+    fn a_saved_orb_position_is_only_restored_while_a_display_still_shows_it() {
+        let size = WindowSize {
+            width: 56.0,
+            height: 56.0,
+        };
+        let displays = [MonitorGeometry {
+            bounds: ball_work_area(-1920.0, 0.0, 1920.0, 1080.0),
+            work_area: ball_work_area(-1920.0, 0.0, 1920.0, 1080.0),
+            coordinate_scale: 1.0,
+        }];
+
+        assert!(ball_position_is_reachable(
+            Point {
+                x: -1900.0,
+                y: 1000.0
+            },
+            size,
+            &displays
+        ));
+        // The display that used to own this position was unplugged.
+        assert!(!ball_position_is_reachable(
+            Point {
+                x: 1200.0,
+                y: 400.0
+            },
+            size,
+            &displays
+        ));
+        // A partial overlap would clip the orb against the right edge.
+        assert!(!ball_position_is_reachable(
+            Point { x: -40.0, y: 400.0 },
+            size,
+            &displays
+        ));
+        assert!(!ball_position_is_reachable(
+            Point {
+                x: f64::NAN,
+                y: 0.0
+            },
+            size,
+            &displays
+        ));
     }
 }

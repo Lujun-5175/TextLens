@@ -84,7 +84,10 @@ export const selectionPayloadSchema = z
   .object({
     selectionId: z.string().trim().min(1).max(128).optional(),
     toolbarMaxWidth: z.number().finite().positive().max(900).optional(),
-    text: z.string().min(1).max(1_000_000),
+    // An Ask session opened from the floating orb has no source text; the
+    // result window renders it as a plain conversation instead of a
+    // selection-backed answer. Toolbar selections are still never empty.
+    text: z.string().max(1_000_000),
     sourceApp: sourceApplicationSchema,
     anchor: selectionAnchorSchema,
     direction: selectionDirectionSchema.default('unknown'),

@@ -282,7 +282,9 @@ describe('SettingsApp provider deletion', () => {
 
     const group = await screen.findByRole('radiogroup', { name: '界面主题' })
     const options = within(group).getAllByRole('radio')
-    expect(options).toHaveLength(5)
+    // Four palettes: the retired "米杏" (sand) must not come back.
+    expect(options).toHaveLength(4)
+    expect(within(group).queryByRole('radio', { name: '米杏' })).not.toBeInTheDocument()
     expect(within(group).getByRole('radio', { name: '暖白' })).toHaveAttribute('aria-checked', 'true')
     expect(document.documentElement).not.toHaveAttribute('data-theme')
 

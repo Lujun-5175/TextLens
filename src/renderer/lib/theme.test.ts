@@ -27,9 +27,9 @@ describe('applyTheme', () => {
   })
 
   it('leaves the stored theme untouched when no theme is known', () => {
-    applyTheme('sand')
+    applyTheme('sage')
     applyTheme(null)
     expect(document.documentElement.dataset.theme).toBeUndefined()
-    expect(storedTheme()).toBe('sand')
+    expect(storedTheme()).toBe('sage')
   })
 })

@@ -10,6 +10,7 @@ const settingsCss = readCss('./settings/settings.css')
 const stylesCss = readCss('./styles.css')
 const themesCss = readCss('./themes.css')
 const toolbarCss = readCss('./toolbar/toolbar.css')
+const ballCss = readCss('./ball/ball.css')
 
 // Tokens every theme block must set explicitly. Shared tokens (danger,
 // shadows, radii) may inherit from the base theme, but the identity of a theme
@@ -31,7 +32,7 @@ const IDENTITY_TOKENS = [
   '--on-accent'
 ] as const
 
-const CSS_FILES = [stylesCss, themesCss, resultCss, settingsCss, toolbarCss]
+const CSS_FILES = [stylesCss, themesCss, resultCss, settingsCss, toolbarCss, ballCss]
 
 function tokenNames(block: string): Set<string> {
   const names = new Set<string>()
@@ -123,7 +124,6 @@ describe('appearance themes', () => {
       '--radius-xs',
       '--radius-sm',
       '--radius-md',
-      '--radius-lg',
       '--radius-pill',
       '--border-subtle',
       '--scrim'
