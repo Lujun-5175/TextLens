@@ -1064,9 +1064,17 @@ export function SettingsApp(): JSX.Element {
       setOperation(null)
       return
     }
-    if (hasUnsavedChanges()) {
+    // `persist()` cannot save an open action editor or model picker, so the
+    // form check alone would quit and silently discard their contents.
+    if (hasUnsavedChanges() || editor !== null || modelPicker !== null) {
       setOperation(null)
-      setBanner({ kind: 'error', text: '新的修改尚未保存，请再次确认退出' })
+      setQuitConfirmationOpen(false)
+      setBanner({
+        kind: 'error',
+        text: editor !== null || modelPicker !== null
+          ? '动作编辑器或模型选择器里还有未保存的内容，请先完成或取消，再退出'
+          : '新的修改尚未保存，请再次确认退出'
+      })
       return
     }
     setQuitConfirmationOpen(false)

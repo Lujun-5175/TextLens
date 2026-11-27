@@ -1674,6 +1674,11 @@ impl WindowCoordinator {
         let Some(window) = app.get_webview_window(label) else {
             return Ok(());
         };
+        // A minimized window also loses the foreground, but the user asked for
+        // it to go to the taskbar, not to be destroyed by a blur.
+        if window.is_minimized().unwrap_or(false) {
+            return Ok(());
+        }
         let request = self
             .state
             .lock()

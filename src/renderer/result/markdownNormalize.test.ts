@@ -127,6 +127,18 @@ describe('inline fences', () => {
     expect(expandInlineFences(lines)).toEqual(lines)
   })
 
+  it('does not pair a stray mid-line fence with a later block', () => {
+    // The later marker carries a language, so it opens a new block: the stray
+    // one was never closed and splitting would swallow that block's body.
+    const lines = ['用 ``` 包住代码', '', '正常段落', '', '```js', 'const a = 1', '```', '', '结尾']
+    expect(expandInlineFences(lines)).toEqual(lines)
+  })
+
+  it('leaves the body of a real block untouched', () => {
+    const lines = ['```md', '示例： ```json``` 这样写', '```']
+    expect(expandInlineFences(lines)).toEqual(lines)
+  })
+
   it('leaves a stray run of backticks alone when nothing closes it', () => {
     const lines = ['用 ``` 包住代码']
     expect(expandInlineFences(lines)).toEqual(lines)
@@ -161,7 +173,7 @@ c = d
   })
 
   it('converts single-line display and inline delimiters', () => {
-    expect(normalizeMarkdownSource(String.raw`\[x=1\]`)).toBe('$$x=1$$')
+    expect(normalizeMarkdownSource(String.raw`\[x=1\]`)).toBe('$$\nx=1\n$$')
     expect(normalizeMarkdownSource(String.raw`其中 \(\alpha=0.05\) 显著`)).toBe(
       String.raw`其中 $\alpha=0.05$ 显著`
     )
@@ -203,6 +215,12 @@ c = d
     const broken = String.raw`坏公式 \(\frac{1}\) 保留原文`
     expect(normalizeMarkdownSource(broken)).toBe(broken)
     expect(normalizeMarkdownSource(String.raw`好公式 \(x^2\)`)).toBe('好公式 $x^2$')
+  })
+
+  it('leaves dollar amounts inside code alone', () => {
+    const input = ['```bash', "awk '{print $1, $2}'", '```', '', '价格 $5 到 $10。'].join('\n')
+    const out = normalizeMarkdownSource(input)
+    expect(out).toContain("awk '{print $1, $2}'")
   })
 
   it('keeps a clean inline formula untouched', () => {

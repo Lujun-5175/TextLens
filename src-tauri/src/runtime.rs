@@ -1670,12 +1670,18 @@ impl RuntimeState {
         self.reconcile_capture(app);
         self.reconcile_shortcut(app);
         refresh_tray(app, settings);
+        let mode = dismiss_mode(settings.result.dismiss_mode);
         self.windows.update_result_behavior(
             app,
-            dismiss_mode(settings.result.dismiss_mode),
+            mode,
             u64::from(settings.result.dismiss_delay_ms),
             settings.result.remember_size,
         );
+        // The session table keeps its own copy for the external-selection rule;
+        // without this a window created before the change keeps the old mode.
+        for meta in self.result_sessions.lock().values_mut() {
+            meta.dismiss_mode = mode;
+        }
         for (label, _) in app.webview_windows() {
             if label.starts_with(RESULT_LABEL_PREFIX) {
                 let _ = self
@@ -2764,7 +2770,15 @@ pub fn open_settings(
     // Settings is a shared, long-lived workspace. Result windows, the
     // toolbar, and the settings window itself may all bring it forward; an
     // unknown WebView must still be rejected.
-    ensure_known_caller(&window)?;
+    //
+    // The orb is allowed even though it never reads settings: when it cannot
+    // start an ask (no enabled action, missing model or key) this is the only
+    // path that can show the user why. It calls open_settings and discards the
+    // error, so a rejection here used to turn an actionable failure into a
+    // silent red flash.
+    if window.label() != crate::ball::BALL_LABEL {
+        ensure_known_caller(&window)?;
+    }
     open_settings_window_with_options(&app, options);
     Ok(())
 }
@@ -3810,9 +3824,12 @@ fn ball_anchor(app: &AppHandle) -> WindowPoint {
         .unwrap_or(crate::ball::BALL_LOGICAL_SIZE);
     if let Some(window) = app.get_webview_window(crate::ball::BALL_LABEL) {
         if let Ok(position) = window.outer_position() {
+            // The position is physical, the stored diameter is logical: mixing
+            // them put the window on top of the orb at >100% scaling.
+            let scale = window.scale_factor().unwrap_or(1.0);
             return WindowPoint {
-                x: f64::from(position.x) + diameter / 2.0,
-                y: f64::from(position.y) + diameter,
+                x: f64::from(position.x) + diameter * scale / 2.0,
+                y: f64::from(position.y) + diameter * scale,
             };
         }
     }
@@ -4496,7 +4513,9 @@ pub fn reinsert_result(
     session_id: String,
     text: String,
 ) -> Result<String, String> {
-    ensure_result_window(&window)?;
+    // Session-scoped like every other result command: a window must not paste
+    // into another session's source application.
+    ensure_result_caller(&window, &session_id)?;
     if text.trim().is_empty() {
         return Err("结果为空".to_owned());
     }
@@ -4529,6 +4548,14 @@ pub fn reinsert_result(
         let _ = window.show();
         let _ = window.set_focus();
         return Ok("copied".to_owned());
+    }
+    // The source application now holds the text; this window has done its job.
+    // Hiding it without closing left the session (and its slot in the result
+    // limit) behind with no taskbar entry or tray path back to it.
+    let app = window.app_handle().clone();
+    let label = window.label().to_owned();
+    if state.windows.close_result(&app, &label).is_ok() {
+        state.cleanup_result_session(&app, &session_id);
     }
     Ok("pasted".to_owned())
 }

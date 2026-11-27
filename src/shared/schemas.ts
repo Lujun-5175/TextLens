@@ -87,7 +87,14 @@ export const selectionPayloadSchema = z
     // An Ask session opened from the floating orb has no source text; the
     // result window renders it as a plain conversation instead of a
     // selection-backed answer. Toolbar selections are still never empty.
-    text: z.string().max(1_000_000),
+    // Rust counts Unicode scalars (`chars().count() > 1_000_000`), so a plain
+    // `.max()` would count UTF-16 units and reject selections the native side
+    // accepted — silently, because event payloads that fail the schema are
+    // dropped. Keep both sides on the same unit.
+    text: z.string().refine(
+      (value) => hasAtMostUnicodeScalars(value, 1_000_000),
+      '选区最多包含 1000000 个 Unicode scalar'
+    ),
     sourceApp: sourceApplicationSchema,
     anchor: selectionAnchorSchema,
     direction: selectionDirectionSchema.default('unknown'),

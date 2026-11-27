@@ -165,11 +165,15 @@ export function normalizeLatexDelimiters(source: string): string {
     if (head.length > 0) out.push(head)
     const close = indexOutsideInlineCode(raw, '\\]', open + 2)
     if (close === -1) {
-      const seed = rewriteInlineLine(raw.slice(open + 2))
+      // A display body is already math: inline rewrites inside it would nest
+      // `$...$` in `$$...$$`, and the balance pass would then escape the lot.
+      const seed = raw.slice(open + 2).trim()
       display = seed.length > 0 ? [seed] : []
     } else {
-      const body = rewriteInlineLine(raw.slice(open + 2, close)).trim()
-      if (body.length > 0) out.push(`$$${body}$$`)
+      const body = raw.slice(open + 2, close).trim()
+      // `$$...$$` inside a paragraph is inline math to remark-math; only the
+      // block form marks it as display.
+      if (body.length > 0) out.push('$$', body, '$$')
       const tail = rewriteInlineLine(raw.slice(close + 2))
       if (tail.length > 0) out.push(tail)
     }
@@ -267,10 +271,12 @@ const CJK = /[\u3400-\u9fff\u3040-\u30ff\uac00-\ud7af]/u
  */
 export function escapeCurrencyDollars(line: string): string {
   if (!line.includes('$')) return line
-  return line.replace(CURRENCY_PAIR, (match, body: string) => {
-    const looksLikeMoney = CJK.test(body) || /\s$/u.test(body)
-    return looksLikeMoney ? match.replace(/\$/gu, '\\$') : match
-  })
+  return mapOutsideInlineCode(line, (segment) =>
+    segment.replace(CURRENCY_PAIR, (match, body: string) => {
+      const looksLikeMoney = CJK.test(body) || /\s$/u.test(body)
+      return looksLikeMoney ? match.replace(/\$/gu, '\\$') : match
+    })
+  )
 }
 
 /**
@@ -401,6 +407,15 @@ export function expandInlineFences(lines: readonly string[]): string[] {
       if (isMatchingFenceClose(line, fenceChar, fenceLength)) fenceChar = null
       continue
     }
+    // A real block: remember it so its body is never rewritten. Without this
+    // the scan would treat a sample containing ``` as a misplaced fence.
+    const block = line.match(FENCE_MARKER)
+    if (block && !(block[1]![0] === '`' && block[2]!.includes('`'))) {
+      out.push(line)
+      fenceChar = block[1]![0]!
+      fenceLength = block[1]!.length
+      continue
+    }
     const opener = findInlineFenceOpener(line)
     if (!opener) {
       out.push(line)
@@ -448,8 +463,14 @@ function hasClosingFenceBelow(
 ): boolean {
   const char = marker[0]!
   for (let index = from; index < lines.length; index += 1) {
-    const close = lines[index]!.match(/^[ 	]{0,3}(`{3,}|~{3,})[ 	]*$/u)
-    if (close && close[1]![0] === char && close[1]!.length >= marker.length) return true
+    const match = lines[index]!.match(FENCE_MARKER)
+    if (!match) continue
+    const candidate = match[1]!
+    if (candidate[0] !== char || candidate.length < marker.length) continue
+    // A marker that carries an info string opens a *new* block. Our stray
+    // marker was never closed, and splitting here would swallow that block.
+    if (match[2]!.trim().length > 0) return false
+    return true
   }
   return false
 }
@@ -480,11 +501,7 @@ export function normalizeMarkdownSource(source: string): string {
 
   // The transport has already decoded JSON. Literal escapes are content,
   // especially inside code, regular expressions and Windows paths.
-  const text = normalizeLatexDelimiters(source)
-    .replace(/\r\n?/gu, '\n')
-    .split('\n')
-    .map(escapeCurrencyDollars)
-    .join('\n')
+  const text = normalizeLatexDelimiters(source).replace(/\r\n?/gu, '\n')
   const lines = expandInlineFences(text.split('\n'))
   const out: string[] = []
   let fenceChar: string | null = null
@@ -562,7 +579,11 @@ export function normalizeMarkdownSource(source: string): string {
       for (const item of expanded.split('\n')) emitLine(item, 'list')
       continue
     }
-    const line = balanceDollarDelimiters(convertListMarkers(raw))
+    // Currency escaping runs here, not on the whole document: a code block's
+    // `$1, $2` must stay literal, and a fence line is never prose.
+    const line = balanceDollarDelimiters(
+      convertListMarkers(escapeCurrencyDollars(raw))
+    )
     const kind = priorKind === 'list' && /^[ \t]{2,}\S/u.test(line)
       ? 'list'
       : classifyLine(line)

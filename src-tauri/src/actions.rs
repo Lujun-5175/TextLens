@@ -2064,6 +2064,22 @@ fn resolve_request_config(
                 });
             }
             validate_conversation_messages(last_messages)?;
+            // Beyond the opening exchange this is a follow-up: replaying it is
+            // exactly what "重新发送上一次请求" means. Rebuilding from the action
+            // prompt would drop the question and every turn before it. A
+            // translation target switch still rebuilds, because that is a
+            // deliberate re-ask of the original text.
+            if options.target_language.is_none() && last_messages.len() > 2 {
+                return Ok(ResolvedRequestConfig {
+                    session_data: PreparedSessionData {
+                        frozen_request: request,
+                        route,
+                        last_messages: last_messages.clone(),
+                        committed_messages: committed_messages.clone(),
+                    },
+                    route_only: false,
+                });
+            }
             let prompt = build_prompt(
                 action,
                 &request.source_text,

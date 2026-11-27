@@ -796,7 +796,10 @@ fn load_settings(path: &Path) -> Result<LoadedSettings, SettingsError> {
     if bytes.len() > 5 * 1024 * 1024 {
         return Err(SettingsError::Validation("设置文件体积异常".to_owned()));
     }
-    let mut value: serde_json::Value = serde_json::from_slice(&bytes)?;
+    // A UTF-8 BOM is invisible in every editor and used to turn a valid file
+    // into a startup panic. Strip it before parsing.
+    let bytes = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(&bytes);
+    let mut value: serde_json::Value = serde_json::from_slice(bytes)?;
     let version = value.get("version").and_then(serde_json::Value::as_u64);
     if version == Some(SETTINGS_VERSION as u64) {
         let missing_result_defaults = value.pointer("/result/dismissMode").is_none()

@@ -225,6 +225,20 @@ describe('SafeMarkdown', () => {
       .toHaveLength(2)
   })
 
+  it('renders a single-line bracket formula as one display block', () => {
+    // The body already is math: an inline rewrite inside it used to nest
+    // `$...$` in `$$...$$` and the balance pass escaped the whole formula.
+    const { container } = render(
+      <SafeMarkdown
+        content={String.raw`\[\hat\mu=\frac{1}{n}\sum_i (X_i-\bar X)^2\]`}
+        onOpenExternal={() => undefined}
+      />
+    )
+
+    expect(container.querySelectorAll('.katex-display')).toHaveLength(1)
+    expect(container.querySelectorAll('.katex-error')).toHaveLength(0)
+  })
+
   it('keeps a malformed formula from swallowing the rest of the answer', () => {
     // From a real answer: the model wrapped an expression that already
     // contained `$` in `\(...\)`. remark-math then paired dollars across the
