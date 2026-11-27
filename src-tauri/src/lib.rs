@@ -73,9 +73,9 @@ pub fn run() {
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
 
             let settings_path = app.path().app_config_dir()?.join("settings.json");
-            let settings = Arc::new(SettingsRepository::new_with_legacy_migration_deferred(
-                settings_path,
-            )?);
+            // A damaged settings file must not abort startup: recover from the
+            // backup (or defaults) and keep the bad file for the user.
+            let settings = Arc::new(SettingsRepository::open_or_recover(settings_path)?);
             // Skip the reconcile entirely when the executable path is unknown: a
             // blank Run value would make Windows try to launch nothing at login.
             if let Ok(executable) = std::env::current_exe() {

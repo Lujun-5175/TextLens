@@ -573,6 +573,7 @@ function ResultSessionApp({
   // taken while streaming, so this is filled by a post-completion refresh.
   const [requestUsage, setRequestUsage] = useState<RequestUsage | null>(null)
   const usageRefreshRequestId = useRef<string | null>(null)
+  const terminalLogRequest = useRef<string | null>(null)
   const contentRef = useRef<HTMLDivElement>(null)
   const contentInnerRef = useRef<HTMLDivElement>(null)
   const modelSwitchRef = useRef<HTMLDivElement>(null)
@@ -1020,6 +1021,25 @@ function ResultSessionApp({
       setRequestUsage({ requestId, usage: refreshed.usage })
     })(), { scope: 'result', operation: 'result-usage-refresh' })
   }, [bootstrap, preparingRequestId, requestId, session, status])
+
+  // The audit log is written by the native ready handshake, and above we only
+  // repeat that handshake for a completed answer (to read its usage). A failed
+  // or cancelled request therefore never reached the log at all. Mirror the
+  // handshake for those terminals so the audit trail keeps a row for them; the
+  // native side claims the request id, so repeats stay idempotent.
+  useEffect(() => {
+    if (status !== 'error' && status !== 'cancelled') return
+    if (!requestId || preparingRequestId !== null) return
+    const key = `${status}:${requestId}`
+    if (terminalLogRequest.current === key) return
+    terminalLogRequest.current = key
+    runDetached((async () => {
+      await new Promise<void>((resolve) => { window.setTimeout(resolve, 0) })
+      const latest = getActionEventSnapshot()
+      if (disposedRef.current || latest.status !== status || latest.requestId !== requestId) return
+      await bootstrap.recover()
+    })(), { scope: 'result', operation: 'request-log-refresh' })
+  }, [bootstrap, preparingRequestId, requestId, status])
 
   const visibleUsage =
     status === 'completed' && requestUsage?.requestId === requestId

@@ -99,6 +99,41 @@ impl SettingsRepository {
         Self::new_with_legacy_migration_impl(path.into(), true)
     }
 
+    /// Loads the settings for startup without letting a damaged file kill the
+    /// process before any window exists.
+    ///
+    /// A corrupt or unsupported `settings.json` used to propagate out of the
+    /// Tauri setup hook, which panics with the console hidden. Instead the bad
+    /// file is renamed aside, the last good backup written by every save is
+    /// promoted, and — with neither — the app starts from defaults. The
+    /// renamed file keeps whatever the user had, so nothing is destroyed.
+    pub fn open_or_recover(path: impl Into<PathBuf>) -> Result<Self, SettingsError> {
+        let path = path.into();
+        match Self::new_with_legacy_migration_deferred(&path) {
+            Ok(repository) => Ok(repository),
+            // Only damaged content is recoverable. An I/O failure (permissions,
+            // locked file) or a broken key store is not something a rename can
+            // fix, and moving a valid settings file aside would lose it.
+            Err(error @ (SettingsError::Json(_) | SettingsError::Validation(_))) => {
+                let backup = path.with_extension("json.bak");
+                let invalid = path.with_extension("json.invalid");
+                eprintln!(
+                    "[settings] {} could not be loaded ({error}); recovering",
+                    path.display()
+                );
+                let _ = fs::remove_file(&invalid);
+                if path.exists() {
+                    fs::rename(&path, &invalid)?;
+                }
+                if backup.exists() {
+                    fs::copy(&backup, &path)?;
+                }
+                Self::new_with_legacy_migration_deferred(&path)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     fn new_with_legacy_migration_impl(
         path: PathBuf,
         defer_persist: bool,
@@ -2662,6 +2697,19 @@ mod tests {
         assert!(DEFAULT_EXPLAIN_PROMPT.contains("先说清整体意思"));
         assert!(DEFAULT_EXPLAIN_PROMPT.contains("学科术语"));
         assert!(!DEFAULT_EXPLAIN_PROMPT.contains("必要上下文"));
+    }
+
+    #[test]
+    fn startup_recovers_from_a_damaged_settings_file() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("settings.json");
+        fs::write(&path, b"{ this is not json").unwrap();
+
+        // Startup must not abort on a corrupt file: defaults take over and the
+        // damaged file is preserved next to them.
+        let repository = SettingsRepository::open_or_recover(&path).expect("recovered");
+        assert!(!repository.get_settings().actions.is_empty());
+        assert!(path.with_extension("json.invalid").exists());
     }
 
     #[test]

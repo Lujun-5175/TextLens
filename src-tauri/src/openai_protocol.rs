@@ -230,8 +230,13 @@ impl SseDecoder {
 
         // `response.completed` already ends some Responses streams, while other
         // gateways still append the conventional [DONE] marker.
-        let trailing_done = data_lines.len() == 1 && data_lines[0] == "[DONE]";
-        if matches!(self.state, SseState::Done) && event_end > event_start && !trailing_done {
+        // Comments (`: keep-alive`) and bare `event:` lines are not data. Only
+        // real payload after the terminal event is an error; a proxy may append
+        // either inside the same TCP chunk.
+        let payload_after_done = data_lines
+            .iter()
+            .any(|line| !line.trim().is_empty() && line.trim() != "[DONE]");
+        if matches!(self.state, SseState::Done) && event_end > event_start && payload_after_done {
             return self.fail(ProtocolError::DataAfterDone);
         }
 
@@ -891,7 +896,13 @@ fn infer_provider_code(kind: Option<&str>, param: Option<&str>) -> Option<String
 }
 
 fn field(object: &serde_json::Map<String, Value>, name: &str) -> Option<String> {
-    object.get(name).and_then(Value::as_str).map(bounded)
+    // Gemini-style and some gateways report `code` as a number; accepting only
+    // strings made those errors look non-retryable (and hid a 200 + error body
+    // entirely, because the top-level branch requires a code).
+    object
+        .get(name)
+        .and_then(string_or_number)
+        .map(|value| bounded(&value))
 }
 
 /// True when a provider rejection names `field` as the offending parameter.
@@ -1074,6 +1085,38 @@ mod tests {
                 }
             }
             assert!(error.is_some());
+        }
+    }
+
+    #[test]
+    fn protocol_accepts_numeric_error_codes() {
+        for value in [
+            serde_json::json!({"error": {"code": 429, "message": "rate limited"}}),
+            serde_json::json!({"code": 503, "message": "upstream unavailable"}),
+        ] {
+            let error = provider_error_from_value(&value).expect("provider error");
+            assert!(error.code.is_some(), "numeric codes must survive");
+        }
+    }
+
+    #[test]
+    fn protocol_ignores_comments_after_the_terminal_event() {
+        let mut decoder = SseDecoder::new(ProtocolLimits::test());
+        decoder
+            .push(
+                b"data: [DONE]
+
+: keep-alive
+
+",
+            )
+            .unwrap();
+        loop {
+            match decoder.next_event() {
+                Ok(Some(_)) => {}
+                Ok(None) => break,
+                Err(error) => panic!("a comment after [DONE] must be ignored: {error:?}"),
+            }
         }
     }
 

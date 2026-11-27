@@ -342,6 +342,17 @@ where
             if content.trim().is_empty() {
                 return Err(empty_or_reasoning_failure(reasoning_seen, content_seen));
             }
+            // A clean EOF with no [DONE] and no finish_reason means the stream
+            // stopped without saying it was finished: the answer may be cut
+            // short, and it must not enter history as a completed one.
+            if termination == SseTermination::CleanEofUnverified {
+                return Err(failure(
+                    "INCOMPLETE_STREAM",
+                    "连接提前结束，回答可能不完整，请重试",
+                    true,
+                    content_seen,
+                ));
+            }
             return Ok(TransportSuccess {
                 content,
                 transport: ResponseTransport::Sse,
