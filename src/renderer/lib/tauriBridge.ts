@@ -387,6 +387,15 @@ export function installTauriBridge(): void {
     async cycleBallSize() {
       await invoke(TAURI_COMMANDS.cycleBallSize)
     },
+    async openBallMenu() {
+      await invoke(TAURI_COMMANDS.openBallMenu)
+    },
+    async showBallMenu() {
+      await invoke(TAURI_COMMANDS.showBallMenu)
+    },
+    async closeBallMenu() {
+      await invoke(TAURI_COMMANDS.closeBallMenu)
+    },
     async getBallSettings() {
       return parseBallSettings(await invoke(TAURI_COMMANDS.getBallSettings))
     },

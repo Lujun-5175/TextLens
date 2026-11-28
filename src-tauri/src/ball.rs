@@ -23,6 +23,13 @@ use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder}
 use crate::windows::{self, Point, WindowSize};
 
 pub const BALL_LABEL: &str = "selection-ball";
+/// Right-click panel opened next to the orb. Unlike the orb it is focusable:
+/// it hosts real controls, so it must accept keyboard input.
+pub const BALL_MENU_LABEL: &str = "selection-ball-menu";
+/// Logical size of that panel. The renderer fills the whole window.
+pub const BALL_MENU_WIDTH: f64 = 248.0;
+pub const BALL_MENU_HEIGHT: f64 = 300.0;
+const BALL_MENU_GAP: f64 = 8.0;
 /// Default orb diameter in CSS pixels. The renderer draws the circle at 100%
 /// of the window, so a size change is a window resize.
 pub const BALL_LOGICAL_SIZE: f64 = 56.0;
@@ -294,6 +301,146 @@ fn hide_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window(BALL_LABEL) {
         let _ = window.hide();
     }
+    // The panel is anchored to the orb: hiding one without the other leaves a
+    // floating menu pointing at nothing.
+    if let Some(window) = app.get_webview_window(BALL_MENU_LABEL) {
+        let _ = window.hide();
+    }
+}
+
+/// Opens the orb's right-click panel next to it, or closes it when it is
+/// already showing. Ctrl-free toggle: the orb's right button is the only path.
+pub fn toggle_menu(app: &AppHandle) -> Result<(), String> {
+    if let Some(window) = app.get_webview_window(BALL_MENU_LABEL) {
+        if window.is_visible().unwrap_or(false) {
+            let _ = window.hide();
+            return Ok(());
+        }
+    }
+    let Some(window) = app.get_webview_window(BALL_MENU_LABEL) else {
+        // First open: the window is created visible at its final position. A
+        // `show()` right after `build()` races WebView2 creation on Windows
+        // ("FailedToReceiveMessage") — the same trap the result window solves
+        // by deferring every native call to the renderer's prepare handshake.
+        return create_menu_window(app).map_err(|error| format!("无法创建悬浮球菜单：{error}"));
+    };
+    // Re-opens are safe: the window (and its WebView) already exist.
+    reveal_menu(app)
+}
+
+fn create_menu_window(app: &AppHandle) -> tauri::Result<()> {
+    let builder = WebviewWindowBuilder::new(
+        app,
+        BALL_MENU_LABEL,
+        WebviewUrl::App("ball/index.html?menu=1".into()),
+    )
+    .title("TextLens")
+    .inner_size(BALL_MENU_WIDTH, BALL_MENU_HEIGHT)
+    .decorations(false)
+    .transparent(true)
+    .shadow(false)
+    .resizable(false)
+    .minimizable(false)
+    .maximizable(false)
+    .fullscreen(false)
+    .always_on_top(true)
+    .visible_on_all_workspaces(true)
+    .skip_taskbar(true)
+    .accept_first_mouse(true)
+    .focusable(true)
+    .focused(false)
+    .visible(false)
+    .build()?;
+    Ok(())
+}
+
+/// Shows the panel once its renderer is alive.
+///
+/// Creating a transparent window visible used to hand back a window whose
+/// WebView never navigated: the page stayed blank because the window appeared
+/// before WebView2 finished constructing. Waiting for this call is the same
+/// contract the result window follows with its prepare handshake.
+pub fn reveal_menu(app: &AppHandle) -> Result<(), String> {
+    let window = app
+        .get_webview_window(BALL_MENU_LABEL)
+        .ok_or_else(|| "悬浮球菜单尚未创建".to_owned())?;
+    if let Err(error) = position_menu(app, &window) {
+        eprintln!("[ball] stage=menu-position error_class=window: {error}");
+    }
+    window.show().map_err(|error| error.to_string())?;
+    let _ = window.set_focus();
+    Ok(())
+}
+
+fn position_menu(app: &AppHandle, menu: &WebviewWindow) -> tauri::Result<()> {
+    let Some(orb) = app.get_webview_window(BALL_LABEL) else {
+        return Ok(());
+    };
+    // A non-activating tool window may not report a monitor it belongs to;
+    // every one of these is advisory, the default position is still usable.
+    let Ok(orb_position) = orb.outer_position() else {
+        return Ok(());
+    };
+    let Ok(orb_size) = orb.outer_size() else {
+        return Ok(());
+    };
+    let scale = menu.scale_factor().unwrap_or(1.0);
+    let menu_width = (BALL_MENU_WIDTH * scale).round() as i32;
+    let menu_height = (BALL_MENU_HEIGHT * scale).round() as i32;
+    let gap = (BALL_MENU_GAP * scale).round() as i32;
+    let monitor = orb
+        .current_monitor()
+        .ok()
+        .flatten()
+        .or_else(|| menu.current_monitor().ok().flatten());
+    let work_area = monitor.map(|monitor| {
+        let position = monitor.position();
+        let size = monitor.size();
+        (
+            position.x,
+            position.y,
+            size.width as i32,
+            size.height as i32,
+        )
+    });
+    let (x, y) = menu_position(
+        (
+            orb_position.x,
+            orb_position.y,
+            orb_size.width as i32,
+            orb_size.height as i32,
+        ),
+        (menu_width, menu_height),
+        work_area,
+        gap,
+    );
+    menu.set_position(tauri::PhysicalPosition::new(x, y))
+}
+
+/// Places the panel above the orb, or below when there is no room, clamped so
+/// a corner-docked orb never pushes it off the screen.
+fn menu_position(
+    orb: (i32, i32, i32, i32),
+    menu: (i32, i32),
+    monitor: Option<(i32, i32, i32, i32)>,
+    gap: i32,
+) -> (i32, i32) {
+    let (orb_x, orb_y, _orb_width, orb_height) = orb;
+    let (menu_width, menu_height) = menu;
+    let Some((left, top, width, height)) = monitor else {
+        return (orb_x, orb_y - gap - menu_height);
+    };
+    let right = left + width;
+    let bottom = top + height;
+    let x = orb_x.clamp(left, (right - menu_width).max(left));
+    let above = orb_y - gap - menu_height;
+    let below = orb_y + orb_height + gap;
+    let y = if above >= top {
+        above
+    } else {
+        below.clamp(top, (bottom - menu_height).max(top))
+    };
+    (x, y)
 }
 
 /// Shows, resizes or hides the orb to match the persisted state and the
@@ -621,6 +768,39 @@ mod tests {
         assert!(!store.should_show());
         store.resume(BallSuppression::Fullscreen);
         assert!(store.should_show());
+    }
+
+    #[test]
+    fn the_menu_sits_above_the_orb_and_flips_below_near_the_top() {
+        // Orb docked at the bottom-left: the panel goes above it.
+        assert_eq!(
+            menu_position((20, 1200, 56, 56), (248, 300), Some((0, 0, 1920, 1300)), 8),
+            (20, 892)
+        );
+        // No room above: the panel flips below the orb.
+        assert_eq!(
+            menu_position((20, 120, 56, 56), (248, 300), Some((0, 0, 1920, 1300)), 8),
+            (20, 184)
+        );
+    }
+
+    #[test]
+    fn the_menu_is_clamped_to_the_monitor() {
+        // Orb at the right edge: the panel shifts left instead of overflowing.
+        assert_eq!(
+            menu_position(
+                (1800, 1200, 56, 56),
+                (248, 300),
+                Some((0, 0, 1920, 1300)),
+                8
+            ),
+            (1672, 892)
+        );
+        // A tiny monitor leaves the panel at its top-left rather than negative.
+        assert_eq!(
+            menu_position((10, 10, 44, 44), (248, 300), Some((0, 0, 200, 260)), 8),
+            (0, 0)
+        );
     }
 
     #[test]

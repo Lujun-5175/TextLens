@@ -109,6 +109,12 @@ export interface WindowTextLensApi {
   moveBall?(x: number, y: number): Promise<void>
   /** Floating orb only: cycle the orb between its small, medium and large sizes. */
   cycleBallSize?(): Promise<void>
+  /** The orb's right-click panel. */
+  openBallMenu?(): Promise<void>
+  /** Shows the panel once its renderer is alive. */
+  showBallMenu?(): Promise<void>
+  /** Closes the panel from inside itself. */
+  closeBallMenu?(): Promise<void>
   /** Settings window only: the orb's own preferences (size, visibility, action). */
   getBallSettings?(): Promise<BallSettings>
   /** Settings window only: apply orb preferences immediately. */

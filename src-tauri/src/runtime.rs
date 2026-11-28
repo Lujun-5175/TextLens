@@ -3687,6 +3687,37 @@ pub fn move_ball(
     Ok(())
 }
 
+/// Opens (or closes) the orb's right-click panel next to it.
+/// Async on purpose: building a WebView window from a synchronous command runs
+/// on the main thread and starves the event loop the creation callback needs —
+/// the window appears, its page never loads.
+#[tauri::command]
+pub async fn open_ball_menu(app: AppHandle, window: WebviewWindow) -> Result<(), String> {
+    if window.label() != crate::ball::BALL_LABEL {
+        return Err("悬浮球调用无效".to_owned());
+    }
+    crate::ball::toggle_menu(&app)
+}
+
+/// The panel calls this once its renderer is alive; only then is the WebView
+/// ready to be shown without going blank.
+#[tauri::command]
+pub fn show_ball_menu(app: AppHandle, window: WebviewWindow) -> Result<(), String> {
+    if window.label() != crate::ball::BALL_MENU_LABEL {
+        return Err("悬浮球菜单调用无效".to_owned());
+    }
+    crate::ball::reveal_menu(&app)
+}
+
+/// Closes the panel from inside itself (× button, Esc, window blur).
+#[tauri::command]
+pub fn close_ball_menu(window: WebviewWindow) -> Result<(), String> {
+    if window.label() != crate::ball::BALL_MENU_LABEL {
+        return Err("悬浮球菜单调用无效".to_owned());
+    }
+    window.hide().map_err(|error| error.to_string())
+}
+
 /// Right-click shortcut for the tray's size submenu: 小 → 中 → 大 → 小.
 #[tauri::command]
 pub fn cycle_ball_size(
@@ -3740,7 +3771,9 @@ fn ball_ask_action(
 
 fn ensure_ball_settings_caller(window: &WebviewWindow) -> Result<(), String> {
     let label = window.label();
-    (label == crate::ball::BALL_LABEL || label == SETTINGS_LABEL)
+    (label == crate::ball::BALL_LABEL
+        || label == crate::ball::BALL_MENU_LABEL
+        || label == SETTINGS_LABEL)
         .then_some(())
         .ok_or_else(|| "该操作只能从设置窗口或悬浮球执行".to_owned())
 }
@@ -4628,6 +4661,7 @@ fn ensure_result_caller(window: &WebviewWindow, session_id: &str) -> Result<(), 
 fn ensure_known_caller(window: &WebviewWindow) -> Result<(), String> {
     if window.label() == SETTINGS_LABEL
         || window.label() == TOOLBAR_LABEL
+        || window.label() == crate::ball::BALL_MENU_LABEL
         || session_from_result_label(window.label()).is_some()
     {
         Ok(())

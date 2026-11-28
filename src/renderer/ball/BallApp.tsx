@@ -145,10 +145,10 @@ export function BallApp() {
           // real click/tap. The flag is cleared on the next press.
         }}
         onContextMenu={(event) => {
-          // Right-click cycles the size: the tray submenu is the documented
-          // path, this is the shortcut for people who try right-clicking.
+          // Right-click opens the orb's own panel: size, show/hide and the rest
+          // are one click away instead of cycling blindly through sizes.
           event.preventDefault()
-          void Promise.resolve(window.textLens.cycleBallSize?.()).catch(() => undefined)
+          void Promise.resolve(window.textLens.openBallMenu?.()).catch(() => undefined)
         }}
         onClick={() => {
           if (drag.current?.dragging) {

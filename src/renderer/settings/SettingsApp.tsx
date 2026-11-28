@@ -566,6 +566,9 @@ export function SettingsApp(): JSX.Element {
     } else if (focus === 'actions') {
       setActiveSection('actions')
       targetId = 'actions-title'
+    } else if (focus === 'ball') {
+      setActiveSection('ball')
+      targetId = 'ball-title'
     }
     if (targetId) {
       const scrollTargetId = targetId
