@@ -65,6 +65,12 @@ import {
   type TranscriptTurn
 } from './conversationTranscript'
 import { ResultOutput, stripLeadingBlankLines } from './ResultOutput'
+import {
+  MAX_ATTACHMENTS,
+  describeAttachment,
+  prepareImageAttachment,
+  type AttachmentDraft
+} from './imageAttachment'
 import { useResultContentOverflow } from './resultContentOverflow'
 import type { ResultSessionBootstrap } from './resultSessionBootstrap'
 import type { ResultState } from './resultState'
@@ -565,6 +571,10 @@ function ResultSessionApp({
   const previousStatusRef = useRef<ResultState['status'] | null>(null)
   const [copyComplete, setCopyComplete] = useState(false)
   const [followUpQuestion, setFollowUpQuestion] = useState('')
+  const [attachments, setAttachments] = useState<AttachmentDraft[]>([])
+  // Names are numbered for the life of the window and never reused, so a chip
+  // removed in the middle does not make the next one look like a duplicate.
+  const attachmentSeq = useRef(0)
   const [followUpSubmitting, setFollowUpSubmitting] = useState(false)
   const [revealCommitted, setRevealCommitted] = useState(false)
   const [bootstrapMessage, setBootstrapMessage] = useState('')
@@ -904,13 +914,44 @@ function ResultSessionApp({
     }
   }, [isAsk, sessionId, turns])
 
+  const addPastedImages = useCallback(async (files: File[]): Promise<void> => {
+    const images = files.filter((file) => file.type.startsWith('image/'))
+    if (images.length === 0) return
+    const room = MAX_ATTACHMENTS - attachments.length
+    if (room <= 0) {
+      setCommandMessage(`最多附带 ${MAX_ATTACHMENTS} 张图片`)
+      return
+    }
+    const prepared: AttachmentDraft[] = []
+    for (const file of images.slice(0, room)) {
+      const draft = await prepareImageAttachment(file, `截图 ${attachmentSeq.current + 1}`)
+      if (draft) {
+        attachmentSeq.current += 1
+        prepared.push(draft)
+      }
+    }
+    if (images.length > room) {
+      setCommandMessage(`最多附带 ${MAX_ATTACHMENTS} 张图片，多余的已忽略`)
+    }
+    if (prepared.length > 0) {
+      setAttachments((current) => [...current, ...prepared])
+    } else if (images.length <= room) {
+      setCommandMessage('无法读取这张图片')
+    }
+  }, [attachments.length])
+
+  const removeAttachment = useCallback((name: string): void => {
+    setAttachments((current) => current.filter((draft) => draft.attachment.name !== name))
+  }, [])
+
   const submitFollowUp = useCallback(async (): Promise<void> => {
     const question = followUpQuestion.trim()
     const canSubmit =
       isAsk
         ? status === 'completed' || status === 'idle'
         : status === 'completed'
-    if (!question || followUpInFlight.current || retryInFlight.current || preparingRequestRef.current || !canSubmit) return
+    // An image-only question is a complete request.
+    if ((!question && attachments.length === 0) || followUpInFlight.current || retryInFlight.current || preparingRequestRef.current || !canSubmit) return
     followUpInFlight.current = true
     setCommandMessage('')
     setFollowUpSubmitting(true)
@@ -918,14 +959,19 @@ function ResultSessionApp({
       if (!window.textLens.continueAction) {
         throw new Error('当前版本不支持继续提问')
       }
+      const imageAttachments = attachments.map((draft) => draft.attachment)
       if (isAsk) {
         const turnId =
           typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
             ? crypto.randomUUID()
             : `assistant-${Date.now()}`
-        setTurns((current) => beginAssistantTurn(appendUserTurn(current, question), turnId))
+        // Image-only sends still need something in the optimistic bubble; the
+        // native transcript replaces it with the numbered names afterwards.
+        const displayQuestion = question ||
+          imageAttachments.map((image) => image.name).join('、')
+        setTurns((current) => beginAssistantTurn(appendUserTurn(current, displayQuestion), turnId))
       }
-      const result = await window.textLens.continueAction(sessionId, question)
+      const result = await window.textLens.continueAction(sessionId, question, imageAttachments)
       if (!result.accepted) {
         setCommandMessage(result.message)
         if (isAsk) {
@@ -937,6 +983,7 @@ function ResultSessionApp({
       pendingFollowUp.current = pending
       trackAcceptedRequest(result.requestId)
       setFollowUpQuestion('')
+      setAttachments([])
       reconcilePendingFollowUp(pending)
     } catch (error) {
       setCommandMessage(getErrorMessage(error, '无法继续提问'))
@@ -947,7 +994,7 @@ function ResultSessionApp({
       followUpInFlight.current = false
       setFollowUpSubmitting(false)
     }
-  }, [followUpQuestion, followUpSubmitting, isAsk, preparingRequestId, reconcilePendingFollowUp, sessionId, status, trackAcceptedRequest])
+  }, [attachments, followUpQuestion, followUpSubmitting, isAsk, preparingRequestId, reconcilePendingFollowUp, sessionId, status, trackAcceptedRequest])
 
   useEffect(() => {
     let disposed = false
@@ -1852,7 +1899,32 @@ function ResultSessionApp({
           {(isAsk ? askComposerVisible : showFollowUp) && (
             // Every AI result window shares one footer: a composer with a send
             // button, then the same icon+label actions in the same order.
-            <div className="result-composer" data-disabled={followUpDisabled || undefined}>
+            <div
+              className={`result-composer ${attachments.length > 0 ? 'result-composer--attached' : ''}`}
+              data-disabled={followUpDisabled || undefined}
+            >
+              {attachments.length > 0 && (
+                <div className="result-composer__attachments" aria-label="已附带的截图">
+                  {attachments.map((draft) => (
+                    <span
+                      className="result-attachment"
+                      key={draft.attachment.name}
+                      title={describeAttachment(draft)}
+                    >
+                      {draft.attachment.name}
+                      <button
+                        className="result-attachment__remove"
+                        type="button"
+                        aria-label={`移除 ${draft.attachment.name}`}
+                        onClick={() => removeAttachment(draft.attachment.name)}
+                      >
+                        ×
+                      </button>
+                    </span>
+                  ))}
+                </div>
+              )}
+              <div className="result-composer__row">
               <textarea
                 aria-label="继续提问"
                 ref={followUpRef}
@@ -1860,9 +1932,9 @@ function ResultSessionApp({
                 placeholder={
                   isAsk
                     ? hasSourceText
-                      ? '基于选中文本提问…'
-                      : '问点什么…'
-                    : '继续提问…'
+                      ? '基于选中文本提问… 可粘贴截图'
+                      : '问点什么… 可粘贴截图'
+                    : '继续提问… 可粘贴截图'
                 }
                 title="Enter 发送，Shift+Enter 换行"
                 rows={1}
@@ -1870,6 +1942,14 @@ function ResultSessionApp({
                 value={followUpQuestion}
                 disabled={followUpDisabled}
                 onChange={(event) => setFollowUpQuestion(event.target.value)}
+                onPaste={(event) => {
+                  // A pasted screenshot becomes an attachment; ordinary text
+                  // paste keeps working untouched.
+                  const files = Array.from(event.clipboardData?.files ?? [])
+                  if (!files.some((file) => file.type.startsWith('image/'))) return
+                  event.preventDefault()
+                  void addPastedImages(files)
+                }}
                 onCompositionStart={() => { followUpComposing.current = true }}
                 onCompositionEnd={() => { followUpComposing.current = false }}
                 onKeyDown={(event) => {
@@ -1888,12 +1968,17 @@ function ResultSessionApp({
                 className="result-composer__send"
                 type="button"
                 aria-label="发送问题"
-                title={followUpQuestion.trim() ? '发送（Enter）' : '先输入问题'}
-                disabled={!followUpQuestion.trim() || followUpDisabled}
+                title={
+                  followUpQuestion.trim() || attachments.length > 0
+                    ? '发送（Enter）'
+                    : '先输入问题或粘贴截图'
+                }
+                disabled={(!followUpQuestion.trim() && attachments.length === 0) || followUpDisabled}
                 onClick={() => void submitFollowUp()}
               >
                 <ArrowUp size={15} />
               </button>
+              </div>
             </div>
           )}
           {/* No 关闭 here for any window: the header ✕ is the single close

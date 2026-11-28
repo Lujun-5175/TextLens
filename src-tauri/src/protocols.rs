@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 use url::Url;
 
 use crate::{
-    actions::{ChatMessage, ChatRole},
+    actions::{ChatImage, ChatMessage, ChatRole},
     models::{ProviderConfig, ProviderModel, ProviderProtocol, ThinkingLevel},
     openai_protocol::SseCodec,
     thinking::{self, AppliedThinkingControl, ThinkingRequestPlan},
@@ -121,18 +121,29 @@ pub(crate) fn build_base_body(
     messages: &[ChatMessage],
 ) -> Value {
     match protocol {
-        ProviderProtocol::OpenAiChat => json!({
-            "model": model,
-            "stream": true,
-            "messages": messages,
-        }),
+        ProviderProtocol::OpenAiChat => {
+            let messages = messages
+                .iter()
+                .map(|message| {
+                    json!({
+                        "role": role_str(message.role),
+                        "content": openai_chat_content(message),
+                    })
+                })
+                .collect::<Vec<_>>();
+            json!({
+                "model": model,
+                "stream": true,
+                "messages": messages,
+            })
+        }
         ProviderProtocol::OpenAiResponses => {
             let input = messages
                 .iter()
                 .map(|message| {
                     json!({
                         "role": role_str(message.role),
-                        "content": message.content,
+                        "content": openai_responses_content(message),
                     })
                 })
                 .collect::<Vec<_>>();
@@ -150,10 +161,10 @@ pub(crate) fn build_base_body(
             let mut turns = Vec::new();
             for message in messages {
                 match message.role {
-                    ChatRole::System => system.push(message.content.as_str()),
+                    ChatRole::System => system.push(message_text(message).to_owned()),
                     ChatRole::User => turns.push(json!({
                         "role": "user",
-                        "content": message.content,
+                        "content": anthropic_content(message),
                     })),
                     ChatRole::Assistant => turns.push(json!({
                         "role": "assistant",
@@ -168,7 +179,11 @@ pub(crate) fn build_base_body(
                 "messages": turns,
             });
             if !system.is_empty() {
-                body["system"] = json!(system.join("\n\n"));
+                body["system"] = json!(system.join(
+                    "
+
+"
+                ));
             }
             body
         }
@@ -177,14 +192,14 @@ pub(crate) fn build_base_body(
             let mut contents = Vec::new();
             for message in messages {
                 match message.role {
-                    ChatRole::System => system.push(message.content.as_str()),
+                    ChatRole::System => system.push(message_text(message).to_owned()),
                     ChatRole::User => contents.push(json!({
                         "role": "user",
-                        "parts": [{"text": message.content}],
+                        "parts": gemini_parts(message),
                     })),
                     ChatRole::Assistant => contents.push(json!({
                         "role": "model",
-                        "parts": [{"text": message.content}],
+                        "parts": [{ "text": message.content }],
                     })),
                 }
             }
@@ -193,12 +208,102 @@ pub(crate) fn build_base_body(
             });
             if !system.is_empty() {
                 body["systemInstruction"] = json!({
-                    "parts": [{"text": system.join("\n\n")}],
+                    "parts": [{ "text": system.join("
+
+") }],
                 });
             }
             body
         }
     }
+}
+
+/// An image-only turn still needs something for the model to answer.
+const IMAGE_ONLY_PROMPT: &str = "请看看这张图片。";
+
+fn message_text(message: &ChatMessage) -> &str {
+    if message.content.trim().is_empty() && !message.images.is_empty() {
+        IMAGE_ONLY_PROMPT
+    } else {
+        &message.content
+    }
+}
+
+fn data_url(image: &ChatImage) -> String {
+    format!("data:{};base64,{}", image.media_type, image.data)
+}
+
+/// Chat Completions: `[{type:"text"},{type:"image_url",image_url:{url}}]`.
+fn openai_chat_content(message: &ChatMessage) -> Value {
+    if message.images.is_empty() {
+        return json!(message.content);
+    }
+    let mut parts = Vec::new();
+    if !message.content.trim().is_empty() {
+        parts.push(json!({ "type": "text", "text": message.content }));
+    }
+    for image in &message.images {
+        parts.push(json!({
+            "type": "image_url",
+            "image_url": { "url": data_url(image) },
+        }));
+    }
+    Value::Array(parts)
+}
+
+/// Responses API: `[{type:"input_text"},{type:"input_image",image_url:"data:..."}]`.
+fn openai_responses_content(message: &ChatMessage) -> Value {
+    if message.images.is_empty() {
+        return json!(message.content);
+    }
+    let mut parts = Vec::new();
+    if !message.content.trim().is_empty() {
+        parts.push(json!({ "type": "input_text", "text": message.content }));
+    }
+    for image in &message.images {
+        parts.push(json!({
+            "type": "input_image",
+            "image_url": data_url(image),
+        }));
+    }
+    Value::Array(parts)
+}
+
+fn anthropic_content(message: &ChatMessage) -> Value {
+    if message.images.is_empty() {
+        return json!(message.content);
+    }
+    let mut parts = Vec::new();
+    if !message.content.trim().is_empty() {
+        parts.push(json!({ "type": "text", "text": message.content }));
+    }
+    for image in &message.images {
+        parts.push(json!({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": image.media_type,
+                "data": image.data,
+            },
+        }));
+    }
+    Value::Array(parts)
+}
+
+fn gemini_parts(message: &ChatMessage) -> Value {
+    let mut parts = Vec::new();
+    if !message.content.trim().is_empty() {
+        parts.push(json!({ "text": message.content }));
+    }
+    for image in &message.images {
+        parts.push(json!({
+            "inline_data": {
+                "mime_type": image.media_type,
+                "data": image.data,
+            },
+        }));
+    }
+    Value::Array(parts)
 }
 
 pub(crate) fn apply_thinking(
@@ -554,10 +659,12 @@ mod tests {
             ChatMessage {
                 role: ChatRole::System,
                 content: "system".to_owned(),
+                images: Vec::new(),
             },
             ChatMessage {
                 role: ChatRole::User,
                 content: "hello".to_owned(),
+                images: Vec::new(),
             },
         ];
         let chat = build_base_body(ProviderProtocol::OpenAiChat, "m", &messages);
@@ -810,5 +917,54 @@ mod tests {
         assert_eq!(merged[0].id, "manual-0");
         assert_eq!(merged[1].id, "remote-0");
         assert!(merged.iter().all(|model| model.id != "manual-1"));
+    }
+
+    #[test]
+    fn openai_bodies_embed_attachments_inline() {
+        let image = ChatImage {
+            name: "截图 1".to_owned(),
+            media_type: "image/jpeg".to_owned(),
+            data: "aGVsbG8=".to_owned(),
+        };
+        let messages = vec![ChatMessage::user_with_images(
+            "这张图里是什么".to_owned(),
+            vec![image],
+        )];
+
+        // Responses: `input_image` carries the data URL as a string.
+        let responses = build_base_body(ProviderProtocol::OpenAiResponses, "model", &messages);
+        assert_eq!(responses["input"][0]["content"][1]["type"], "input_image");
+        assert_eq!(
+            responses["input"][0]["content"][1]["image_url"],
+            "data:image/jpeg;base64,aGVsbG8="
+        );
+
+        // Chat Completions: `image_url` is an object, and the attachment must
+        // not leak into the message body as its own field.
+        let chat = build_base_body(ProviderProtocol::OpenAiChat, "model", &messages);
+        assert_eq!(chat["messages"][0]["content"][1]["type"], "image_url");
+        assert_eq!(
+            chat["messages"][0]["content"][1]["image_url"]["url"],
+            "data:image/jpeg;base64,aGVsbG8="
+        );
+        assert!(chat["messages"][0].get("images").is_none());
+        assert!(responses["input"][0].get("images").is_none());
+    }
+
+    #[test]
+    fn image_only_turns_still_carry_an_instruction() {
+        let image = ChatImage {
+            name: "截图 1".to_owned(),
+            media_type: "image/png".to_owned(),
+            data: "aGVsbG8=".to_owned(),
+        };
+        let messages = vec![ChatMessage::user_with_images(String::new(), vec![image])];
+        let responses = build_base_body(ProviderProtocol::OpenAiResponses, "model", &messages);
+        // No empty text part; the image is the whole message.
+        assert_eq!(
+            responses["input"][0]["content"].as_array().unwrap().len(),
+            1
+        );
+        assert_eq!(responses["input"][0]["content"][0]["type"], "input_image");
     }
 }

@@ -583,7 +583,7 @@ describe('ResultApp window interactions', () => {
     expect(footer.querySelector('.result-composer')).toBeInTheDocument()
     expect(screen.getByRole('textbox', { name: '继续提问' })).toHaveAttribute(
       'placeholder',
-      '继续提问…'
+      '继续提问… 可粘贴截图'
     )
     expect(footer.querySelector('.result-footer-row')?.firstElementChild).toHaveClass(
       'result-composer'
@@ -598,7 +598,7 @@ describe('ResultApp window interactions', () => {
     fireEvent.change(followUp, { target: { value: '继续解释这一段' } })
     fireEvent.keyDown(followUp, { key: 'Enter' })
     await waitFor(() => {
-      expect(continueAction).toHaveBeenCalledWith('session-1', '继续解释这一段')
+      expect(continueAction).toHaveBeenCalledWith('session-1', '继续解释这一段', [])
     })
 
     // An accepted follow-up stays busy until the committed request arrives.
@@ -719,7 +719,7 @@ describe('ResultApp window interactions', () => {
   it('submits with Enter from the ask composer using the current session', async () => {
     const { continueAction } = await renderResult(askCompletedSession)
     const input = screen.getByRole('textbox', { name: '继续提问' })
-    expect(input).toHaveAttribute('placeholder', '基于选中文本提问…')
+    expect(input).toHaveAttribute('placeholder', '基于选中文本提问… 可粘贴截图')
 
     // Ask uses a chat composer that grows with its content, so the manual
     // expand control belongs to non-ask sessions only.
@@ -733,9 +733,70 @@ describe('ResultApp window interactions', () => {
     fireEvent.keyDown(input, { key: 'Enter' })
 
     await waitFor(() => {
-      expect(continueAction).toHaveBeenCalledWith('session-1', '解释第二句话')
+      expect(continueAction).toHaveBeenCalledWith('session-1', '解释第二句话', [])
     })
     await waitFor(() => expect(input).toHaveValue(''))
+  })
+
+  it('sends a pasted screenshot even without text', async () => {
+    vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockReturnValue({
+      fillStyle: '',
+      fillRect: vi.fn(),
+      drawImage: vi.fn()
+    } as never)
+    vi.spyOn(HTMLCanvasElement.prototype, 'toDataURL')
+      .mockReturnValue('data:image/jpeg;base64,aGVsbG8=')
+    vi.stubGlobal('createImageBitmap', vi.fn(async () => ({ width: 800, height: 600 })))
+    try {
+      const { api, container } = await renderResult(askCompletedSession)
+      const input = screen.getByRole('textbox', { name: '继续提问' })
+
+      fireEvent.paste(input, {
+        clipboardData: { files: [new File(['x'], 'shot.png', { type: 'image/png' })] }
+      })
+      expect(await screen.findByText('截图 1')).toBeInTheDocument()
+
+      fireEvent.click(screen.getByRole('button', { name: '发送问题' }))
+      await waitFor(() =>
+        expect(api.continueAction).toHaveBeenCalledWith('session-1', '', [
+          { name: '截图 1', mediaType: 'image/jpeg', data: 'aGVsbG8=' }
+        ])
+      )
+      // The composer chip clears once the request is accepted; the name stays
+      // visible in the conversation turn.
+      expect(container.querySelector('.result-composer .result-attachment')).toBeNull()
+    } finally {
+      vi.restoreAllMocks()
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('removes an attachment with its × button', async () => {
+    vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockReturnValue({
+      fillStyle: '',
+      fillRect: vi.fn(),
+      drawImage: vi.fn()
+    } as never)
+    vi.spyOn(HTMLCanvasElement.prototype, 'toDataURL')
+      .mockReturnValue('data:image/jpeg;base64,aGVsbG8=')
+    vi.stubGlobal('createImageBitmap', vi.fn(async () => ({ width: 800, height: 600 })))
+    try {
+      await renderResult(askCompletedSession)
+      const input = screen.getByRole('textbox', { name: '继续提问' })
+
+      fireEvent.paste(input, {
+        clipboardData: { files: [new File(['x'], 'shot.png', { type: 'image/png' })] }
+      })
+      expect(await screen.findByText('截图 1')).toBeInTheDocument()
+
+      fireEvent.click(screen.getByRole('button', { name: '移除 截图 1' }))
+      expect(screen.queryByText('截图 1')).not.toBeInTheDocument()
+      // With no text and no image the send button is disabled again.
+      expect(screen.getByRole('button', { name: '发送问题' })).toBeDisabled()
+    } finally {
+      vi.restoreAllMocks()
+      vi.unstubAllGlobals()
+    }
   })
 
   it('keeps a follow-up question when the backend rejects it', async () => {
@@ -824,13 +885,13 @@ describe('ResultApp window interactions', () => {
 
     const input = screen.getByRole('textbox', { name: '继续提问' })
     expect(input).not.toBeDisabled()
-    expect(input).toHaveAttribute('placeholder', '基于选中文本提问…')
+    expect(input).toHaveAttribute('placeholder', '基于选中文本提问… 可粘贴截图')
 
     fireEvent.change(input, { target: { value: '这段话什么意思？' } })
     fireEvent.keyDown(input, { key: 'Enter' })
 
     await waitFor(() => {
-      expect(continueAction).toHaveBeenCalledWith('session-1', '这段话什么意思？')
+      expect(continueAction).toHaveBeenCalledWith('session-1', '这段话什么意思？', [])
     })
     expect(screen.getByText('这段话什么意思？')).toBeInTheDocument()
     expect(container.querySelector('.result-turn--user')).toBeInTheDocument()
@@ -905,7 +966,7 @@ describe('ResultApp window interactions', () => {
 
     const input = screen.getByRole('textbox', { name: '继续提问' })
     expect(input).not.toBeDisabled()
-    expect(input).toHaveAttribute('placeholder', '问点什么…')
+    expect(input).toHaveAttribute('placeholder', '问点什么… 可粘贴截图')
 
     // A suggestion fills the composer rather than sending immediately: the
     // user should be able to adjust it before asking.
@@ -915,7 +976,7 @@ describe('ResultApp window interactions', () => {
     fireEvent.change(input, { target: { value: '解释一下机会成本' } })
     fireEvent.keyDown(input, { key: 'Enter' })
     await waitFor(() => {
-      expect(continueAction).toHaveBeenCalledWith('session-1', '解释一下机会成本')
+      expect(continueAction).toHaveBeenCalledWith('session-1', '解释一下机会成本', [])
     })
   })
 

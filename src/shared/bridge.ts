@@ -66,6 +66,14 @@ export interface SettingsGuidance {
   notice?: string
 }
 
+/** One image attached to a user turn. `data` is base64 without the prefix. */
+export interface ChatImageAttachment {
+  /** Display name shown on the chip ("截图 1"); never sent to the provider. */
+  name: string
+  mediaType: string
+  data: string
+}
+
 export interface WindowTextLensApi {
   getSettings(): Promise<PublicSettings>
   settingsReady?(): Promise<void>
@@ -140,7 +148,11 @@ export interface WindowTextLensApi {
     sessionId?: string,
     options?: ActionRetryOptions
   ): Promise<RunActionResult>
-  continueAction?(sessionId: string, question: string): Promise<RunActionResult>
+  continueAction?(
+    sessionId: string,
+    question: string,
+    images?: ChatImageAttachment[]
+  ): Promise<RunActionResult>
   copyText(text: string): Promise<void>
   /** Pastes the answer back into the window the selection came from. */
   reinsertResult?(sessionId: string, text: string): Promise<'pasted' | 'copied'>

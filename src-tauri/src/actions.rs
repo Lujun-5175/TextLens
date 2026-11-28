@@ -1,9 +1,10 @@
 use std::{collections::HashMap, ops::ControlFlow, sync::Arc, time::Duration};
 
+use base64::Engine as _;
 use futures_util::StreamExt;
 use parking_lot::Mutex;
 use reqwest::{header, Client, Response, StatusCode};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tauri::{AppHandle, Emitter, Runtime};
 use thiserror::Error;
@@ -45,6 +46,13 @@ const ERROR_RESPONSE_LIMIT: usize = 8 * 1024;
 const FOLLOW_UP_INPUT_LIMIT: usize = 20_000;
 const CONVERSATION_CONTEXT_LIMIT: usize = 200_000;
 const MAX_CONVERSATION_MESSAGES: usize = 64;
+/// Attachments per user turn. Every follow-up replays the whole conversation,
+/// so each extra image is paid again on every turn.
+const MAX_IMAGES_PER_MESSAGE: usize = 4;
+/// A compressed screenshot is well under this; the cap only rejects abuse or a
+/// renderer that skipped downscaling.
+const MAX_IMAGE_BASE64_BYTES: usize = 5 * 1024 * 1024;
+const MAX_CONVERSATION_IMAGE_BYTES: usize = 24 * 1024 * 1024;
 
 #[derive(Debug, Error)]
 pub enum ActionServiceError {
@@ -101,10 +109,25 @@ pub(crate) enum ChatRole {
     Assistant,
 }
 
+/// One image attached to a user turn, already compressed and base64-encoded
+/// by the renderer. The name is display metadata ("截图 1"); it never reaches
+/// the provider.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatImage {
+    pub(crate) name: String,
+    pub(crate) media_type: String,
+    pub(crate) data: String,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub(crate) struct ChatMessage {
     pub(crate) role: ChatRole,
     pub(crate) content: String,
+    /// Only user turns carry images. Older persisted conversations and every
+    /// request without an attachment keep this empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) images: Vec<ChatImage>,
 }
 
 impl ChatMessage {
@@ -112,13 +135,19 @@ impl ChatMessage {
         Self {
             role: ChatRole::System,
             content,
+            images: Vec::new(),
         }
     }
 
     fn user(content: String) -> Self {
+        Self::user_with_images(content, Vec::new())
+    }
+
+    pub(crate) fn user_with_images(content: String, images: Vec<ChatImage>) -> Self {
         Self {
             role: ChatRole::User,
             content,
+            images,
         }
     }
 
@@ -126,6 +155,7 @@ impl ChatMessage {
         Self {
             role: ChatRole::Assistant,
             content,
+            images: Vec::new(),
         }
     }
 }
@@ -199,6 +229,7 @@ enum FrozenPreparationSeed {
         route: SessionRoute,
         committed_messages: Vec<ChatMessage>,
         question: String,
+        images: Vec<ChatImage>,
         ask_system: Option<String>,
     },
 }
@@ -537,6 +568,7 @@ impl ActionServiceState {
         session_id: &str,
         request_id: String,
         question: String,
+        images: Vec<ChatImage>,
         action_started: tokio::time::Instant,
     ) -> Result<ActionReservation, SessionError> {
         let (request, route, committed_messages, ask_system) = {
@@ -567,6 +599,7 @@ impl ActionServiceState {
                 route,
                 committed_messages,
                 question,
+                images,
                 ask_system,
             },
             action_started,
@@ -951,16 +984,22 @@ impl ActionService {
         app: &AppHandle<R>,
         session_id: &str,
         question: &str,
+        images: Vec<ChatImage>,
     ) -> Result<String, ActionServiceError> {
         let action_started = tokio::time::Instant::now();
         if !valid_routing_id(session_id, 128) {
             return Err(ActionServiceError::SessionEnded);
         }
-        validate_follow_up_question(question)?;
+        validate_follow_up_question(question, !images.is_empty())?;
+        // Reject oversized or malformed attachments before reserving the slot:
+        // a rejected send must not leave the session looking busy.
+        let probe = ChatMessage::user_with_images(question.to_owned(), images.clone());
+        validate_message_images(&probe)?;
         let action_reservation = self.inner.state.lock().reserve_continue(
             session_id,
             Uuid::new_v4().to_string(),
             question.to_owned(),
+            images,
             action_started,
         )?;
         let request_id = action_reservation.reservation.ticket.request_id.clone();
@@ -1894,8 +1933,8 @@ fn validate_request_shape(request: &ExecuteActionRequest) -> Result<(), ActionSe
     validate_request_text(&request.text)
 }
 
-fn validate_follow_up_question(question: &str) -> Result<(), ActionServiceError> {
-    if question.trim().is_empty() {
+fn validate_follow_up_question(question: &str, has_images: bool) -> Result<(), ActionServiceError> {
+    if question.trim().is_empty() && !has_images {
         return Err(ActionServiceError::Validation(
             "请输入继续提问的内容".to_owned(),
         ));
@@ -2102,14 +2141,15 @@ fn resolve_request_config(
             route,
             committed_messages,
             question,
+            images,
             ask_system,
         } => {
             let action = prepared_action(settings, &request.action_id)?;
             let route = resolve_route(settings, action, &route.provider.id, &route.model)?;
             let last_messages = if let Some(seed_system) = ask_system.as_deref() {
-                build_ask_continue_messages(seed_system, committed_messages, question)?
+                build_ask_continue_messages(seed_system, committed_messages, question, images)?
             } else {
-                build_follow_up_messages(committed_messages, question)?
+                build_follow_up_messages(committed_messages, question, images)?
             };
             PreparedSessionData {
                 frozen_request: request.clone(),
@@ -2178,12 +2218,34 @@ fn transcript_for_messages(
                 ChatRole::User => TranscriptRole::User,
                 ChatRole::Assistant => TranscriptRole::Assistant,
             };
+            // The transcript is display-only, so an image-only turn still
+            // needs its names visible. The model never sees this marker.
+            let content = if message.images.is_empty() {
+                message.content.clone()
+            } else {
+                let names = message
+                    .images
+                    .iter()
+                    .map(|image| image.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join("、");
+                if message.content.trim().is_empty() {
+                    format!("🖼 {names}")
+                } else {
+                    format!(
+                        "{}
+
+🖼 {names}",
+                        message.content
+                    )
+                }
+            };
             Some(TranscriptTurn {
                 id: String::new(),
                 role,
-                content: message.content.clone(),
+                content: content.clone(),
                 streaming: false,
-                scalar_count: message.content.chars().count() as u64,
+                scalar_count: content.chars().count() as u64,
             })
         })
         .collect();
@@ -2303,9 +2365,10 @@ fn build_prompt(
 fn build_follow_up_messages(
     committed_messages: &[ChatMessage],
     question: &str,
+    images: &[ChatImage],
 ) -> Result<Vec<ChatMessage>, ActionServiceError> {
     let question = question.trim();
-    if question.is_empty() {
+    if question.is_empty() && images.is_empty() {
         return Err(ActionServiceError::Validation(
             "请输入继续提问的内容".to_owned(),
         ));
@@ -2321,7 +2384,10 @@ fn build_follow_up_messages(
         ));
     }
     let mut messages = committed_messages.to_vec();
-    messages.push(ChatMessage::user(question.to_owned()));
+    messages.push(ChatMessage::user_with_images(
+        question.to_owned(),
+        images.to_vec(),
+    ));
     validate_conversation_messages(&messages)?;
     Ok(messages)
 }
@@ -2382,27 +2448,90 @@ fn build_ask_continue_messages(
     seed_system: &str,
     committed: &[ChatMessage],
     question: &str,
+    images: &[ChatImage],
 ) -> Result<Vec<ChatMessage>, ActionServiceError> {
-    validate_follow_up_question(question)?;
+    validate_follow_up_question(question, !images.is_empty())?;
     let mut messages = if committed.is_empty() {
         vec![ChatMessage::system(seed_system.to_owned())]
     } else {
         committed.to_vec()
     };
-    messages.push(ChatMessage::user(question.trim().to_owned()));
+    messages.push(ChatMessage::user_with_images(
+        question.trim().to_owned(),
+        images.to_vec(),
+    ));
     validate_conversation_messages(&messages)?;
     Ok(messages)
 }
 
+/// Checks the attachment itself: role, count, mime type, size and that the
+/// payload is real base64. A user turn with images may have empty text.
+fn validate_message_images(message: &ChatMessage) -> Result<(), ActionServiceError> {
+    if message.images.is_empty() {
+        return Ok(());
+    }
+    if message.role != ChatRole::User {
+        return Err(ActionServiceError::Validation(
+            "只有用户消息可以附带图片".to_owned(),
+        ));
+    }
+    if message.images.len() > MAX_IMAGES_PER_MESSAGE {
+        return Err(ActionServiceError::Validation(format!(
+            "每条消息最多附带 {MAX_IMAGES_PER_MESSAGE} 张图片"
+        )));
+    }
+    for image in &message.images {
+        if !matches!(
+            image.media_type.as_str(),
+            "image/png" | "image/jpeg" | "image/webp"
+        ) {
+            return Err(ActionServiceError::Validation(
+                "仅支持 PNG、JPEG 或 WebP 图片".to_owned(),
+            ));
+        }
+        if image.data.is_empty() || image.data.len() > MAX_IMAGE_BASE64_BYTES {
+            return Err(ActionServiceError::Validation(
+                "图片过大，请压缩后重试".to_owned(),
+            ));
+        }
+        if base64::engine::general_purpose::STANDARD
+            .decode(&image.data)
+            .is_err()
+        {
+            return Err(ActionServiceError::Validation("图片数据无效".to_owned()));
+        }
+        if image.name.chars().count() > 64 {
+            return Err(ActionServiceError::Validation("图片名称过长".to_owned()));
+        }
+    }
+    Ok(())
+}
+
 fn validate_conversation_messages(messages: &[ChatMessage]) -> Result<(), ActionServiceError> {
-    if messages.is_empty()
-        || messages.len() > MAX_CONVERSATION_MESSAGES
-        || messages
-            .iter()
-            .any(|message| message.content.trim().is_empty())
-    {
+    if messages.is_empty() || messages.len() > MAX_CONVERSATION_MESSAGES {
         return Err(ActionServiceError::Validation(
             "对话上下文格式无效或轮次过多".to_owned(),
+        ));
+    }
+    let mut image_bytes = 0usize;
+    for message in messages {
+        validate_message_images(message)?;
+        if message.content.trim().is_empty() && message.images.is_empty() {
+            return Err(ActionServiceError::Validation(
+                "对话上下文格式无效或轮次过多".to_owned(),
+            ));
+        }
+        image_bytes = image_bytes.saturating_add(
+            message
+                .images
+                .iter()
+                .map(|image| image.data.len())
+                .sum::<usize>(),
+        );
+    }
+    if image_bytes > MAX_CONVERSATION_IMAGE_BYTES {
+        return Err(ActionServiceError::Validation(
+            "对话中的图片总量过大，请新开一个会话".to_owned(),
         ));
     }
     let total_chars = messages.iter().fold(0usize, |total, message| {
@@ -3100,6 +3229,7 @@ mod tests {
                 session_id,
                 Uuid::new_v4().to_string(),
                 question.to_owned(),
+                Vec::new(),
                 tokio::time::Instant::now(),
             )?;
             prepare();
@@ -3891,7 +4021,7 @@ mod tests {
             ChatMessage::user("第一个追问".to_owned()),
             ChatMessage::assistant("第一个追问的回答".to_owned()),
         ];
-        let messages = build_follow_up_messages(&committed, "  请解释第二个词  ").unwrap();
+        let messages = build_follow_up_messages(&committed, "  请解释第二个词  ", &[]).unwrap();
         assert_eq!(messages.len(), 4);
         assert_eq!(messages[0].role, ChatRole::Assistant);
         assert_eq!(messages[0].content, "先前的翻译结果");
@@ -3906,7 +4036,7 @@ mod tests {
     #[test]
     fn ask_first_continue_includes_selection_context_in_messages() {
         let seed = "你是助手。\n\n<selection>\n选中的句子\n</selection>";
-        let messages = build_ask_continue_messages(seed, &[], "这句话什么意思？").unwrap();
+        let messages = build_ask_continue_messages(seed, &[], "这句话什么意思？", &[]).unwrap();
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].role, ChatRole::System);
         assert!(messages[0].content.contains("选中的句子"));
@@ -3918,7 +4048,8 @@ mod tests {
             ChatMessage::user("这句话什么意思？".to_owned()),
             ChatMessage::assistant("这是一句示例。".to_owned()),
         ];
-        let second = build_ask_continue_messages(seed, &after_first, "能再详细点吗？").unwrap();
+        let second =
+            build_ask_continue_messages(seed, &after_first, "能再详细点吗？", &[]).unwrap();
         assert_eq!(second.len(), 4);
         assert_eq!(second[0].role, ChatRole::System);
         assert!(second[0].content.contains("选中的句子"));
@@ -4021,6 +4152,7 @@ mod tests {
                 "ask-session",
                 Uuid::new_v4().to_string(),
                 "这句话什么意思？".to_owned(),
+                Vec::new(),
                 tokio::time::Instant::now(),
             )
             .unwrap();
@@ -4294,6 +4426,7 @@ mod tests {
             committed_messages: Vec::new(),
             question: "Explain opportunity cost".to_owned(),
             ask_system: Some(seed_system),
+            images: Vec::new(),
         };
 
         // This is the exact path the orb's first question takes. Before the
@@ -4474,6 +4607,7 @@ mod tests {
                 "session",
                 "same-question-next".to_owned(),
                 "same question".to_owned(),
+                Vec::new(),
                 tokio::time::Instant::now(),
             )
             .unwrap();
@@ -4584,15 +4718,68 @@ mod tests {
             ChatMessage::user("question".to_owned()),
             ChatMessage::assistant("answer".to_owned()),
         ];
-        assert!(build_follow_up_messages(&committed, "   ").is_err());
+        assert!(build_follow_up_messages(&committed, "   ", &[]).is_err());
         assert!(
-            build_follow_up_messages(&committed, &"x".repeat(FOLLOW_UP_INPUT_LIMIT + 1)).is_err()
+            build_follow_up_messages(&committed, &"x".repeat(FOLLOW_UP_INPUT_LIMIT + 1), &[])
+                .is_err()
         );
 
         let oversized_context = vec![ChatMessage::assistant(
             "x".repeat(CONVERSATION_CONTEXT_LIMIT),
         )];
-        assert!(build_follow_up_messages(&oversized_context, "more").is_err());
+        assert!(build_follow_up_messages(&oversized_context, "more", &[]).is_err());
+    }
+
+    #[test]
+    fn image_attachments_are_validated() {
+        let image = ChatImage {
+            name: "截图 1".to_owned(),
+            media_type: "image/jpeg".to_owned(),
+            data: "aGVsbG8=".to_owned(),
+        };
+        // An image-only user turn is a complete message.
+        assert!(
+            validate_conversation_messages(&[ChatMessage::user_with_images(
+                String::new(),
+                vec![image.clone()]
+            )])
+            .is_ok()
+        );
+        // Too many images.
+        assert!(
+            validate_conversation_messages(&[ChatMessage::user_with_images(
+                "看图".to_owned(),
+                vec![image.clone(); MAX_IMAGES_PER_MESSAGE + 1]
+            )])
+            .is_err()
+        );
+        // Only user turns may carry images.
+        let mut assistant = ChatMessage::assistant("answer".to_owned());
+        assistant.images = vec![image.clone()];
+        assert!(validate_conversation_messages(&[assistant]).is_err());
+        // Unsupported mime type and broken base64.
+        let gif = ChatImage {
+            media_type: "image/gif".to_owned(),
+            ..image.clone()
+        };
+        assert!(
+            validate_conversation_messages(&[ChatMessage::user_with_images(
+                "看图".to_owned(),
+                vec![gif]
+            )])
+            .is_err()
+        );
+        let broken = ChatImage {
+            data: "!!!!".to_owned(),
+            ..image.clone()
+        };
+        assert!(
+            validate_conversation_messages(&[ChatMessage::user_with_images(
+                "看图".to_owned(),
+                vec![broken]
+            )])
+            .is_err()
+        );
     }
 
     #[test]

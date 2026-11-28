@@ -4480,15 +4480,18 @@ pub fn continue_action(
     state: State<'_, RuntimeState>,
     session_id: String,
     question: String,
+    images: Option<Vec<crate::actions::ChatImage>>,
 ) -> Result<RunActionResult, String> {
     ensure_result_caller(&window, &session_id)?;
     if !state.result_sessions.lock().contains_key(&session_id) {
         return Ok(RunActionResult::rejected("结果会话已结束"));
     }
-    match state
-        .actions
-        .continue_with_question(&app, &session_id, &question)
-    {
+    match state.actions.continue_with_question(
+        &app,
+        &session_id,
+        &question,
+        images.unwrap_or_default(),
+    ) {
         Ok(request_id) => Ok(RunActionResult::accepted(
             Some(session_id),
             Some(request_id),

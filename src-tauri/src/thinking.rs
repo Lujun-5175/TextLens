@@ -1629,10 +1629,12 @@ mod tests {
             ChatMessage {
                 role: ChatRole::System,
                 content: "sys".to_owned(),
+                images: Vec::new(),
             },
             ChatMessage {
                 role: ChatRole::User,
                 content: "hello".to_owned(),
+                images: Vec::new(),
             },
         ];
         let capability =

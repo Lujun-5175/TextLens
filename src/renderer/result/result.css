@@ -1454,6 +1454,65 @@ body,
   border-radius: var(--radius-md);
 }
 
+/* The field and its send button; a wrapper lets chips sit above them inside
+   the same rounded card. */
+.result-composer__row {
+  display: flex;
+  flex: 1 1 auto;
+  gap: 8px;
+  align-items: center;
+  min-width: 0;
+}
+
+/* With attachments the card grows upward: chips first, controls below. */
+.result-composer--attached {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 6px;
+  padding-top: 6px;
+  padding-bottom: 6px;
+}
+
+.result-composer__attachments {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.result-attachment {
+  display: inline-flex;
+  gap: 2px;
+  align-items: center;
+  height: 26px;
+  padding: 0 2px 0 8px;
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+  background: var(--surface-muted);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}
+
+.result-attachment__remove {
+  display: inline-grid;
+  place-items: center;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  color: var(--text-tertiary);
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+  background: transparent;
+  border: 0;
+  border-radius: var(--radius-sm);
+}
+
+.result-attachment__remove:hover,
+.result-attachment__remove:focus-visible {
+  color: var(--danger);
+  background: var(--danger-soft);
+}
+
 .result-composer:focus-within {
   border-color: var(--accent);
   box-shadow: 0 0 0 3px var(--accent-soft);

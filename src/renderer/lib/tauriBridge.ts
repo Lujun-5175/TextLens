@@ -38,7 +38,8 @@ import {
   type ToolbarPointerEvent,
   type ToolbarSize,
   type Unsubscribe,
-  type WindowTextLensApi
+  type WindowTextLensApi,
+  type ChatImageAttachment
 } from '../../shared'
 
 const EVENTS = TAURI_EVENTS
@@ -460,10 +461,15 @@ export function installTauriBridge(): void {
         modelId: options?.modelId ?? null
       }))
     },
-    async continueAction(sessionId: string, question: string) {
+    async continueAction(
+      sessionId: string,
+      question: string,
+      images?: ChatImageAttachment[]
+    ) {
       return parseRunActionResult(await invoke(TAURI_COMMANDS.continueAction, {
         sessionId: requiredSessionId(sessionId),
-        question
+        question,
+        ...(images && images.length > 0 ? { images } : {})
       }))
     },
     async copyText(text: string) {
